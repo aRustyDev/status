@@ -105,15 +105,26 @@ Earlier rehearsal evidence:
 
 A read-only baseline confirmed that all four D1 migrations were applied with none pending, the endpoint registry matched its synchronization preview, and representative scheduled checks were healthy. Detailed values are retained privately.
 
-A local synthetic-fixture comparison exercised the pinned Node and adapted Cloudflare reader, dashboard, monitors, incidents, and maintenance screens at 1440 and 390 pixels. Each pair displayed its expected page heading, with no horizontal document overflow; the reader captures used the same expanded incident state. The adapted reader's coordinate-free layout also passed real-browser non-overlap checks at both widths after expanding a long incident. These are semantic and geometry checks, not a pixel-equivalence claim or a substitute for live staging validation. `npm run test:e2e -w @bsp/status` runs the durable geometry regression. Final staging keyboard verification remains part of the rollout gate.
+A local synthetic-fixture comparison exercised the pinned Node and adapted Cloudflare reader, dashboard, monitors, incidents, and maintenance screens at 1440 and 390 pixels. Each pair displayed its expected page heading, with no horizontal document overflow; the reader captures used the same expanded incident state. The adapted reader's coordinate-free layout also passed real-browser non-overlap checks at both widths after expanding a long incident. These are semantic and geometry checks, not a pixel-equivalence claim or a substitute for live staging validation. `npm run test:e2e -w @bsp/status` runs the durable geometry regression. The final-build staging keyboard observations are recorded below.
 
 
 ### Final-build staging follow-up
 
-The fixed live reader was inspected at 1440- and 390-pixel widths, including with an expanded incident; the reader blocks did not overlap. The fixed admin incident screen visibly explained unavailable actions. Visibility alone does not complete the keyboard review.
+The fixed live reader was inspected at 1440- and 390-pixel widths, including with an expanded incident; the reader blocks did not overlap. The fixed admin incident screen visibly explained unavailable actions. Keyboard observations are recorded below.
 
 Before a fixture check's first sample, the final reader showed Unknown on the card and in the headline; both status APIs returned null for the last-check time. The fixture was restored afterward.
 
-A revoked session caused an admin save to return 401, hid the protected draft, and created no audit entry. Reauthentication as the same identity recovered the draft, which was then saved. Natural expiry with a five-minute session did not reproduce the expiry path, and expiry-notification toast privacy was not exercised live. Those checks and the outstanding keyboard review remain open. The temporary role, normal Access duration, and fixture configuration were restored. Staging is serving the legacy board while the rollout gate is incomplete.
+A revoked session caused an admin save to return 401, hid the protected draft, and created no audit entry. Reauthentication as the same identity recovered the draft, which was then saved. Natural expiry with a five-minute session did not reproduce the expiry path, and a later browser interruption prevented completion of the natural-expiry and expiry-notification toast privacy checks. Those checks remain open. The temporary role, normal Access duration, and fixture configuration were restored. Staging is serving the legacy board while the rollout gate is incomplete.
 
-The CI static check also remains unresolved: npm attestation validation failed with a malformed attestation. Record a passing CI result before marking the pull request ready.
+The CI static check passed using a temporary recovered-attestation workaround for malformed npm registry responses. npm still verifies the signatures and attestations. The recovered snapshots cannot establish whether the registry later adds or withdraws an attestation; remove the workaround when the registry endpoint is restored.
+
+
+### Final-build keyboard retest
+
+The initial mobile navigation check failed because Escape did not close the drawer, and staging was returned to the legacy board. The fixed admin build was then retested.
+
+On mobile, Enter opened navigation with initial focus on Close, Tab moved to Dashboard, and Escape closed the drawer and returned focus to its opener. Escape also closed the maintenance dialog and returned focus to its opener; the recurring-maintenance and subscriber-notification unavailability explanations were visible.
+
+On desktop, Tab and Shift+Tab were exercised in the incident dialog, and Escape closed it and returned focus to New Incident. The monitor menu opened with Enter and closed with Escape, returning focus to its opener. On the reader, the account menu opened with Enter and closed with Escape; the incident control responded to Enter and Space, and Tab exposed the history-bar text.
+
+These observations do not complete session-expiry validation or determine the final rollout state.
