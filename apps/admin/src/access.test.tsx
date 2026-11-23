@@ -1,0 +1,84 @@
+import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { expect, it, vi } from 'vitest'
+import { api } from './api/client'
+import App from './App'
+
+vi.mock('./api/client', () => ({ api: { get: vi.fn() } }))
+vi.mock('./pages/Dashboard', async () => {
+  const { Modal, useToast } = await import('@better-forge/ui')
+  function MockDashboard() {
+    const toast = useToast()
+    return <Modal title="Edit incident" icon="edit" onClose={() => {}}>
+      <input aria-label="Draft incident" />
+      <button type="button" onClick={() => toast.success('Published protected incident', { duration: 0 })}>Show notification</button>
+    </Modal>
+  }
+  return { default: MockDashboard }
+})
+
+it('hides the console during expiry and retains a draft for the same identity', async () => {
+  const identity = { id: 'operator-uuid', email: 'operator@example.com', role: 'operator' }
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path === '/auth/me') return identity
+    if (path === '/capabilities') return { supportedRoutes: ['/admin/'] }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  window.history.replaceState({}, '', '/admin/')
+  const user = userEvent.setup()
+  render(<App />)
+  const draft = await screen.findByLabelText('Draft incident')
+  await user.type(draft, 'Investigating')
+  window.dispatchEvent(new Event('access-expired'))
+  expect(await screen.findByText('Your Access session has expired.')).toBeInTheDocument()
+  expect(screen.getByLabelText('Draft incident')).not.toBeVisible()
+  expect(screen.getByRole('dialog', { name: 'Access session expired' })).toBeVisible()
+  expect(screen.getByRole('link', { name: 'Sign in' })).toBeVisible()
+  await user.tab()
+  expect(screen.getByRole('link', { name: 'Sign in' })).toHaveFocus()
+  await user.tab()
+  expect(screen.getByRole('button', { name: 'Continue' })).toHaveFocus()
+  await user.click(screen.getByRole('button', { name: 'Continue' }))
+  await waitFor(() => expect(screen.getByLabelText('Draft incident')).toHaveValue('Investigating'))
+})
+
+
+it('hides notifications during expiry and restores them for the same identity', async () => {
+  const identity = { id: 'operator-uuid', email: 'operator@example.com', role: 'operator' }
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path === '/auth/me') return identity
+    if (path === '/capabilities') return { supportedRoutes: ['/admin/'] }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  window.history.replaceState({}, '', '/admin/')
+  const user = userEvent.setup()
+  render(<App />)
+  await user.click(await screen.findByRole('button', { name: 'Show notification' }))
+  const notification = screen.getByText('Published protected incident')
+  expect(notification).toBeVisible()
+  window.dispatchEvent(new Event('access-expired'))
+  expect(await screen.findByRole('dialog', { name: 'Access session expired' })).toBeVisible()
+  expect(notification).not.toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Continue' }))
+  await waitFor(() => expect(notification).toBeVisible())
+})
+
+it('drops previous identity notifications and drafts after a different identity signs in', async () => {
+  let identity = { id: 'first-operator', email: 'first@example.com', role: 'operator' }
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path === '/auth/me') return identity
+    if (path === '/capabilities') return { supportedRoutes: ['/admin/'] }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  window.history.replaceState({}, '', '/admin/')
+  const user = userEvent.setup()
+  render(<App />)
+  await user.type(await screen.findByLabelText('Draft incident'), 'Private draft')
+  await user.click(screen.getByRole('button', { name: 'Show notification' }))
+  window.dispatchEvent(new Event('access-expired'))
+  expect(await screen.findByRole('dialog', { name: 'Access session expired' })).toBeVisible()
+  identity = { id: 'second-operator', email: 'second@example.com', role: 'operator' }
+  await user.click(screen.getByRole('button', { name: 'Continue' }))
+  await waitFor(() => expect(screen.getByLabelText('Draft incident')).toHaveValue(''))
+  expect(screen.queryByText('Published protected incident')).not.toBeInTheDocument()
+})

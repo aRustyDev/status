@@ -1,0 +1,112 @@
+import assert from 'node:assert/strict'
+import { existsSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { after, before, describe, it, mock } from 'node:test'
+import Fastify from 'fastify'
+import jwt from '@fastify/jwt'
+import cookie from '@fastify/cookie'
+import { sqlite } from '../src/db/client.js'
+import { setupRoutes } from '../src/routes/setup.js'
+import { createTestDb, teardownTestDb } from './helpers/testDb.js'
+
+const testDb = createTestDb('bsp-setup-test-')
+process.env['SETUP_CONFIG_PATH'] = join(testDb.dir, 'setup.json')
+
+const app = Fastify({ logger: false })
+const schedulerStart = mock.fn()
+
+before(async () => {
+  await app.register(jwt, { secret: 'setup-integration-secret' })
+  await app.register(cookie)
+  await app.register(setupRoutes, { prefix: '/setup', startBackgroundServices: schedulerStart })
+  await app.ready()
+})
+
+after(async () => {
+  await app.close()
+  teardownTestDb(testDb)
+})
+
+describe('first-run setup', () => {
+  it('reports an incomplete installation and validates credentials', async () => {
+    assert.deepEqual((await app.inject({ url: '/setup/status' })).json(), { needsSetup: true })
+    assert.equal((await app.inject({ method: 'POST', url: '/setup/complete', payload: { email: '', password: '' } })).statusCode, 400)
+    assert.equal((await app.inject({ method: 'POST', url: '/setup/complete', payload: { email: 'admin@example.test', password: 'short' } })).statusCode, 400)
+  })
+
+  it('rolls back the admin when the setup marker cannot be written, so the same email can retry', async () => {
+    // A file where the marker's directory should be makes writeSetupComplete fail while isSetupComplete stays false.
+    const markerPath = process.env['SETUP_CONFIG_PATH']!
+    const blocker = join(testDb.dir, 'blocker')
+    writeFileSync(blocker, '')
+    process.env['SETUP_CONFIG_PATH'] = join(blocker, 'setup.json')
+    try {
+      const failed = await app.inject({
+        method: 'POST', url: '/setup/complete',
+        payload: { email: 'owner@example.test', password: 'secure-password' },
+      })
+      assert.equal(failed.statusCode, 500)
+      assert.equal((sqlite.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n, 0)
+      assert.equal(schedulerStart.mock.callCount(), 0)
+    } finally {
+      process.env['SETUP_CONFIG_PATH'] = markerPath
+      rmSync(blocker, { force: true })
+    }
+  })
+
+  it('refuses setup over an existing database whose marker is missing, and keeps the account untouched', async () => {
+    sqlite.exec("INSERT INTO users(email,password_hash,role,created_at) VALUES ('owner@example.test','existing','viewer',1)")
+    try {
+      for (const payload of [{ email: 'owner@example.test', password: 'secure-password' }, { email: 'new@example.test', password: 'secure-password' }]) {
+        assert.equal((await app.inject({ method: 'POST', url: '/setup/complete', payload })).statusCode, 409)
+      }
+      assert.equal((sqlite.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n, 1)
+      assert.deepEqual({ ...(sqlite.prepare("SELECT role, password_hash AS hash FROM users WHERE email = 'owner@example.test'").get() as object) }, { role: 'viewer', hash: 'existing' })
+      assert.equal(existsSync(process.env['SETUP_CONFIG_PATH']!), false)
+      assert.equal(schedulerStart.mock.callCount(), 0)
+    } finally {
+      sqlite.exec('DELETE FROM users')
+    }
+  })
+
+  it('sets up beside seeded accounts when BSP_DEMO_MODE is true', async () => {
+    sqlite.exec("INSERT INTO users(email,password_hash,role,created_at) VALUES ('seeded@example.test','existing','operator',1)")
+    process.env['BSP_DEMO_MODE'] = 'true'
+    try {
+      const response = await app.inject({ method: 'POST', url: '/setup/complete', payload: { email: 'owner@example.test', password: 'secure-password' } })
+      assert.equal(response.statusCode, 200)
+      const rows = sqlite.prepare('SELECT email, role FROM users ORDER BY id').all() as { email: string; role: string }[]
+      assert.deepEqual(rows.map((row) => ({ ...row })), [{ email: 'seeded@example.test', role: 'operator' }, { email: 'owner@example.test', role: 'admin' }])
+    } finally {
+      delete process.env['BSP_DEMO_MODE']
+      rmSync(process.env['SETUP_CONFIG_PATH']!, { force: true })
+      sqlite.exec('DELETE FROM users; DELETE FROM branding; DELETE FROM layout')
+      schedulerStart.mock.resetCalls()
+    }
+  })
+
+  it('rejects a body that is not made of strings', async () => {
+    for (const payload of [{ email: 'a@example.test', password: 12345678 }, { email: ['a@example.test'], password: 'secure-password' }]) {
+      assert.equal((await app.inject({ method: 'POST', url: '/setup/complete', payload })).statusCode, 400)
+    }
+  })
+
+  it('initializes storage, seeds defaults, signs in, and starts scheduling once', async () => {
+    const response = await app.inject({
+      method: 'POST', url: '/setup/complete',
+      payload: { email: 'owner@example.test', password: 'secure-password' },
+    })
+    assert.equal(response.statusCode, 200)
+    assert.equal(response.json().email, 'owner@example.test')
+    assert.match(String(response.headers['set-cookie']), /bsp_session=/)
+    assert.equal(existsSync(process.env['DATABASE_PATH']!), true)
+    assert.equal(existsSync(process.env['SETUP_CONFIG_PATH']!), true)
+    assert.equal(schedulerStart.mock.callCount(), 1)
+    const admin = sqlite.prepare("SELECT role, password_hash AS hash FROM users WHERE email = 'owner@example.test'").get() as { role: string; hash: string }
+    assert.equal(admin.role, 'admin')
+    assert.notEqual(admin.hash, 'existing')
+    assert.deepEqual((await app.inject({ url: '/setup/status' })).json(), { needsSetup: false })
+    assert.equal((await app.inject({ method: 'POST', url: '/setup/complete', payload: { email: 'other@example.test', password: 'secure-password' } })).statusCode, 409)
+    assert.equal(schedulerStart.mock.callCount(), 1)
+  })
+})

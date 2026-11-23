@@ -1,0 +1,127 @@
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import type { Monitor, MonitorType } from '@bsp/shared'
+import { Alert, Field, Modal, ModalFooter, getCurrentUser } from '@better-forge/ui'
+import { api } from '../../api/client'
+
+type Component = Monitor & { uuid: string; version: number; manualStatus: string; position: number }
+type Check = { id: string; componentId: string; endpointId: string; enabled: boolean | number; intervalMinutes: number; expectedStatus: number; version: number }
+type Endpoint = { id: string; name: string }
+type History = { results: Array<{ completedAt: number; status: string; httpStatus: number | null; latencyMs: number }>; retentionDays: number }
+
+type Props = {
+  monitor: Monitor | null
+  initialType?: MonitorType | undefined
+  allTags?: unknown[]
+  allGroups?: string[]
+  onClose: () => void
+  onSaved: () => void
+}
+
+function CheckForm({ componentId, check, endpoints, onSaved }: { componentId: string; check?: Check | undefined; endpoints: Endpoint[]; onSaved: () => void }) {
+  const [initialCheck] = useState(check)
+  const [endpointId, setEndpointId] = useState(check?.endpointId ?? '')
+  const [enabled, setEnabled] = useState(Boolean(check?.enabled))
+  const [intervalMinutes, setIntervalMinutes] = useState(check?.intervalMinutes ?? 1)
+  const [expectedStatus, setExpectedStatus] = useState(check?.expectedStatus ?? 200)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  async function save(event: React.FormEvent) {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      const body = { componentId, endpointId, enabled, intervalMinutes, expectedStatus }
+      if (initialCheck) await api.patch(`/admin/checks/${initialCheck.id}`, { ...body, version: initialCheck.version })
+      else await api.post('/admin/checks', body)
+      onSaved()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save the check')
+    } finally {
+      setBusy(false)
+    }
+  }
+  return <form onSubmit={save} className="space-y-3">
+    <h3 className="font-bold">HTTP check</h3>
+    <Field label="Approved destination" required>
+      <select value={endpointId} onChange={event => setEndpointId(event.target.value)} required className="input-sig">
+        <option value="">Select a destination</option>
+        {endpoints.map(endpoint => <option value={endpoint.id} key={endpoint.id}>{endpoint.name}</option>)}
+      </select>
+    </Field>
+    <Field label="Interval">
+      <select value={intervalMinutes} onChange={event => setIntervalMinutes(Number(event.target.value))} className="input-sig">
+        <option value={1}>1 minute</option><option value={5}>5 minutes</option>
+      </select>
+    </Field>
+    <Field label="Expected HTTP status">
+      <input type="number" min={100} max={599} required value={expectedStatus} onChange={event => setExpectedStatus(Number(event.target.value))} className="input-sig" />
+    </Field>
+    <label><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> Enabled</label>
+    {error && <Alert tone="error">{error}</Alert>}
+    <button type="submit" disabled={busy || !endpointId} className="btn btn-primary">Save check</button>
+  </form>
+}
+
+export default function MonitorFormModal({ monitor, onClose, onSaved }: Props) {
+  const component = monitor as Component | null
+  const [name, setName] = useState(component?.name ?? '')
+  const [manualStatus, setManualStatus] = useState(component?.manualStatus ?? 'operational')
+  const [position, setPosition] = useState(component?.position ?? 0)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const isAdmin = getCurrentUser()?.role === 'admin'
+  const history = useQuery<History>({ queryKey: ['monitor-history', component?.id], queryFn: () => api.get(`/admin/monitors/${component!.id}/history`), enabled: !!component })
+  const checks = useQuery<Check[]>({ queryKey: ['checks'], queryFn: () => api.get('/admin/checks'), enabled: isAdmin && !!component, refetchOnMount: 'always' })
+  const endpoints = useQuery<Endpoint[]>({ queryKey: ['endpoints'], queryFn: () => api.get('/admin/endpoints'), enabled: isAdmin && !!component, refetchOnMount: 'always' })
+  async function save(event: React.FormEvent) {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      const body = { name, manualStatus, position }
+      if (component) await api.patch(`/admin/components/${component.uuid}`, { ...body, version: component.version })
+      else await api.post('/admin/components', body)
+      onSaved()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save the service')
+    } finally {
+      setBusy(false)
+    }
+  }
+  return <Modal title={component ? 'Edit Monitor' : 'New Monitor'} icon="edit" onClose={onClose} flush>
+    <div className="p-6 space-y-5">
+      <form onSubmit={save} className="space-y-3">
+        <Field label="Name" required><input value={name} onChange={event => setName(event.target.value)} required className="input-sig" /></Field>
+        <Field label="Manual health"><select value={manualStatus} onChange={event => setManualStatus(event.target.value)} className="input-sig">
+          <option value="operational">Operational</option><option value="degraded">Degraded</option><option value="down">Down</option>
+        </select></Field>
+        <Field label="Order"><input type="number" min={0} value={position} onChange={event => setPosition(Number(event.target.value))} className="input-sig" /></Field>
+        {error && <Alert tone="error">{error}</Alert>}
+        <button type="submit" disabled={busy} className="btn btn-primary">Save service</button>
+      </form>
+      {component && isAdmin && checks.isFetchedAfterMount && endpoints.isFetchedAfterMount && !checks.isError && !endpoints.isError && checks.data && endpoints.data && <CheckForm componentId={component.uuid} check={checks.data.find(item => item.componentId === component.uuid)} endpoints={endpoints.data} onSaved={onSaved} />}
+      {component && isAdmin && (!checks.isFetchedAfterMount || !endpoints.isFetchedAfterMount) && !checks.isError && !endpoints.isError && <p role="status">Loading check settings…</p>}
+      {component && isAdmin && (checks.isError || endpoints.isError) && <Alert tone="error">Could not load check settings.</Alert>}
+      {component && <section aria-label="Check history">
+        <h3 className="font-bold">Recent check history</h3>
+        {history.data && <div className="my-2 space-y-1">
+          <label htmlFor="check-history-range">History range</label>
+          <select id="check-history-range" defaultValue="14" aria-describedby="check-history-availability" className="input-sig">
+            <option value="14">14 days</option>
+            <option value="30" disabled>30 days</option>
+            <option value="90" disabled>90 days</option>
+          </select>
+          <p id="check-history-availability" className="text-sm">
+            History beyond {history.data.retentionDays} days is unavailable. Showing the most recent 20 samples.
+          </p>
+        </div>}
+        {history.data?.results.length === 0 && <p>No samples for this check configuration.</p>}
+        {history.data?.results.slice(-20).reverse().map(sample => <p key={sample.completedAt}>{new Date(sample.completedAt).toLocaleString()} · {sample.status} · HTTP {sample.httpStatus ?? '—'} · {sample.latencyMs} ms</p>)}
+        {history.isError && <p role="alert">Could not load check history.</p>}
+      </section>}
+      <p className="text-sm">Dependencies, notification channels, and additional monitor types are unavailable.</p>
+    </div>
+    <ModalFooter><button type="button" onClick={onClose} className="btn btn-secondary">Close</button></ModalFooter>
+  </Modal>
+}
