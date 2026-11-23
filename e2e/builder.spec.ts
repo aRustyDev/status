@@ -60,6 +60,35 @@ test('moves canvas monitors into a group and group monitors back out', async ({ 
   expect(saved.children.some((node) => node.id === 'gm')).toBe(true)
 })
 
+test('toolbox drops still reach groups and cancelled drags restore canvas controls', async ({ adminPage: page, adminApi }) => {
+  const monitor = await createHttpMonitor(adminApi, unique('Toolbox group'), `${API_URL}/health`)
+  await ok(adminApi.put('admin/layout', {
+    data: { tree: { id: 'root', type: 'page', children: [
+      { id: 'g1', type: 'group', label: 'Core', collapsible: false, grid: { x: 0, y: 0, w: 2, h: 3 }, children: [] },
+      { id: 'd1', type: 'divider', grid: { x: 0, y: 3, w: 3, h: 1 } },
+    ] } },
+  }))
+  await page.goto(`${ADMIN_URL}/builder`)
+  const group = page.locator('[data-group-id="g1"]')
+  const source = page.locator('[draggable="true"]').filter({ hasText: monitor.name })
+  await expect(group).toBeVisible()
+  await expect(source).toBeVisible()
+  const box = (await group.boundingBox())!
+  await drag(page, source, { x: box.x + box.width / 2, y: box.y + box.height * 0.75 })
+  await expect(group.getByText(monitor.name)).toBeVisible()
+
+  const card = page.locator('[data-toolbox-grid-item]').first()
+  const toolbox = page.getByRole('button', { name: 'Add Text to the page' })
+  const from = (await toolbox.boundingBox())!
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(from.x + from.width / 2 + 8, from.y + from.height / 2 + 8, { steps: 4 })
+  await expect(card).toHaveCSS('pointer-events', 'none')
+  await page.keyboard.press('Escape')
+  await page.mouse.up()
+  await expect(card).toHaveCSS('pointer-events', 'auto')
+})
+
 // Regression for #157: a block dropped between existing ones used to crash the builder (React error #185).
 for (const block of ['Divider', 'Incidents', 'Maintenance', 'Text']) {
   test(`a ${block} block dropped between existing blocks keeps the builder working`, async ({ adminPage: page, adminApi }) => {
@@ -79,6 +108,12 @@ for (const block of ['Divider', 'Incidents', 'Maintenance', 'Text']) {
     await page.goto(`${ADMIN_URL}/builder`)
     const dividers = page.getByRole('button', { name: 'Divider', exact: true })
     await expect(dividers).toHaveCount(3)
+    // RGL initially renders at a provisional width before measuring the canvas.
+    await expect.poll(async () => {
+      const card = await dividers.nth(1).boundingBox()
+      const canvas = await page.locator('.react-grid-layout').boundingBox()
+      return card && canvas ? Math.abs(card.width - canvas.width) : Infinity
+    }).toBeLessThan(1)
 
     // The middle of the second divider: the new block lands between the first and the last.
     const second = (await dividers.nth(1).boundingBox())!
@@ -95,6 +130,6 @@ for (const block of ['Divider', 'Incidents', 'Maintenance', 'Text']) {
     await expect(page.getByText('Saved!')).toBeVisible()
     const saved = await ok<Tree>(adminApi.get('admin/layout'))
     expect(saved.children).toHaveLength(4)
-    expect(saved.children.filter((node) => node.id.startsWith('d'))).toHaveLength(3)
+    expect(saved.children.filter((node) => ['d1', 'd2', 'd3'].includes(node.id))).toHaveLength(3)
   })
 }

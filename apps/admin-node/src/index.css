@@ -45,3 +45,9 @@ html:not(.dark) .maintenance-active-count {
 [data-joining-group] .react-grid-placeholder {
   display: none;
 }
+
+/* Keep moving grid cards from intercepting a toolbox drop; groups remain drop targets. */
+[data-toolbox-dragging] [data-toolbox-grid-item],
+[data-toolbox-dragging] .react-grid-placeholder {
+  pointer-events: none;
+}

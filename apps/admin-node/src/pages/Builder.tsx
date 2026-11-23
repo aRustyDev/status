@@ -164,6 +164,7 @@ export default function BuilderPage() {
   const prunedRef = useRef(false)
 
   // What's currently being dragged from toolbox (for droppingItem size hint)
+  const [toolboxDragging, setToolboxDragging] = useState(false)
   const draggingTypeRef = useRef<string>('monitor')
   const [droppingItem, setDroppingItem] = useState<LayoutItem>({
     i: '__dropping__', x: 0, y: 0, w: 1, h: 1,
@@ -255,6 +256,7 @@ export default function BuilderPage() {
   // Drop from toolbox
   function handleToolboxDragStart(type: string, data?: Record<string, string>) {
     draggingTypeRef.current = type
+    setToolboxDragging(true)
     const g = defaultGrid(type)
     setDroppingItem({ i: '__dropping__', x: 0, y: 0, w: g.w, h: g.h })
     return data ?? {}
@@ -408,6 +410,7 @@ export default function BuilderPage() {
               chartMonitorIds={chartMonitorIds}
               onAdd={handleToolboxAdd}
               onDragStart={handleToolboxDragStart}
+              onDragEnd={() => setToolboxDragging(false)}
             />
           </div>
         ) : (
@@ -474,7 +477,7 @@ export default function BuilderPage() {
           ) : tree.children.length === 0 ? (
             <EmptyDrop onDrop={handleDrop} droppingItem={droppingItem} rglLayout={rglLayout} />
           ) : (
-            <div className="relative" ref={canvasRef} data-joining-group={groupDrop.target ? '' : undefined}>
+            <div className="relative" ref={canvasRef} data-joining-group={groupDrop.target ? '' : undefined} data-toolbox-dragging={toolboxDragging ? '' : undefined}>
               {/* Column guides */}
               <div className="absolute inset-0 pointer-events-none" style={{
                 display: 'grid',
@@ -508,7 +511,7 @@ export default function BuilderPage() {
               style={{ minHeight: canvasMinHeight }}
             >
               {tree.children.map((node) => (
-                <div key={node.id}>
+                <div key={node.id} data-toolbox-grid-item={node.type === 'group' ? undefined : ''}>
                   <NodeCard
                     node={node}
                     monitors={monitors}

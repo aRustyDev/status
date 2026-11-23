@@ -33,7 +33,7 @@ const Icon = ({ name, size = 16 }: { name: string; size?: number }) => (
  * The builder's "Add" panel: fixed blocks on top, then a searchable monitor list that can be filtered by type and
  * grouped. Entries are dragged onto the canvas or added at the bottom with their buttons.
  */
-export function Toolbox({ monitors, status, usedMonitorIds, chartMonitorIds, onAdd, onDragStart }: {
+export function Toolbox({ monitors, status, usedMonitorIds, chartMonitorIds, onAdd, onDragStart, onDragEnd }: {
   monitors: ToolboxMonitor[]
   status: 'pending' | 'error' | 'success'
   /** Monitors that already have a card on the page, and monitors that already have a chart. */
@@ -41,6 +41,7 @@ export function Toolbox({ monitors, status, usedMonitorIds, chartMonitorIds, onA
   chartMonitorIds: ReadonlySet<number>
   onAdd: (type: string, monitorId?: number) => void
   onDragStart: (type: string) => void
+  onDragEnd: () => void
 }) {
   const [query, setQuery] = useState('')
   const [type, setType] = useState('all')
@@ -85,6 +86,7 @@ export function Toolbox({ monitors, status, usedMonitorIds, chartMonitorIds, onA
         <div
           draggable
           onDragStart={(e) => drag(e, 'monitor', { monitorId: String(m.id) })}
+          onDragEnd={onDragEnd}
           className="flex-1 min-w-0 flex items-center gap-1.5 pl-1 py-1 cursor-grab active:cursor-grabbing select-none"
           title={used ? `${m.name} (already on the page)` : m.name}
         >
@@ -135,6 +137,7 @@ export function Toolbox({ monitors, status, usedMonitorIds, chartMonitorIds, onA
               if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onAdd(b.type) }
             }}
             onDragStart={(e) => drag(e, b.type, b.type === 'group' ? { label: 'New group' } : {})}
+            onDragEnd={onDragEnd}
             className="flex flex-col items-center gap-0.5 py-2 rounded-lg bg-surface-container hover:bg-surface-container-high text-[11px] text-on-surface cursor-grab active:cursor-grabbing select-none"
           >
             <span className="text-secondary"><Icon name={b.icon} size={18} /></span>
