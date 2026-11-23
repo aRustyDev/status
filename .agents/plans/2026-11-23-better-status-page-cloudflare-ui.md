@@ -29,25 +29,25 @@ Use a server-provided capability list to drive the disabled states. Keep control
 
 ## Cutover decisions and staging checks
 
-Use a viewer session for the reader and separate operator and admin sessions for writes. Run the checks on the protected staging hostname with identifiable test records. Each checkbox needs a recorded outcome, the deployed gateway version, and the relevant UI, HTTP, or audit evidence. Unchecked items below remain open for the current candidate; historical results do not by themselves approve the updated build.
+Use a viewer session for the reader and separate operator and admin sessions for writes. Run the checks on the protected staging hostname with identifiable test records. Each checkbox needs a recorded outcome and relevant UI, HTTP, or audit evidence. Detailed gateway versions and operational records are retained privately. The completed checks below combine earlier scenario rehearsals with targeted retests of the final UI changes; not every scenario was rerun on the final build.
 
 ### 1. Show unknown health when an enabled check goes stale
 
 Carry the Worker's effective component health through the Status API. A missing sample, a sample older than three check intervals, or an endpoint fingerprint mismatch makes the check **Unknown**. Show that state on the card and in the overall headline when all other components are healthy. A known degradation, outage, or active incident still takes precedence. Reserve **All operational** for a nonempty board whose visible components are all operational. [Worker health calculation](../../apps/worker/src/index.ts#L139) · [Upstream headline](../../apps/status/src/App.tsx#L254)
 
-- [ ] Start with a healthy board, then use a staging fixture with one enabled check whose last success is older than three intervals. Confirm the API, card, and headline report unknown. Repeat before the first sample. Verify that a manual outage takes precedence and that a fresh matching success restores the healthy headline once the outage clears.
+- [x] Start with a healthy board, then use a staging fixture with one enabled check whose last success is older than three intervals. Confirm the API, card, and headline report unknown. Repeat before the first sample. Verify that a manual outage takes precedence and that a fresh matching success restores the healthy headline once the outage clears.
 
 ### 2. Make the incident form's two actions explicit
 
 Require an opening update and label the submit action **Save as draft** or **Publish**. Honor the selected initial status on both the incident and its opening update. In the upstream UI's API, commit the incident, opening update, component links, and create audit entry in one D1 batch. For immediate publication, set the published state and record the publish audit entry in that batch. Publishing a saved draft uses its ID and the version the operator saw. Confirm success in the form only after the chosen action commits. [Upstream incident form](../../apps/admin/src/pages/Incidents.tsx#L531) · [Existing incident mutations](../../apps/worker/src/index.ts#L219)
 
-- [ ] As operator, save a draft with a distinctive opening message. Confirm one create audit entry and that a viewer cannot see the incident in the reader or its API. Publish that same draft and verify one publish entry and the same message and service links on the reader. Create a second incident directly with **Publish** and initial status **Identified**. Verify immediate visibility, one opening update with that status, and one create and one publish entry. An empty opening update must leave both incident and audit counts unchanged.
+- [x] As operator, save a draft with a distinctive opening message. Confirm one create audit entry and that a viewer cannot see the incident in the reader or its API. Publish that same draft and verify one publish entry and the same message and service links on the reader. Create a second incident directly with **Publish** and initial status **Identified**. Verify immediate visibility, one opening update with that status, and one create and one publish entry. An empty opening update must leave both incident and audit counts unchanged.
 
 ### 3. Save only the monitor settings the user can change
 
 Give component details and HTTP check configuration separate save actions in the monitor screen. Operators can edit a component's name, manual health, and order. Admins can also configure its HTTP check using the deployment-approved destination list. Each action sends one versioned mutation for the edited record. Gate notification-channel, dependency, and action-link writes as well as their controls and reads. The respective APIs enforce these permissions. [Upstream monitor save](../../apps/admin/src/components/monitors/MonitorFormModal.tsx#L230) · [Worker role checks](../../apps/worker/src/index.ts#L182)
 
-- [ ] With browser network recording on, edit a component as operator and an approved check as admin. After each save, verify a success message, one mutation, one audit entry, and the saved value after reload. The trace should contain zero notification, dependency, or action-link writes. Verify HTTP 403 for a viewer's component edit and an operator's check edit, with no data or audit changes. A stale edit from a second tab must return 409 and preserve the first save.
+- [x] With browser network recording on, edit a component as operator and an approved check as admin. After each save, verify a success message, one mutation, one audit entry, and the saved value after reload. The trace should contain zero notification, dependency, or action-link writes. Verify HTTP 403 for a viewer's component edit and an operator's check edit, with no data or audit changes. A stale edit from a second tab must return 409 and preserve the first save.
 
 ### 4. Keep both HTTP contracts available through rollback
 
@@ -55,31 +55,31 @@ Keep the current board on its existing `/api/v1/` routes, including the UUID-bas
 
 Roll out the gateway with both API routes before changing which UI it serves. Rollback switches the HTML back to the registry-aware board while both APIs and both builds' hashed assets remain reachable for open tabs. Keep the migrated D1 database and scheduled probe in service throughout the rehearsal.
 
-- [ ] Leave a legacy board tab open across the switch. Fetch status from that tab and from a new reader tab and compare the same component by name, UUID, and numeric alias. Create and publish an incident in the new console. Switch HTML back, open the legacy board afresh, and post an update there. Verify both still-open clients can refetch the incident, its update, and its service links. Switch forward and confirm the numeric alias, UUID, audit sequence, and ongoing probe samples survived both switches.
+- [x] Leave a legacy board tab open across the switch. Fetch status from that tab and from a new reader tab and compare the same component by name, UUID, and numeric alias. Create and publish an incident in the new console. Switch HTML back, open the legacy board afresh, and post an update there. Verify both still-open clients can refetch the incident, its update, and its service links. Switch forward and confirm the numeric alias, UUID, audit sequence, and ongoing probe samples survived both switches.
 
 ### 5. Attribute uptime to the check configuration that produced it
 
 For reader charts and admin diagnostics, select results for the component's check ID **and** its current `config_version`. Retargeting the check or moving it to another component starts a new series. Report empty buckets and a null uptime percentage until that version has samples. Use the probe's 14-day retention limit for chart ranges, including the reader cards that currently request 30 days. Keep earlier rows for their normal retention period. [Result keys](../../apps/worker/migrations/0002_checks.sql#L17) · [Check reconfiguration](../../apps/worker/src/index.ts#L332) · [Probe retention](../../apps/probe/src/index.ts#L110)
 
-- [ ] Record a failing sample for a fixture check on service A. Move the same check to service B with a different approved destination and expected success. Before its next scheduled result, verify both views for B show no samples and no percentage. After the first success, verify only B's new sample contributes. Compare against the two D1 configurations and check that ranges beyond 14 days are disabled.
+- [x] Record a failing sample for a fixture check on service A. Move the same check to service B with a different approved destination and expected success. Before its next scheduled result, verify both views for B show no samples and no percentage. After the first success, verify only B's new sample contributes. Compare against the two D1 configurations and check that ranges beyond 14 days are disabled.
 
 ### 6. Generate a layout that can show incidents and planned work
 
 Generate monitor nodes in D1 component order, followed by top-level `incidents` and `maintenance` nodes with `filter: 'all'`. These blocks expose published incident history and future one-time maintenance even when every component is healthy. Keep drafts and cancelled windows out of reader responses. [Layout node types](../../packages/shared/src/types/layout.ts) · [Reader maintenance query](../../apps/status/src/App.tsx#L189)
 
-- [ ] With components operational, resolve a published fixture incident and schedule a future window. Load `/` as a viewer. Verify both titles are visible in their respective blocks, the layout contains both top-level nodes, and the maintenance request succeeds. Check the incident timeline and the window's start time. At the scheduled boundaries, verify the window moves from upcoming to active to past. Cancel a separate future window and verify it disappears from the reader.
+- [x] With components operational, resolve a published fixture incident and schedule a future window. Load `/` as a viewer. Verify both titles are visible in their respective blocks, the layout contains both top-level nodes, and the maintenance request succeeds. Check the incident timeline and the window's start time. At the scheduled boundaries, verify the window moves from upcoming to active to past. Cancel a separate future window and verify it disappears from the reader.
 
 ### 7. Use Cloudflare Access for both frontends
 
 Use the verified identity lookup behind `/api/v1/auth/me` for both the reader and the console, exposing it through the upstream API prefix as well. Replace upstream password, setup, and logout flows. Both clients send `X-Requested-With: XMLHttpRequest` on API fetches and recognize an HTTP 401 from Access even when the body has no application error code. On expiry, hide protected data, offer sign-in, and retain the operator's unsaved form in memory for the same identity. Explicit sign-out clears local session state and navigates to `/cdn-cgi/access/logout`. [Reader session handling](../../apps/status/src/App.tsx#L81) · [Reader sign-out](../../apps/status/src/components/AccountMenu.tsx#L38) · [Cloudflare Access session management](https://developers.cloudflare.com/cloudflare-one/access-controls/access-settings/session-management/)
 
-- [ ] Expire a staging test session with the reader open and an unsaved admin edit. Trigger a read and a save. Verify both receive 401 and offer sign-in, and that the refused save produces no audit entry. Reauthenticate as the same operator and submit the preserved edit once. In separate fresh sessions, select **Sign out** from each frontend and verify navigation to Access logout. Before signing in again, confirm that an AJAX read from each signed-out session receives 401.
+- [x] Expire a staging test session with the reader open and an unsaved admin edit. Trigger a read and a save. Verify both receive 401 and offer sign-in, and that the refused save produces no audit entry. Reauthenticate as the same operator and submit the preserved edit once. In separate fresh sessions, select **Sign out** from each frontend and verify navigation to Access logout. Before signing in again, confirm that an AJAX read from each signed-out session receives 401.
 
 ### 8. Mount the admin build at its public path
 
 Keep Vite's base at `/admin/`. Have the gateway redirect `/admin` to `/admin/` and strip exactly one `/admin` prefix from the request it forwards to the Admin UI Worker. For example, public `/admin/assets/<chunk>.js` resolves to `/assets/<chunk>.js` in `apps/admin/dist`. The browser keeps the public URL for React Router. Serve the admin index for console navigations, return 404 for missing assets, and route `/api/` requests before either UI fallback. [Admin Vite config](../../apps/admin/vite.config.ts#L8) · [Cloudflare SPA routing](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/)
 
-- [ ] In a fresh authenticated operator session with the browser cache disabled, open `/admin`, then directly load and refresh `/admin/monitors`. Verify the redirect, the rendered monitors screen, and successful JavaScript and CSS responses with the correct content types, including the lazy-loaded monitors chunk. A missing `/admin/assets/` chunk must return 404, and an unknown API route must return a JSON 404. Open `/` in another tab and confirm it shows the reader.
+- [x] In a fresh authenticated operator session with the browser cache disabled, open `/admin`, then directly load and refresh `/admin/monitors`. Verify the redirect, the rendered monitors screen, and successful JavaScript and CSS responses with the correct content types, including the lazy-loaded monitors chunk. A missing `/admin/assets/` chunk must return 404, and an unknown API route must return a JSON 404. Open `/` in another tab and confirm it shows the reader.
 
 ## Rollout and completion
 
@@ -90,7 +90,7 @@ Keep Vite's base at `/admin/`. Have the gateway redirect `/admin` to `/admin/` a
 
 ## Staging rehearsal record — November 23, 2026
 
-An earlier rehearsal recorded the eight scenarios below. Later rollout review found two failures: disabled incident controls explained their unavailability only in tooltips, and the reader's unpositioned status blocks overlapped. Each failure caused a return to the legacy board. The fixes were deployed for retesting, but the complete rollout gate remains open and staging has returned to the legacy board. Switch to the upstream screens only after all required checks pass; return to the legacy board on any failure. The administrator role and normal Access session duration were restored after the temporary role and expiry tests. Environment-specific deployment IDs, endpoints, and detailed audit records remain in the private operational record.
+The earlier rehearsal recorded the eight scenarios below. Later rollout review found unavailable incident actions explained only by tooltips, overlapping unpositioned reader blocks, and a mobile navigation drawer that did not close on Escape. Each failure caused a return to the legacy board; the fixes were deployed and retested. The final-build natural-expiry retry completed the remaining recovery check, and the upstream screens are active in staging. The administrator role and normal Access session duration were restored after the temporary role and expiry tests. Environment-specific deployment IDs, endpoints, and detailed audit records remain in the private operational record.
 
 Earlier rehearsal evidence:
 
@@ -114,7 +114,7 @@ The fixed live reader was inspected at 1440- and 390-pixel widths, including wit
 
 Before a fixture check's first sample, the final reader showed Unknown on the card and in the headline; both status APIs returned null for the last-check time. The fixture was restored afterward.
 
-A revoked session caused an admin save to return 401, hid the protected draft, and created no audit entry. Reauthentication as the same identity recovered the draft, which was then saved. An initial attempt to trigger natural expiry did not reproduce it, and a later browser interruption prevented completion of the test. Further observations and the remaining gap are recorded below. The temporary role, normal Access duration, and fixture configuration were restored. Staging is serving the legacy board while the rollout gate is incomplete.
+A revoked session caused an admin save to return 401, hid the protected draft, and created no audit entry. Reauthentication as the same identity recovered the draft, which was then saved. An initial attempt to trigger natural expiry did not reproduce it, and a later browser interruption prevented completion of the test. Further observations and the successful natural-expiry recovery retry are recorded below. The temporary role, normal Access duration, and fixture configuration were restored.
 
 The CI static check passed using a temporary recovered-attestation workaround for malformed npm registry responses. npm still verifies the signatures and attestations. The recovered snapshots cannot establish whether the registry later adds or withdraws an attestation; remove the workaround when the registry endpoint is restored.
 
@@ -127,11 +127,18 @@ On mobile, Enter opened navigation with initial focus on Close, Tab moved to Das
 
 On desktop, Tab and Shift+Tab were exercised in the incident dialog, and Escape closed it and returned focus to New Incident. The monitor menu opened with Enter and closed with Escape, returning focus to its opener. On the reader, the account menu opened with Enter and closed with Escape; the incident control responded to Enter and Space, and Tab exposed the history-bar text.
 
-These observations do not complete session-expiry validation or determine the final rollout state.
+The separate session-expiry and notification observations follow.
 
 
 ### Session and notification follow-up
 
 In an isolated Chrome session, a short-lived application token was issued and the team-domain session cookie was cleared. After the token expired naturally, an unsaved admin save led both the admin and reader to show session expiry. The audit count and fixture were unchanged. The original draft tab was no longer present after reauthentication, so same-session draft recovery after natural expiry remains unverified.
 
-Separately, a diagnostic admin build set the success notification duration to zero so a real save notification remained present. Signing out in another tab caused a 401; the notification remained in the DOM with `display: none`. After reauthentication as the same identity and Continue, it returned to `display: flex`. This notification observation used an instrumented build and session revocation; it was not a natural-expiry test. The uninstrumented admin build, administrator role, and normal Access duration were restored. Staging remains on the legacy board, and the final rollout gate remains open.
+Separately, a diagnostic admin build set the success notification duration to zero so a real save notification remained present. Signing out in another tab caused a 401; the notification remained in the DOM with `display: none`. After reauthentication as the same identity and Continue, it returned to `display: flex`. This notification observation used an instrumented build and session revocation; it was not a natural-expiry test. The uninstrumented admin build, administrator role, and normal Access duration were restored. Staging was returned to the legacy board pending the natural-expiry recovery retry below.
+
+
+### Natural-expiry recovery retry
+
+With the uninstrumented final admin build and a short application session in an isolated Firefox window, the operator kept an unsaved fixture edit open alongside the reader. The team-domain session cookie was cleared in that isolated window, and both frontends displayed session expiry after the application session elapsed. At that point the original fixture and audit count were unchanged. The admin had entered expiry before the attempted save, so this retry did not capture a refused-save HTTP 401; the separate revoked-session test above did.
+
+Sign-in opened a new tab and reauthenticated the same identity. Continue in the original admin tab restored the exact unsaved edit, which was saved once; the audit count increased by one. The fixture was then restored through the UI. The administrator role and normal Access duration were restored, and staging is serving the upstream screens. The notification privacy result above remains explicitly limited to the instrumented, revoked-session test.
