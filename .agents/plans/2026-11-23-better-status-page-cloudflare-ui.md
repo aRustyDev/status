@@ -90,7 +90,7 @@ Keep Vite's base at `/admin/`. Have the gateway redirect `/admin` to `/admin/` a
 
 ## Staging rehearsal record — November 23, 2026
 
-An earlier rehearsal recorded the eight scenarios below. Later rollout review found two failures: disabled incident controls explained their unavailability only in tooltips, and the reader's unpositioned status blocks overlapped. Each failure caused a return to the legacy board. The fixes are deployed and the gateway is temporarily serving the upstream screens for retesting; the current candidate has not yet passed the complete rollout gate. Keep it active only if all required checks pass; return to the legacy board on any failure. The administrator role and normal Access session duration were restored after the temporary role and expiry tests. Environment-specific deployment IDs, endpoints, and detailed audit records remain in the private operational record.
+An earlier rehearsal recorded the eight scenarios below. Later rollout review found two failures: disabled incident controls explained their unavailability only in tooltips, and the reader's unpositioned status blocks overlapped. Each failure caused a return to the legacy board. The fixes were deployed for retesting, but the complete rollout gate remains open and staging has returned to the legacy board. Switch to the upstream screens only after all required checks pass; return to the legacy board on any failure. The administrator role and normal Access session duration were restored after the temporary role and expiry tests. Environment-specific deployment IDs, endpoints, and detailed audit records remain in the private operational record.
 
 Earlier rehearsal evidence:
 
@@ -99,10 +99,21 @@ Earlier rehearsal evidence:
 3. Operator component and administrator check edits each produced one mutation and audit entry; disallowed writes returned 403 and a stale update returned 409. Browser recording covered same-origin fetch and XMLHttpRequest traffic.
 4. Both API contracts, stable aliases, incident updates across rollback, audit entries, and continued public and private probe samples were verified.
 5. A moved and retargeted check began with empty history and accumulated only the new configuration's samples; earlier samples remained retained.
-6. The viewer saw incident history and scheduled maintenance, including boundary transitions and cancellation. The later overlap failure requires a reader-layout retest of the fixed build.
-7. Expired reads and saves returned 401 without a refused-save audit entry; reauthentication preserved the operator draft. Both sign-outs reached Access logout and later AJAX reads returned 401. A modal obstruction found during rehearsal was fixed and retested; the subsequent expiry privacy changes still require staging validation.
+6. The viewer saw incident history and scheduled maintenance, including boundary transitions and cancellation. The later overlap failure was retested on the fixed reader build as described below.
+7. Expired reads and saves returned 401 without a refused-save audit entry; reauthentication preserved the operator draft. Both sign-outs reached Access logout and later AJAX reads returned 401. A modal obstruction found during rehearsal was fixed and retested; the subsequent expiry-notification privacy change still requires staging validation.
 8. With browser caching disabled, the admin redirect, direct monitors load and refresh, JavaScript and CSS content types, missing asset and unknown API 404 responses, and reader were verified.
 
 A read-only baseline confirmed that all four D1 migrations were applied with none pending, the endpoint registry matched its synchronization preview, and representative scheduled checks were healthy. Detailed values are retained privately.
 
-A local synthetic-fixture comparison exercised the pinned Node and adapted Cloudflare reader, dashboard, monitors, incidents, and maintenance screens at 1440 and 390 pixels. Each pair displayed its expected page heading, with no horizontal document overflow; the reader captures used the same expanded incident state. The adapted reader's coordinate-free layout also passed real-browser non-overlap checks at both widths after expanding a long incident. These are semantic and geometry checks, not a pixel-equivalence claim or a substitute for live staging validation. `npm run test:e2e -w @bsp/status` runs the durable geometry regression. Final staging keyboard and disabled-control verification remains part of the rollout gate.
+A local synthetic-fixture comparison exercised the pinned Node and adapted Cloudflare reader, dashboard, monitors, incidents, and maintenance screens at 1440 and 390 pixels. Each pair displayed its expected page heading, with no horizontal document overflow; the reader captures used the same expanded incident state. The adapted reader's coordinate-free layout also passed real-browser non-overlap checks at both widths after expanding a long incident. These are semantic and geometry checks, not a pixel-equivalence claim or a substitute for live staging validation. `npm run test:e2e -w @bsp/status` runs the durable geometry regression. Final staging keyboard verification remains part of the rollout gate.
+
+
+### Final-build staging follow-up
+
+The fixed live reader was inspected at 1440- and 390-pixel widths, including with an expanded incident; the reader blocks did not overlap. The fixed admin incident screen visibly explained unavailable actions. Visibility alone does not complete the keyboard review.
+
+Before a fixture check's first sample, the final reader showed Unknown on the card and in the headline; both status APIs returned null for the last-check time. The fixture was restored afterward.
+
+A revoked session caused an admin save to return 401, hid the protected draft, and created no audit entry. Reauthentication as the same identity recovered the draft, which was then saved. Natural expiry with a five-minute session did not reproduce the expiry path, and expiry-notification toast privacy was not exercised live. Those checks and the outstanding keyboard review remain open. The temporary role, normal Access duration, and fixture configuration were restored. Staging is serving the legacy board while the rollout gate is incomplete.
+
+The CI static check also remains unresolved: npm attestation validation failed with a malformed attestation. Record a passing CI result before marking the pull request ready.
