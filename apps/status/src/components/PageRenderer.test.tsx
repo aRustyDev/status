@@ -29,6 +29,20 @@ const monitors: PublicMonitor[] = [
 ]
 
 describe('PageRenderer', () => {
+  it('places unpositioned status blocks in separate full-width auto rows', () => {
+    const tree: LayoutTree = { id: 'root', type: 'page', children: [
+      { id: 'first', type: 'monitor', monitorId: 1, showUptimeBar: false },
+      { id: 'second', type: 'monitor', monitorId: 2, showUptimeBar: false },
+      { id: 'incidents', type: 'incidents', filter: 'all', limit: 20 },
+      { id: 'maintenance', type: 'maintenance', filter: 'all', limit: 20 },
+    ] }
+    const { container } = render(<PageRenderer tree={tree} monitors={monitors} statusMap={{}} />)
+    const cells = [...container.querySelectorAll<HTMLElement>('.bsp-layout-cell')]
+    expect(cells).toHaveLength(4)
+    expect(cells.map(cell => cell.style.gridRow)).toEqual(['auto', 'auto', 'auto', 'auto'])
+    expect(cells.map(cell => cell.style.gridColumn)).toEqual(['1 / -1', '1 / -1', '1 / -1', '1 / -1'])
+  })
+
   it('shows incidents even when the limit of the block is empty or zero', () => {
     const incident = { id: 1, title: 'Checkout errors', status: 'investigating', impact: 'major', monitorIds: [], updates: [], startedAt: 1, createdAt: 1, updatedAt: 1 } as never
     const tree = (limit: number): LayoutTree => ({ id: 'root', type: 'page', children: [{ id: 'i', type: 'incidents', limit }] })

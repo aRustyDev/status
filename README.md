@@ -8,6 +8,7 @@ The board supports services, manual health, incident drafts and updates, one-tim
 
 - `apps/gateway` — staging gateway, internal Worker configurations, and static-asset routing.
 - `apps/admin` and `apps/status` — adapted upstream React console and reader used by the Workers deployment.
+- `apps/admin-node` and `apps/status-node` — pinned upstream console and reader for the Node/Docker deployment.
 - `apps/board` — legacy React board retained for rollback.
 - `apps/worker` — Access-verified APIs, legacy assets, and D1 migrations.
 - `apps/probe` — scheduled HTTP checks and endpoint synchronization tooling.

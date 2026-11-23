@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --port 5174",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e": "playwright test --config playwright.config.ts"
   },
   "dependencies": {
     "@better-forge/contracts": "0.2.0",

@@ -5,6 +5,7 @@ import type { Incident } from '@bsp/shared'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../api/client'
 import IncidentsPage from './Incidents'
+import { CapabilitiesContext, type Capabilities } from '../capabilities'
 import { ToastProvider } from '@better-forge/ui'
 
 vi.mock('../api/client', () => ({
@@ -40,9 +41,9 @@ function mockGets(list: Incident[] = incidents) {
   })
 }
 
-function renderPage() {
+function renderPage(capabilities: Capabilities = { supportedRoutes: [] }) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={queryClient}><ToastProvider><IncidentsPage /></ToastProvider></QueryClientProvider>)
+  return render(<QueryClientProvider client={queryClient}><CapabilitiesContext.Provider value={capabilities}><ToastProvider><IncidentsPage /></ToastProvider></CapabilitiesContext.Provider></QueryClientProvider>)
 }
 
 describe('IncidentsPage', () => {
@@ -60,6 +61,26 @@ describe('IncidentsPage', () => {
     expect(await screen.findByText('Checkout errors')).toBeInTheDocument()
     expect(screen.getByText('DNS blip')).toBeInTheDocument()
     expect(screen.getByText('1 active · 2 total')).toBeInTheDocument()
+  })
+
+  it('explains unavailable templates and incident deletion to all users', async () => {
+    renderPage()
+    await screen.findByText('Checkout errors')
+    expect(screen.getByText('Incident templates are unavailable.')).toBeVisible()
+    expect(screen.getByText('Deleting incidents is unavailable.')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Templates' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Templates' })).toHaveAccessibleDescription('Incident templates are unavailable.')
+    expect(screen.getByRole('button', { name: 'Delete Checkout errors' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Delete Checkout errors' })).toHaveAccessibleDescription('Deleting incidents is unavailable.')
+  })
+
+  it('does not show unavailable explanations when the actions are supported', async () => {
+    renderPage({ supportedRoutes: [], templates: true, incidentDelete: true })
+    await screen.findByText('Checkout errors')
+    expect(screen.getByRole('button', { name: 'Templates' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Delete Checkout errors' })).toBeEnabled()
+    expect(screen.queryByText('Incident templates are unavailable.')).not.toBeInTheDocument()
+    expect(screen.queryByText('Deleting incidents is unavailable.')).not.toBeInTheDocument()
   })
 
   it('shows an empty state', async () => {

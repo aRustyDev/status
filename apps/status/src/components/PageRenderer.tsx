@@ -47,8 +47,8 @@ export function PageRenderer({
           key={node.id}
           className="bsp-layout-cell"
           style={{
-            gridColumn: `${(node.grid?.x ?? 0) + 1} / span ${node.grid?.w ?? 3}`,
-            gridRow: `${(node.grid?.y ?? 0) + 1} / span ${node.grid?.h ?? 1}`,
+            gridColumn: node.grid ? `${node.grid.x + 1} / span ${node.grid.w}` : '1 / -1',
+            gridRow: node.grid ? `${node.grid.y + 1} / span ${node.grid.h}` : 'auto',
             minWidth: 0,
             alignSelf: 'start',
           }}

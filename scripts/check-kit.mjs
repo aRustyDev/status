@@ -11,7 +11,7 @@ const read = (file) => JSON.parse(fs.readFileSync(path.join(root, file), 'utf8')
 const SCOPE = '@better-forge/'
 const problems = []
 
-for (const file of ['package.json', 'apps/api/package.json', 'apps/admin/package.json', 'apps/status/package.json', 'packages/shared/package.json']) {
+for (const file of ['package.json', 'apps/api/package.json', 'apps/admin/package.json', 'apps/admin-node/package.json', 'apps/status/package.json', 'apps/status-node/package.json', 'packages/shared/package.json']) {
   const manifest = read(file)
   for (const section of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
     for (const [name, range] of Object.entries(manifest[section] ?? {})) {

@@ -24,6 +24,8 @@ const source = path.join(root, 'node_modules', 'material-symbols', 'material-sym
 // `fill` pins the FILL axis when the surface never varies it: the public page only draws outlined icons, the admin also
 // fills the active one, so its font keeps the axis and the filled glyph of every icon.
 const surfaces = [
+  { file: 'apps/status-node/src/fonts/material-symbols-outlined.woff2', dirs: ['apps/status-node'], fill: 0 },
+  { file: 'apps/admin-node/src/fonts/material-symbols-outlined-fill.woff2', dirs: ['apps/admin-node'], fill: undefined, withUiIcons: true },
   { file: 'apps/status/src/fonts/material-symbols-outlined.woff2', dirs: ['apps/status'], fill: 0 },
   { file: 'apps/admin/src/fonts/material-symbols-outlined-fill.woff2', dirs: ['apps/admin'], fill: undefined, withUiIcons: true },
 ]
@@ -32,7 +34,8 @@ const uiIconList = 'node_modules/@better-forge/ui/icons.json'
 const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
   const file = path.join(dir, entry.name)
   if (entry.isDirectory()) return ['node_modules', 'dist', 'build', 'coverage'].includes(entry.name) ? [] : walk(file)
-  return /\.(ts|tsx|html)$/.test(entry.name) && !/\.(test|spec)\.|\.d\.ts$/.test(entry.name) ? [file] : []
+  // Test and configuration files do not contribute rendered icons.
+  return /\.(ts|tsx|html)$/.test(entry.name) && !/\.(test|spec)\.|\.d\.ts$|\.config\.ts$/.test(entry.name) ? [file] : []
 })
 
 // Every lowercase word in the sources. Quotes are not paired to find the string literals: an apostrophe in a text or a

@@ -176,6 +176,7 @@ export default function MonitorsPage() {
           <span className="text-sm">Import and export are unavailable.</span>
         </>}
       />
+      {!capabilities.runNow && <p id="monitor-run-now-unavailable" className="text-sm">Run-now checks are unavailable.</p>}
 
       {/* Tag filter bar */}
       {allTags.length > 0 && (
@@ -380,8 +381,10 @@ export default function MonitorsPage() {
                       {monitor.type !== 'webhook' && (
                         <ActionBtn
                           onClick={() => checkNowMutation.mutate(monitor)}
-                                                    label={checkingId === monitor.id ? `Checking ${monitor.name}…` : `Check ${monitor.name} now`}
-                          disabled={!capabilities.runNow || checkingId === monitor.id} title={capabilities.runNow ? "Check now" : "Run-now checks are unavailable"}
+                          label={checkingId === monitor.id ? `Checking ${monitor.name}…` : `Check ${monitor.name} now`}
+                          disabled={!capabilities.runNow || checkingId === monitor.id}
+                          title={capabilities.runNow ? "Check now" : "Run-now checks are unavailable"}
+                          describedBy={capabilities.runNow ? undefined : "monitor-run-now-unavailable"}
                         >
                           <IconRefresh spinning={checkingId === monitor.id} />
                         </ActionBtn>
@@ -461,11 +464,11 @@ function CertExpiryChip({ monitor }: { monitor: Monitor }) {
   )
 }
 
-function ActionBtn({ children, onClick, title, label, danger = false, disabled = false }: {
-  children: React.ReactNode; onClick: () => void; title: string; label: string; danger?: boolean; disabled?: boolean
+function ActionBtn({ children, onClick, title, label, danger = false, disabled = false, describedBy }: {
+  children: React.ReactNode; onClick: () => void; title: string; label: string; danger?: boolean; disabled?: boolean; describedBy: string | undefined
 }) {
   return (
-    <button type="button" onClick={onClick} title={title} aria-label={label} disabled={disabled}
+    <button type="button" onClick={onClick} title={title} aria-label={label} aria-describedby={describedBy} disabled={disabled}
       className={danger ? 'btn-icon hover:!bg-[var(--m3-down-bg)]' : 'btn-icon'}
       style={danger ? { color: 'var(--m3-down)' } : undefined}
     >

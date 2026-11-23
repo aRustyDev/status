@@ -127,7 +127,7 @@ export default function IncidentsPage() {
 
   const newIncidentButton = (
     <>
-      <button type="button" disabled={!capabilities.templates} onClick={() => setShowTemplates(true)} title={capabilities.templates ? undefined : "Incident templates are unavailable"} className="btn btn-secondary">
+      <button type="button" disabled={!capabilities.templates} onClick={() => setShowTemplates(true)} title={capabilities.templates ? undefined : "Incident templates are unavailable"} aria-describedby={capabilities.templates ? undefined : "incident-templates-unavailable"} className="btn btn-secondary">
         <span className="material-symbols-outlined" aria-hidden="true">article</span>
         Templates
       </button>
@@ -145,6 +145,8 @@ export default function IncidentsPage() {
         subtitle={isPending || isError ? undefined : `${activeCount} active · ${incidents.length} total`}
         actions={newIncidentButton}
       />
+      {!capabilities.templates && <p id="incident-templates-unavailable" className="text-sm">Incident templates are unavailable.</p>}
+      {!capabilities.incidentDelete && <p id="incident-delete-unavailable" className="text-sm">Deleting incidents is unavailable.</p>}
 
       {isPending ? (
         <LoadingState label="Loading incidents…" />
@@ -221,6 +223,7 @@ export default function IncidentsPage() {
                   type="button"
                   disabled={!capabilities.incidentDelete} onClick={() => setConfirmDelete(incident)} title={capabilities.incidentDelete ? undefined : "Deleting incidents is unavailable"}
                   aria-label={`Delete ${incident.title}`}
+                  aria-describedby={capabilities.incidentDelete ? undefined : "incident-delete-unavailable"}
                   className="btn-icon hover:!bg-[var(--m3-down-bg)]"
                   style={{ color: 'var(--m3-down)' }}
                 >

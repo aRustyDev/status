@@ -234,6 +234,11 @@ export default function MaintenancePage() {
                     </span>
                   ))}
                 </div>
+                {(win.state === 'cancelled' || occurrence.startsAt <= now) && (
+                  <p id={`maintenance-${win.id}-actions-unavailable`} className="text-xs mt-2" style={{ color: 'var(--m3-secondary)' }}>
+                    {win.state === 'cancelled' ? 'Cancelled maintenance cannot be edited or deleted.' : 'Only upcoming maintenance can be deleted.'}
+                  </p>
+                )}
               </div>
 
               <div className="flex items-center gap-1 flex-shrink-0">
@@ -248,6 +253,7 @@ export default function MaintenancePage() {
                   disabled={win.state === 'cancelled'}
                   title="Edit"
                   aria-label={`Edit ${win.name}`}
+                  aria-describedby={win.state === 'cancelled' ? `maintenance-${win.id}-actions-unavailable` : undefined}
                   className="btn-icon"
                 >
                   <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: '18px' }}>edit</span>
@@ -258,6 +264,7 @@ export default function MaintenancePage() {
                   disabled={win.state === 'cancelled' || occurrence.startsAt <= now}
                   title="Delete"
                   aria-label={`Delete ${win.name}`}
+                  aria-describedby={win.state === 'cancelled' || occurrence.startsAt <= now ? `maintenance-${win.id}-actions-unavailable` : undefined}
                   className="btn-icon hover:!bg-[var(--m3-down-bg)]"
                   style={{ color: 'var(--m3-down)' }}
                 >

@@ -15,8 +15,8 @@ const SNAPSHOT_KEY = 'snapshot.json'
 const SNAPSHOT_META = `<meta name="bsp-snapshot" content="/${SNAPSHOT_KEY}" />`
 
 const here = path.dirname(fileURLToPath(import.meta.url))
-/** `apps/status/dist`, from `src/services` as well as from `dist/services`. */
-export const defaultStatusDist = path.resolve(here, '../../../status/dist')
+/** `apps/status-node/dist`, from `src/services` as well as from `dist/services`. */
+export const defaultStatusDist = path.resolve(here, '../../../status-node/dist')
 
 const CONTENT_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -108,7 +108,7 @@ function uploadsOf(snapshot: StatusSnapshot): MirrorObject[] {
  */
 export function buildMirrorObjects(snapshot: StatusSnapshot, statusDist = defaultStatusDist): MirrorObject[] {
   const indexFile = path.join(statusDist, 'index.html')
-  if (!fs.existsSync(indexFile)) throw new Error('The status page is not built: apps/status/dist/index.html is missing')
+  if (!fs.existsSync(indexFile)) throw new Error('The status page is not built: apps/status-node/dist/index.html is missing')
   const html = fs.readFileSync(indexFile, 'utf8')
   if (!html.includes('</head>')) throw new Error('index.html of the status page has no <head> to mark as a saved copy')
   const savedCopy = html.replace('</head>', `    ${SNAPSHOT_META}\n  </head>`)

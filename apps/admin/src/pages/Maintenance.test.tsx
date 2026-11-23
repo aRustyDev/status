@@ -97,6 +97,27 @@ describe('MaintenancePage', () => {
     expect(screen.getByText('(45m)')).toBeInTheDocument()
   })
 
+  it('explains unavailable actions for started and cancelled windows', async () => {
+    const user = userEvent.setup()
+    const now = Date.now()
+    mockGets([
+      { id: 1, name: 'Started work', description: null, startsAt: now - HOUR, endsAt: now + HOUR, monitorIds: [], state: 'active' },
+      { id: 2, name: 'Cancelled work', description: null, startsAt: now + HOUR, endsAt: now + 2 * HOUR, monitorIds: [], state: 'cancelled' },
+    ])
+    renderPage()
+    const startedDelete = await screen.findByRole('button', { name: 'Delete Started work' })
+    expect(startedDelete).toBeDisabled()
+    expect(screen.getByText('Only upcoming maintenance can be deleted.')).toBeVisible()
+    expect(startedDelete).toHaveAccessibleDescription('Only upcoming maintenance can be deleted.')
+    await user.click(screen.getByRole('button', { name: /^cancelled/ }))
+    expect(screen.getByText('Cancelled maintenance cannot be edited or deleted.')).toBeVisible()
+    for (const label of ['Edit Cancelled work', 'Delete Cancelled work']) {
+      const action = screen.getByRole('button', { name: label })
+      expect(action).toBeDisabled()
+      expect(action).toHaveAccessibleDescription('Cancelled maintenance cannot be edited or deleted.')
+    }
+  })
+
   it('shows empty states per tab', async () => {
     const user = userEvent.setup()
     mockGets([])

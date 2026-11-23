@@ -268,7 +268,7 @@ describe('a push on demand', () => {
 describe('a mirror run', () => {
   const built = fs.existsSync(path.join(defaultStatusDist, 'index.html'))
 
-  it('uploads signed files to the target and records the success', { skip: !built && 'apps/status is not built' }, async () => {
+  it('uploads signed files to the target and records the success', { skip: !built && 'apps/status-node is not built' }, async () => {
     puts.length = 0
     await saveStaticMirrorSettings(valid())
     await runStaticMirror()
@@ -292,7 +292,7 @@ describe('a mirror run', () => {
     assert.deepEqual(puts.map((p) => p.url), ['/status-copy/snapshot.json'])
   })
 
-  it('uploads the whole page again when the settings are saved or a full push is asked for', { skip: !built && 'apps/status is not built' }, async () => {
+  it('uploads the whole page again when the settings are saved or a full push is asked for', { skip: !built && 'apps/status-node is not built' }, async () => {
     await saveStaticMirrorSettings(valid())
     await runStaticMirror()
     puts.length = 0

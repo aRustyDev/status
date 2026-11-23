@@ -1,0 +1,397 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Fonts are bundled with the app (Manrope, Inter, JetBrains Mono: SIL OFL; Material Symbols: Apache 2.0),
+   so opening the console or a status page makes no request to Google. */
+@font-face { font-family: 'Manrope'; font-style: normal; font-weight: 400; font-display: swap; src: url('./fonts/manrope-latin-ext-4.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Manrope'; font-style: normal; font-weight: 600; font-display: swap; src: url('./fonts/manrope-latin-ext-4.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Manrope'; font-style: normal; font-weight: 700; font-display: swap; src: url('./fonts/manrope-latin-ext-4.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Manrope'; font-style: normal; font-weight: 800; font-display: swap; src: url('./fonts/manrope-latin-ext-4.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Manrope'; font-style: normal; font-weight: 400; font-display: swap; src: url('./fonts/manrope-latin-5.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Manrope'; font-style: normal; font-weight: 600; font-display: swap; src: url('./fonts/manrope-latin-5.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Manrope'; font-style: normal; font-weight: 700; font-display: swap; src: url('./fonts/manrope-latin-5.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Manrope'; font-style: normal; font-weight: 800; font-display: swap; src: url('./fonts/manrope-latin-5.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 400; font-display: swap; src: url('./fonts/inter-latin-ext.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 500; font-display: swap; src: url('./fonts/inter-latin-ext.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 600; font-display: swap; src: url('./fonts/inter-latin-ext.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 400; font-display: swap; src: url('./fonts/inter-latin-1.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 500; font-display: swap; src: url('./fonts/inter-latin-1.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 600; font-display: swap; src: url('./fonts/inter-latin-1.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'JetBrains Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url('./fonts/jetbrains-mono-latin-ext-2.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'JetBrains Mono'; font-style: normal; font-weight: 500; font-display: swap; src: url('./fonts/jetbrains-mono-latin-ext-2.woff2') format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'JetBrains Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url('./fonts/jetbrains-mono-latin-3.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'JetBrains Mono'; font-style: normal; font-weight: 500; font-display: swap; src: url('./fonts/jetbrains-mono-latin-3.woff2') format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Material Symbols Outlined'; font-style: normal; font-weight: 400; font-display: block; src: url('./fonts/material-symbols-outlined.woff2') format('woff2'); }
+
+/* ── M3 Color Tokens — Light (exact from mockup) ─────────────────── */
+:root {
+  color-scheme: light;
+  --m3-surface:                  #faf8ff;
+  --m3-surface-dim:              #d2d9f4;
+  --m3-surface-bright:           #faf8ff;
+  --m3-surface-container-lowest: #ffffff;
+  --m3-surface-container-low:    #f2f3ff;
+  --m3-surface-container:        #eaedff;
+  --m3-surface-container-high:   #e2e7ff;
+  --m3-surface-container-highest:#dae2fd;
+  --m3-on-surface:               #131b2e;
+  --m3-on-surface-variant:       #45464d;
+  --m3-secondary:                #505f76;
+  --m3-outline:                  #76777d;
+  --m3-outline-variant:          #c6c6cd;
+  --m3-primary:                  #000000;
+  --m3-on-primary:               #ffffff;
+  --m3-on-primary-container:     #497cff;
+  --m3-primary-fixed:            #dbe1ff;
+  --m3-primary-fixed-dim:        #b4c5ff;
+  --m3-primary-container:        #00174b;
+  --m3-surface-tint:             #0053db;
+  --m3-inverse-primary:          #b4c5ff;
+  --m3-secondary-container:      #d0e1fb;
+  --m3-on-secondary-container:   #54647a;
+  --m3-error:                    #ba1a1a;
+  --m3-error-container:          #ffdad6;
+  --m3-on-error-container:       #93000a;
+
+  /* Status colors matching mockup badges */
+  --m3-up:        #166534;
+  --m3-up-bg:     rgba(34, 197, 94, 0.12);
+  --m3-up-bar:    #22c55e;
+  --m3-down:      #ba1a1a;
+  --m3-down-bg:   #ffdad6;
+  --m3-degraded:  #854d0e;
+  --m3-degraded-bg: rgba(234, 179, 8, 0.12);
+  --m3-degraded-bar: #eab308;
+  --m3-partial-bar: #f97316;
+
+  /* Maintenance colors */
+  --bsp-maintenance:        #3b82f6;
+  --bsp-maintenance-bg:     rgba(59, 130, 246, 0.1);
+  --bsp-maintenance-border: rgba(59, 130, 246, 0.25);
+  --bsp-maintenance-text:   #1d4ed8;
+  --bsp-maintenance-muted:  #1e40af;
+  --bsp-maintenance-chip-bg: rgba(59, 130, 246, 0.13);
+
+  /* BSP branding aliases — map to M3 defaults */
+  --bsp-bg:          var(--m3-surface);
+  --bsp-card-bg:     var(--m3-surface-container-low);
+  --bsp-elevated-bg: var(--m3-surface-container-high);
+  --bsp-card-border: var(--m3-outline-variant);
+  --bsp-text:        var(--m3-on-surface);
+  --bsp-text-muted:  var(--m3-secondary);
+  --bsp-primary:     var(--m3-primary);
+  --bsp-accent:      var(--m3-on-primary-container);
+  --bsp-up:          var(--m3-up-bar);
+  --bsp-down:        var(--m3-down);
+  --bsp-degraded:    var(--m3-degraded-bar);
+  --bsp-partial:     var(--m3-partial-bar);
+  /* Status text (pills, labels) needs more contrast than dots and bars do. */
+  --bsp-up-text:       var(--m3-up);
+  --bsp-down-text:     var(--m3-down);
+  --bsp-degraded-text: var(--m3-degraded);
+  --bsp-chart-bg:    var(--m3-surface-container-low);
+  --bsp-chart-grid:  var(--m3-outline-variant);
+
+  --color-primary: var(--bsp-primary);
+  --color-accent:  var(--bsp-accent);
+}
+
+/* ── M3 Color Tokens — Dark ───────────────────────────────────────── */
+html.dark {
+  color-scheme: dark;
+  --m3-surface:                  #0f1117;
+  --m3-surface-dim:              #0f1117;
+  --m3-surface-bright:           #36343b;
+  --m3-surface-container-lowest: #0a0a10;
+  --m3-surface-container-low:    #191921;
+  --m3-surface-container:        #1d1d26;
+  --m3-surface-container-high:   #282730;
+  --m3-surface-container-highest:#33313b;
+  --m3-on-surface:               #e5e0ec;
+  --m3-on-surface-variant:       #c9c4d0;
+  --m3-secondary:                #cac4d0;
+  --m3-outline:                  #948f9a;
+  --m3-outline-variant:          #48454e;
+  --m3-primary:                  #b4c5ff;
+  --m3-on-primary:               #002891;
+  --m3-on-primary-container:     #aac7ff;
+  --m3-primary-container:        #001543;
+  --m3-secondary-container:      #2a3a4d;
+  --m3-on-secondary-container:   #c0cedd;
+  --m3-error:                    #ffb4ab;
+  --m3-error-container:          #93000a;
+  --m3-on-error-container:       #ffdad6;
+  --m3-primary-fixed:            #002891;
+  --m3-primary-fixed-dim:        #002891;
+  --m3-surface-tint:             #b4c5ff;
+  --m3-inverse-primary:          #0053db;
+
+  --m3-up:        #4ade80;
+  --m3-up-bg:     rgba(74, 222, 128, 0.12);
+  --m3-up-bar:    #4ade80;
+  --m3-down:      #ffb4ab;
+  --m3-down-bg:   rgba(147, 0, 10, 0.25);
+  --m3-degraded:  #ffb950;
+  --m3-degraded-bg: rgba(234, 179, 8, 0.15);
+  --m3-degraded-bar: #fbbf24;
+  --m3-partial-bar: #fb923c;
+
+  /* Maintenance colors — lighter for dark theme */
+  --bsp-maintenance:        #60a5fa;
+  --bsp-maintenance-bg:     rgba(96, 165, 250, 0.12);
+  --bsp-maintenance-border: rgba(96, 165, 250, 0.28);
+  --bsp-maintenance-text:   #93c5fd;
+  --bsp-maintenance-muted:  #7dd3fc;
+  --bsp-maintenance-chip-bg: rgba(96, 165, 250, 0.15);
+}
+
+/* ── Base ─────────────────────────────────────────────────────────── */
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: 'Inter', system-ui, sans-serif;
+  background: var(--m3-surface);
+  color: var(--m3-on-surface);
+}
+
+/* ── BSP card defaults (used by branding system) ─────────────────── */
+.bsp-monitor-card {
+  background: var(--bsp-card-bg);
+  border: 1px solid var(--bsp-card-border);
+  border-radius: 16px;
+  overflow: hidden;
+}
+.bsp-group-card {
+  background: var(--bsp-card-bg);
+  border: 1px solid var(--bsp-card-border);
+  border-radius: 16px;
+}
+.bsp-chart-card {
+  background: var(--bsp-chart-bg);
+  border-color: var(--bsp-card-border);
+}
+.bsp-monitor-name  { color: var(--bsp-text); }
+.bsp-group-label   { color: var(--bsp-text); }
+.bsp-site-name     { color: var(--bsp-text); }
+.bsp-text-block    { color: var(--bsp-text-muted); }
+.bsp-footer        { color: var(--bsp-text-muted); border-top-color: var(--bsp-card-border); }
+.bsp-project-link    { color: var(--bsp-text-muted); opacity: 0.7; text-decoration: none; transition: opacity 0.15s; }
+.bsp-project-link:hover { opacity: 1; }
+.bsp-project-link:focus-visible { opacity: 1; outline: none; box-shadow: 0 0 0 3px var(--bsp-action-focus); }
+.bsp-divider       { border-top-color: var(--bsp-card-border); }
+
+/* ── Page wrapper ─────────────────────────────────────────────────── */
+.bsp-page {
+  background: var(--bsp-bg);
+  min-height: 100vh;
+}
+
+/* ── Status dot pulse ─────────────────────────────────────────────── */
+@keyframes dot-ping {
+  0%   { transform: scale(1);   opacity: 0.5; }
+  70%  { transform: scale(2.4); opacity: 0;   }
+  100% { transform: scale(2.4); opacity: 0;   }
+}
+.monitor-dot-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  animation: dot-ping 2s ease-out infinite;
+}
+
+/* ── Entrance animation ───────────────────────────────────────────── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up {
+  opacity: 0;
+  animation: fadeUp 0.45s ease forwards;
+}
+
+/* ── Card hover ───────────────────────────────────────────────────── */
+.card-hover {
+  transition: box-shadow 0.2s ease, border-color 0.2s ease, transform 0.15s ease;
+}
+.card-hover:hover {
+  box-shadow: 0 2px 16px rgba(0, 83, 219, 0.08);
+  border-color: var(--m3-outline);
+  transform: translateY(-1px);
+}
+html.dark .card-hover:hover {
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.35);
+}
+
+/* ── Primary actions (Subscribe, dialog buttons) ───────────────────
+   Same values as the admin console's .btn-primary, so both apps read as one product. */
+.bsp-page {
+  --bsp-action-bg:       #dbe7ff;
+  --bsp-action-bg-hover: #c9d9ff;
+  --bsp-action-fg:       #172033;
+  --bsp-action-focus:    rgba(73, 124, 255, 0.28);
+}
+html.dark .bsp-page {
+  --bsp-action-bg:       #e5e7eb;
+  --bsp-action-bg-hover: #ffffff;
+  --bsp-action-fg:       #111318;
+  --bsp-action-focus:    rgba(229, 231, 235, 0.28);
+}
+.bsp-action {
+  transition: background-color 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease;
+}
+.bsp-action:hover:not(:disabled) {
+  background: var(--bsp-action-bg-hover) !important;
+}
+.bsp-action:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--bsp-action-focus);
+}
+.bsp-action:disabled {
+  cursor: not-allowed;
+}
+
+/* ── Secondary / icon buttons (close, remove, menus) ─────────────── */
+.bsp-ghost {
+  transition: background-color 0.18s ease, box-shadow 0.18s ease, color 0.18s ease;
+}
+.bsp-ghost:hover:not(:disabled),
+.bsp-ghost[aria-expanded="true"] {
+  background: var(--m3-surface-container);
+}
+.bsp-ghost:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--bsp-action-focus);
+}
+.bsp-ghost:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── Form fields ──────────────────────────────────────────────────── */
+.bsp-input {
+  border: 1px solid var(--bsp-card-border);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.bsp-input:focus-visible {
+  outline: none;
+  border-color: var(--m3-outline);
+  box-shadow: 0 0 0 3px var(--bsp-action-focus);
+}
+.bsp-page input[type="checkbox"],
+.bsp-page input[type="radio"] {
+  accent-color: var(--bsp-text);
+}
+
+/* ── Layout grid: builder columns on desktop, one column on phones ── */
+.bsp-layout-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 24px;
+  row-gap: 10px;
+}
+@media (max-width: 767px) {
+  .bsp-layout-grid { grid-template-columns: minmax(0, 1fr); row-gap: 16px; }
+  .bsp-layout-grid > .bsp-layout-cell {
+    grid-column: 1 / -1 !important;
+    grid-row: auto !important;
+  }
+}
+
+/* ── Group header (collapsible groups are buttons) ────────────────── */
+button.bsp-group-header {
+  transition: background-color 0.15s ease;
+}
+button.bsp-group-header:hover {
+  background: var(--m3-surface-container);
+}
+button.bsp-group-header:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--bsp-action-focus);
+}
+
+/* ── Uptime bars ──────────────────────────────────────────────────── */
+.bsp-uptime-bar:focus-visible {
+  outline: 2px solid var(--bsp-text);
+  outline-offset: 1px;
+}
+
+/* ── Incident cards ───────────────────────────────────────────────── */
+.bsp-incident-row {
+  display: grid;
+  grid-template-columns: 200px 1fr auto auto;
+  grid-template-areas: "date title badge chevron";
+  gap: 40px;
+  align-items: center;
+  padding: 28px 40px;
+}
+button.bsp-incident-row:hover {
+  background: var(--m3-surface-container-low);
+}
+button.bsp-incident-row:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--bsp-action-focus);
+}
+.bsp-incident-row__date    { grid-area: date; }
+.bsp-incident-row__title   { grid-area: title; min-width: 0; }
+.bsp-incident-row__badge   { grid-area: badge; }
+.bsp-incident-row__chevron { grid-area: chevron; }
+.bsp-incident-timeline { padding: 0 40px 32px 240px; }
+.bsp-incident-active { padding: 40px; }
+.bsp-incident-active-grid {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 40px;
+}
+@media (max-width: 767px) {
+  .bsp-incident-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "date chevron" "title title" "badge badge";
+    gap: 8px 16px;
+    padding: 20px;
+    justify-items: start;
+  }
+  .bsp-incident-timeline { padding: 0 20px 20px; }
+  .bsp-incident-active { padding: 20px; border-radius: 1.25rem !important; }
+  .bsp-incident-active-grid { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+}
+
+/* ── Material Symbols ─────────────────────────────────────────────── */
+.material-symbols-outlined {
+  font-family: 'Material Symbols Outlined';
+  font-weight: normal;
+  font-style: normal;
+  display: inline-block;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased;
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+  font-size: inherit;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+/* ── Reduced motion: no looping pings, pulses or entrance fades ──── */
+@media (prefers-reduced-motion: reduce) {
+  .monitor-dot-ring,
+  .animate-pulse {
+    animation: none !important;
+  }
+  .fade-up {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--m3-outline-variant);
+  border-radius: 3px;
+}

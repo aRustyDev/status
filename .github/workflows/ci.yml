@@ -176,6 +176,11 @@ jobs:
       - name: Install Playwright browser
         run: npx playwright install --with-deps chromium
 
+      - name: Status page layout comparison regression
+        run: |
+          npm run build -w @bsp/shared
+          npm run test:e2e -w @bsp/status
+
       - name: Board browser and Worker integration tests
         run: npm run test:e2e -w @bsp/board
 
@@ -240,11 +245,23 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
+      - name: Set up Node.js for browser smoke test
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install test dependencies and Chromium
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
       - name: Start container
         run: >-
           docker run -d --name bsp-smoke -p 3000:3000
           -v bsp-smoke-data:/app/data
           -e JWT_SECRET=smoke-jwt-secret-with-sufficient-entropy
+          -e COOKIE_SECURE=false
           -e VAULT_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           better-status-page:test
 
@@ -267,6 +284,9 @@ jobs:
           curl --fail --silent --show-error --output /dev/null http://127.0.0.1:3000/admin/
           test "$(docker exec bsp-smoke id -u)" != 0
           docker exec bsp-smoke sh -c 'touch /app/data/.write-check && rm /app/data/.write-check'
+
+      - name: Exercise Node setup, login, and reader in a browser
+        run: node scripts/test-node-docker.mjs
 
       # A restart on the same volume has to come up healthy. The database file is not checked: it is opened on
       # first use, so before the setup it does not exist yet.
@@ -293,4 +313,4 @@ jobs:
       - name: Check the results
         run: |
           echo '${{ toJSON(needs) }}'
-          test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = false
+          test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = false

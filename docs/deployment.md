@@ -173,8 +173,8 @@ npm run build
 
 This compiles the TypeScript API and builds both React frontends. Output:
 - `apps/api/dist/` — compiled API
-- `apps/admin/dist/` — admin panel static files
-- `apps/status/dist/` — status page static files
+- `apps/admin-node/dist/` — admin panel static files
+- `apps/status-node/dist/` — status page static files
 
 ### 5. Start
 

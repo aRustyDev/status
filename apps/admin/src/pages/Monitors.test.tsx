@@ -103,6 +103,15 @@ describe('MonitorsPage', () => {
   })
 
 
+  it('explains why run-now checks are unavailable', async () => {
+    renderPage()
+    await screen.findByText('Checkout API')
+    expect(screen.getByText('Run-now checks are unavailable.')).toBeVisible()
+    const action = screen.getByRole('button', { name: 'Check Checkout API now' })
+    expect(action).toBeDisabled()
+    expect(action).toHaveAccessibleDescription('Run-now checks are unavailable.')
+  })
+
   it('disables unsupported import and export', async () => {
     renderPage()
     await screen.findByText('Checkout API')

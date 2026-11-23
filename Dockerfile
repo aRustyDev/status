@@ -9,6 +9,8 @@ COPY packages/shared/package*.json ./packages/shared/
 COPY apps/api/package*.json        ./apps/api/
 COPY apps/admin/package*.json      ./apps/admin/
 COPY apps/status/package*.json     ./apps/status/
+COPY apps/admin-node/package*.json ./apps/admin-node/
+COPY apps/status-node/package*.json ./apps/status-node/
 
 RUN npm ci
 
@@ -41,6 +43,8 @@ COPY packages/shared/package*.json ./packages/shared/
 COPY apps/api/package*.json        ./apps/api/
 COPY apps/admin/package*.json      ./apps/admin/
 COPY apps/status/package*.json     ./apps/status/
+COPY apps/admin-node/package*.json ./apps/admin-node/
+COPY apps/status-node/package*.json ./apps/status-node/
 
 # Production dependencies only
 RUN npm ci --omit=dev
@@ -48,8 +52,8 @@ RUN npm ci --omit=dev
 # Copy compiled workspace artifacts
 COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
 COPY --from=builder /app/apps/api/dist    ./apps/api/dist
-COPY --from=builder /app/apps/admin/dist  ./apps/admin/dist
-COPY --from=builder /app/apps/status/dist ./apps/status/dist
+COPY --from=builder /app/apps/admin-node/dist  ./apps/admin-node/dist
+COPY --from=builder /app/apps/status-node/dist ./apps/status-node/dist
 
 # Data directory — mount a volume here to persist db + uploads
 RUN mkdir -p /app/data/uploads

@@ -40,14 +40,14 @@ export default defineConfig({
       },
     },
     {
-      command: 'node node_modules/vite/bin/vite.js apps/admin --config apps/admin/vite.config.ts --port 5173',
+      command: 'node node_modules/vite/bin/vite.js apps/admin-node --config apps/admin-node/vite.config.ts --port 5173',
       url: 'http://127.0.0.1:5173/admin/',
       reuseExistingServer: false,
       timeout: 120_000,
       env: { VITE_API_PROXY_TARGET: apiUrl },
     },
     {
-      command: 'node node_modules/vite/bin/vite.js apps/status --config apps/status/vite.config.ts --port 5174',
+      command: 'node node_modules/vite/bin/vite.js apps/status-node --config apps/status-node/vite.config.ts --port 5174',
       url: 'http://127.0.0.1:5174/',
       reuseExistingServer: false,
       timeout: 120_000,

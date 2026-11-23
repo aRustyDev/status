@@ -18,8 +18,10 @@ const repoRoot = fileURLToPath(new URL('../../../', import.meta.url))
 const workspacePackages = [
   'package.json',
   'apps/admin/package.json',
+  'apps/admin-node/package.json',
   'apps/api/package.json',
   'apps/status/package.json',
+  'apps/status-node/package.json',
   'packages/shared/package.json',
 ]
 
