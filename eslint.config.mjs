@@ -38,5 +38,10 @@ export default tseslint.config(
   },
   // Maintenance scripts run in Node.
   { files: ['scripts/**/*.mjs'], languageOptions: { globals: { ...globals.node } } },
+  {
+    files: ['scripts/attestation-recovery/**/*.cjs'],
+    languageOptions: { globals: { ...globals.node } },
+    rules: { '@typescript-eslint/no-require-imports': 'off' },
+  },
   ...boundaryConfigs(),
 )

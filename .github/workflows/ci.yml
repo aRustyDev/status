@@ -54,8 +54,11 @@ jobs:
       - name: Shared modules come from npm, at one version
         run: npm run check:kit
 
+      - name: Test temporary attestation recovery
+        run: node --test scripts/attestation-recovery/*.test.cjs
+
       - name: Signatures of the installed packages
-        run: npm audit signatures
+        run: NODE_OPTIONS="--require ./scripts/attestation-recovery/preload.cjs" npm audit signatures
 
       - name: Lint
         run: npm run lint

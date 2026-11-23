@@ -19,6 +19,12 @@ function Shell({ identity, capabilities }: { identity: Identity; capabilities: C
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
   const supported = new Set(capabilities.supportedRoutes)
+  useEffect(() => {
+    if (!drawerOpen) return
+    const closeOnDesktop = () => { if (window.innerWidth >= 768) setDrawerOpen(false) }
+    window.addEventListener('resize', closeOnDesktop)
+    return () => window.removeEventListener('resize', closeOnDesktop)
+  }, [drawerOpen])
   function signOut() {
     clearSession()
     window.location.assign('/cdn-cgi/access/logout')
@@ -58,13 +64,13 @@ function Shell({ identity, capabilities }: { identity: Identity; capabilities: C
     <header className="md:hidden flex items-center justify-between">
       {brand}<button type="button" className="btn-icon" aria-label="Open navigation" aria-expanded={drawerOpen} onClick={() => setDrawerOpen(true)}>☰</button>
     </header>
-    {drawerOpen && <div className="md:hidden fixed inset-0 z-50">
-      <div className="absolute inset-0" style={{ background: 'rgba(0,0,0,0.55)' }} onClick={() => setDrawerOpen(false)} />
-      <div role="dialog" aria-modal="true" aria-label="Navigation" className="absolute inset-y-0 left-0 flex flex-col w-72 max-w-[85vw]" style={{ background: 'var(--m3-surface-container-low)' }}>
-        <div className="flex items-center justify-between">{brand}<button type="button" className="btn-icon" aria-label="Close navigation" onClick={() => setDrawerOpen(false)}>×</button></div>
+    {drawerOpen && <ModalShell onClose={() => setDrawerOpen(false)}>
+      <div className="fixed inset-0" onClick={() => setDrawerOpen(false)} />
+      <div role="dialog" aria-modal="true" aria-label="Navigation" className="fixed inset-y-0 left-0 flex flex-col w-72 max-w-[85vw]" style={{ background: 'var(--m3-surface-container-low)' }}>
+        <div className="flex items-center justify-between">{brand}<button type="button" autoFocus className="btn-icon" aria-label="Close navigation" onClick={() => setDrawerOpen(false)}>×</button></div>
         {navigation}
       </div>
-    </div>}
+    </ModalShell>}
     <aside className="hidden md:flex flex-col h-screen w-64 sticky top-0 flex-shrink-0">{brand}{navigation}</aside>
     <main className="flex-1 min-h-0 min-w-0 overflow-auto"><Outlet /></main>
   </div>
