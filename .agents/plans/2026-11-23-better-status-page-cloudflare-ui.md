@@ -100,7 +100,7 @@ Earlier rehearsal evidence:
 4. Both API contracts, stable aliases, incident updates across rollback, audit entries, and continued public and private probe samples were verified.
 5. A moved and retargeted check began with empty history and accumulated only the new configuration's samples; earlier samples remained retained.
 6. The viewer saw incident history and scheduled maintenance, including boundary transitions and cancellation. The later overlap failure was retested on the fixed reader build as described below.
-7. Expired reads and saves returned 401 without a refused-save audit entry; reauthentication preserved the operator draft. Both sign-outs reached Access logout and later AJAX reads returned 401. A modal obstruction found during rehearsal was fixed and retested; the subsequent expiry-notification privacy change still requires staging validation.
+7. Expired reads and saves returned 401 without a refused-save audit entry; reauthentication preserved the operator draft. Both sign-outs reached Access logout and later AJAX reads returned 401. A modal obstruction found during rehearsal was fixed and retested; the subsequent expiry-notification privacy change was later tested with an instrumented build as described below.
 8. With browser caching disabled, the admin redirect, direct monitors load and refresh, JavaScript and CSS content types, missing asset and unknown API 404 responses, and reader were verified.
 
 A read-only baseline confirmed that all four D1 migrations were applied with none pending, the endpoint registry matched its synchronization preview, and representative scheduled checks were healthy. Detailed values are retained privately.
@@ -114,7 +114,7 @@ The fixed live reader was inspected at 1440- and 390-pixel widths, including wit
 
 Before a fixture check's first sample, the final reader showed Unknown on the card and in the headline; both status APIs returned null for the last-check time. The fixture was restored afterward.
 
-A revoked session caused an admin save to return 401, hid the protected draft, and created no audit entry. Reauthentication as the same identity recovered the draft, which was then saved. Natural expiry with a five-minute session did not reproduce the expiry path, and a later browser interruption prevented completion of the natural-expiry and expiry-notification toast privacy checks. Those checks remain open. The temporary role, normal Access duration, and fixture configuration were restored. Staging is serving the legacy board while the rollout gate is incomplete.
+A revoked session caused an admin save to return 401, hid the protected draft, and created no audit entry. Reauthentication as the same identity recovered the draft, which was then saved. An initial attempt to trigger natural expiry did not reproduce it, and a later browser interruption prevented completion of the test. Further observations and the remaining gap are recorded below. The temporary role, normal Access duration, and fixture configuration were restored. Staging is serving the legacy board while the rollout gate is incomplete.
 
 The CI static check passed using a temporary recovered-attestation workaround for malformed npm registry responses. npm still verifies the signatures and attestations. The recovered snapshots cannot establish whether the registry later adds or withdraws an attestation; remove the workaround when the registry endpoint is restored.
 
@@ -128,3 +128,10 @@ On mobile, Enter opened navigation with initial focus on Close, Tab moved to Das
 On desktop, Tab and Shift+Tab were exercised in the incident dialog, and Escape closed it and returned focus to New Incident. The monitor menu opened with Enter and closed with Escape, returning focus to its opener. On the reader, the account menu opened with Enter and closed with Escape; the incident control responded to Enter and Space, and Tab exposed the history-bar text.
 
 These observations do not complete session-expiry validation or determine the final rollout state.
+
+
+### Session and notification follow-up
+
+In an isolated Chrome session, a short-lived application token was issued and the team-domain session cookie was cleared. After the token expired naturally, an unsaved admin save led both the admin and reader to show session expiry. The audit count and fixture were unchanged. The original draft tab was no longer present after reauthentication, so same-session draft recovery after natural expiry remains unverified.
+
+Separately, a diagnostic admin build set the success notification duration to zero so a real save notification remained present. Signing out in another tab caused a 401; the notification remained in the DOM with `display: none`. After reauthentication as the same identity and Continue, it returned to `display: flex`. This notification observation used an instrumented build and session revocation; it was not a natural-expiry test. The uninstrumented admin build, administrator role, and normal Access duration were restored. Staging remains on the legacy board, and the final rollout gate remains open.
