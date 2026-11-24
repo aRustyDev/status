@@ -58,7 +58,7 @@ jobs:
         run: node --test scripts/attestation-recovery/*.test.cjs
 
       - name: Signatures of the installed packages
-        run: NODE_OPTIONS="--require ./scripts/attestation-recovery/preload.cjs" npm audit signatures
+        run: bash scripts/attestation-recovery/audit-signatures.sh
 
       - name: Lint
         run: npm run lint
