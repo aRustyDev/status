@@ -23,6 +23,8 @@ For a standalone legacy board, configure `apps/worker/wrangler.jsonc` with the m
 
 The probe Worker uses the same environment's D1 database. In both Worker configs, set `ENDPOINTS` to the same JSON array of approved endpoints. Each item has an `id`, `name`, and absolute `url`. Public targets use HTTPS. Private targets also specify the configured VPC Service binding and service ID, as in `[{"id":"api","name":"API","url":"https://api.internal/health","binding":"PRIVATE_API","serviceId":"<VPC_SERVICE_ID>","revision":"1"}]`. The optional `revision` identifies the target configuration and must be changed whenever the service itself is changed without changing its ID. Configure the VPC Service binding in `apps/probe/wrangler.jsonc`. Infrastructure administrators manage the endpoint list and bindings. Keep staging and production databases, routes, and endpoint lists separate. A component displays the most severe of its manual status, enabled HTTP check status, and active incident impact. An enabled check with no recent result is unknown; active maintenance appears separately and does not hide an incident or a failure.
 
+In the Cloudflare monitor editor, the Checks panel supports an optional keyword, header and JSON assertions, a degraded latency threshold, and up to 20 accepted HTTP status ranges. A configured range replaces the single expected status; removing the last range restores it. Test and scheduled checks use the same validation and evaluator. GET and HEAD are supported, but HEAD cannot use keyword or JSON checks. Redirects are not followed, even if their status appears in an accepted range. Only approved destinations can be checked.
+
 Add the binding to the selected probe environment with its Cloudflare VPC Service ID:
 
 ```jsonc

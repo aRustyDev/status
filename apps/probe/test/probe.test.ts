@@ -73,6 +73,27 @@ test('draft tests use the approved endpoint and do not record a check result', a
   sqlite.close()
 })
 
+test('draft and scheduled checks agree on status ranges and assertion outcomes', async () => {
+  for (const scenario of [
+    { status: 201, body: 'ready', header: 'ok', expected: 'up', label: 'HTTP check passed' },
+    { status: 204, body: 'missing', header: 'ok', expected: 'degraded', label: 'HTTP check degraded' },
+    { status: 201, body: 'ready', header: 'wrong', expected: 'down', label: 'HTTP check failed' },
+    { status: 404, body: 'ready', header: 'ok', expected: 'down', label: 'HTTP check failed' },
+  ]) {
+    const { sqlite, now, env } = fixture()
+    const advancedConfig = { acceptedStatusRanges: [{ min: 200, max: 204 }], keyword: 'ready', assertions: [{ type: 'header', name: 'x-health', op: 'equals', value: 'ok', onFail: 'down' }], timeoutMs: 5000, attempts: 1 }
+    sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify(advancedConfig), 'check-0')
+    globalThis.fetch = async () => new Response(scenario.status === 204 ? null : scenario.body, { status: scenario.status, headers: { 'x-health': scenario.header } })
+    const request = new Request('https://probe.internal/test', { method: 'POST', body: JSON.stringify({ endpointId: 'endpoint-0', expectedStatus: 200, advancedConfig }) })
+    const response = await worker.fetch(request, env as never)
+    assert.equal(response.status, 200)
+    assert.equal((await response.json() as { steps: { label: string }[] }).steps[0]?.label, scenario.label)
+    await runChecks(now, env as never)
+    assert.equal(sqlite.prepare('SELECT effective_status FROM http_check_results').get()?.effective_status, scenario.expected)
+    sqlite.close()
+  }
+})
+
 test('checks use four concurrent requests and record nonmatching status', async () => {
   const { sqlite, now, env } = fixture(9)
   let active = 0

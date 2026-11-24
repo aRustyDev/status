@@ -98,6 +98,76 @@ it('replaces status ranges only when the operator chooses a single expected stat
   await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ check: expect.objectContaining({ expectedStatus: 201, advancedConfig: expect.not.objectContaining({ acceptedStatusRanges: expect.anything() }) }) })))
 })
 
+it('creates ranges in the Checks panel and sends the same settings to Test and Save', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.post).mockResolvedValue({ overall: 'ok', steps: [], totalMs: 5 })
+  renderModal(null)
+  await user.type(await screen.findByLabelText('Name'), 'Range check')
+  await user.selectOptions(screen.getByLabelText('Approved destination'), 'api')
+  await user.click(screen.getByRole('button', { name: 'Checks' }))
+  await user.click(screen.getByRole('button', { name: 'Add status range' }))
+  await user.clear(screen.getByLabelText('Status range 1 to'))
+  await user.type(screen.getByLabelText('Status range 1 to'), '204')
+  await user.type(screen.getByLabelText('Keyword (optional)'), 'ready')
+  expect(screen.getByLabelText('Expected status')).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Test' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors/test', expect.objectContaining({ advancedConfig: expect.objectContaining({ acceptedStatusRanges: [{ min: 200, max: 204 }], keyword: 'ready' }) }), expect.anything()))
+  await user.click(screen.getByRole('button', { name: 'Create Monitor' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors', expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.objectContaining({ acceptedStatusRanges: [{ min: 200, max: 204 }], keyword: 'ready' }) }) })))
+})
+
+it('edits persisted ranges, preserves other settings, and uses the expected status after removing the last range', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [{ ...check, advancedConfig: { acceptedStatusRanges: [{ min: 200, max: 299 }], keyword: 'ready' } }]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor)
+  await user.click(await screen.findByRole('button', { name: 'Checks' }))
+  expect(screen.getByLabelText('Status range 1 from')).toHaveValue(200)
+  await user.clear(screen.getByLabelText('Status range 1 to'))
+  await user.type(screen.getByLabelText('Status range 1 to'), '204')
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.objectContaining({ acceptedStatusRanges: [{ min: 200, max: 204 }], keyword: 'ready' }) }) })))
+  await user.click(screen.getByRole('button', { name: 'Remove status range 1' }))
+  expect(screen.getByLabelText('Expected status')).toBeEnabled()
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenLastCalledWith('/admin/monitors/7', expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.not.objectContaining({ acceptedStatusRanges: expect.anything() }) }) })))
+})
+
+it('rejects invalid ranges before Test or Save without losing the draft', async () => {
+  const user = userEvent.setup()
+  renderModal(monitor)
+  await user.click(await screen.findByRole('button', { name: 'Checks' }))
+  await user.click(screen.getByRole('button', { name: 'Add status range' }))
+  await user.clear(screen.getByLabelText('Status range 1 from'))
+  await user.type(screen.getByLabelText('Status range 1 from'), '400')
+  await user.click(screen.getByRole('button', { name: 'Test' }))
+  expect(screen.getByText(/Each status range must have/)).toBeInTheDocument()
+  expect(api.post).not.toHaveBeenCalled()
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  expect(screen.getByText(/Each status range must have/)).toBeInTheDocument()
+  expect(screen.getByLabelText('Status range 1 from')).toHaveValue(400)
+  expect(api.patch).not.toHaveBeenCalled()
+})
+
+it('preserves configured checks when a new monitor has no approved destination', async () => {
+  const user = userEvent.setup()
+  renderModal(null)
+  await user.type(await screen.findByLabelText('Name'), 'Unsaved check')
+  await user.click(screen.getByRole('button', { name: 'Checks' }))
+  await user.click(screen.getByRole('button', { name: 'Add status range' }))
+  await user.click(screen.getByRole('button', { name: 'Create Monitor' }))
+  expect(screen.getByText('Select an approved destination to save check settings.')).toBeInTheDocument()
+  expect(screen.getByLabelText('Status range 1 from')).toHaveValue(200)
+  expect(api.post).not.toHaveBeenCalled()
+  await user.selectOptions(screen.getByLabelText('Approved destination'), 'api')
+  await user.click(screen.getByRole('button', { name: 'Create Monitor' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors', expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.objectContaining({ acceptedStatusRanges: [{ min: 200, max: 299 }] }) }) })))
+})
+
 it('creates a service and disabled check using the upstream Checks panel', async () => {
   const user = userEvent.setup()
   renderModal(null)

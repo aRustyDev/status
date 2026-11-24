@@ -9,6 +9,7 @@ import { CloudflareSideTabStrip } from './CloudflareSideTabStrip'
 import { SidePanelFrame, SideTabStrip, type SideTab } from '@better-forge/ui'
 import { ActionsSection, ChannelsSection, CredentialsSection, DependenciesSection, PANEL_META, RequestSection, hasAccountCredentials, hasDatabaseCredentials, usesCredentials, type SidePanelKey } from './MonitorSidePanel'
 import { HttpAssertionsFields } from './HttpAssertionsFields'
+import { StatusRangesFields, statusRangesProblem, type StatusRange } from './StatusRangesFields'
 import { MonitorTypeConfigFields } from './MonitorTypeConfigFields'
 import { Field, type SecretSummary, type VaultSummary } from '@better-forge/ui'
 import { DATABASE_DEFAULT_PORTS, DATABASE_DEFAULT_QUERIES, isDatabaseType } from './monitorTypes'
@@ -230,6 +231,16 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
   async function handleTest() {
     if (!isTestable) return
+    if (cloudflare) {
+      const problem = statusRangesProblem((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? [])
+      if (problem) { setError(problem); setSidePanel('checks'); return }
+      if (config['method'] === 'HEAD' && (config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).some(assertion => assertion.type === 'json'))) {
+        setError('HEAD responses have no body. Remove the keyword and JSON checks or use GET.')
+        setSidePanel('checks')
+        return
+      }
+      setError('')
+    }
     const revision = testRevision.current
     setTesting(true)
     setTestResult(null)
@@ -272,6 +283,11 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
       setLoading(true)
       try {
         const advanced = cloudflareConfig()
+        const rangeProblem = statusRangesProblem((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? [])
+        if (rangeProblem) { setSidePanel('checks'); throw new Error(rangeProblem) }
+        if (cloudflare.isAdmin && !endpointId && (((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []).length || config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).length || config['degradedAboveMs'] !== undefined)) {
+          throw new Error('Select an approved destination to save check settings.')
+        }
         if (timeoutMs * retries > 10000) throw new Error('Timeout multiplied by attempts must not exceed 10,000 ms.')
         if (config['method'] === 'HEAD' && (config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).some(assertion => assertion.type === 'json'))) throw new Error('HEAD responses have no body. Remove the keyword and JSON checks or use GET.')
         const previous = initialCloudflareCheck
@@ -460,6 +476,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         <SidePanelFrame meta={PANEL_META[sidePanel]} layout="responsive" className={cloudflare?.statusUnavailable ? 'hidden' : undefined}>
           {sidePanel === 'request' && <RequestSection config={config} updateConfig={updateConfig} />}
           {sidePanel === 'checks' && (
+            <>
+            {cloudflare && <StatusRangesFields ranges={(config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []} onChange={ranges => updateConfig('acceptedStatusRanges', ranges.length ? ranges : undefined)} />}
+            {cloudflare && <p className="text-xs">HEAD responses have no body, so keyword and JSON checks require GET. Redirects are not followed.</p>}
             <HttpAssertionsFields
               keyword={keyword}
               onKeywordChange={(value) => updateConfig('keyword', value)}
@@ -467,7 +486,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
               degradedAboveMs={degradedAboveMs}
               onAssertionsChange={(list) => updateConfig('assertions', list.length > 0 ? list : undefined)}
               onDegradedAboveMsChange={(ms) => updateConfig('degradedAboveMs', ms)}
+              followsRedirects={!cloudflare}
             />
+            </>
           )}
           {sidePanel === 'credentials' && <CredentialsSection config={config} updateConfig={updateConfig} vaultPicker={vaultPicker} userKey={isDatabaseType(type) ? 'user' : 'username'} />}
           {sidePanel === 'auth' && <AuthSection auth={auth} onChange={(next) => updateConfig('auth', next)} vaultPicker={vaultPicker} />}
