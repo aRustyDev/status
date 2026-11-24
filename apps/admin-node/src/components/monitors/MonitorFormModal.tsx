@@ -5,6 +5,7 @@ import type { Action, HttpAssertion, Monitor, MonitorAction, MonitorType, Notifi
 import { ModalFooter, ModalHeader, ModalShell } from '@better-forge/ui'
 import { YamlViewModal } from '../YamlViewModal'
 import { AuthSection, readAuth } from './AuthSection'
+import { CloudflareSideTabStrip } from './CloudflareSideTabStrip'
 import { SidePanelFrame, SideTabStrip, type SideTab } from '@better-forge/ui'
 import { ActionsSection, ChannelsSection, CredentialsSection, DependenciesSection, PANEL_META, RequestSection, hasAccountCredentials, hasDatabaseCredentials, usesCredentials, type SidePanelKey } from './MonitorSidePanel'
 import { HttpAssertionsFields } from './HttpAssertionsFields'
@@ -492,7 +493,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
       )}
 
       {/* ── Vertical tab strip ──────────────────────────────────────────── */}
-      <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" className={cloudflare?.statusUnavailable ? 'hidden' : undefined} />
+      {cloudflare
+        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} checkCount={checkCount} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
+        : <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" />}
 
       </div>{/* outer flex row */}
       {showYaml && monitor && <YamlViewModal kind="Monitor" objectKey={monitor.key} title={monitor.name} onClose={() => setShowYaml(false)} />}

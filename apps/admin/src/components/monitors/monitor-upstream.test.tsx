@@ -35,6 +35,20 @@ function renderModal(value: Monitor | null) {
   render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true }}><MonitorFormModal monitor={value} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
 }
 
+it('shows unavailable upstream sidebar sections while keeping Checks usable', async () => {
+  const user = userEvent.setup()
+  renderModal(monitor)
+  const checks = await screen.findByRole('button', { name: 'Checks' })
+  for (const label of ['Auth', 'Request', 'Tags', 'Alerts', 'Actions', 'Depends on', 'Incident', 'Latency']) {
+    const button = screen.getByRole('button', { name: label })
+    expect(button).toBeDisabled()
+    expect(button).toHaveAttribute('title', `${label} (unavailable)`)
+  }
+  expect(checks).toBeEnabled()
+  await user.click(checks)
+  expect(screen.getByLabelText('Keyword (optional)')).toBeInTheDocument()
+})
+
 it('preserves an unchanged legacy check when saving service settings', async () => {
   const user = userEvent.setup()
   renderModal(monitor)
