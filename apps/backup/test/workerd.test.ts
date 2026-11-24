@@ -6,10 +6,19 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 
 test('R2-backed backup integrity verification runs in workerd', async () => {
   const bundle = await build({ stdin: {
-    contents: `import { backupService } from './core.ts';
+    contents: `import { backupService, finishExport } from './core.ts';
       const id = 'a'.repeat(64);
       export default { async fetch(request, env) {
         const path = new URL(request.url).pathname;
+        if (path === '/export') {
+          globalThis.fetch = async (url, init) => {
+            const parsed = new Request(url, init);
+            if (parsed.url.startsWith('https://api.cloudflare.com/')) return Response.json({success:true,result:{result:{signed_url:'https://download.example/dump.sql'}}});
+            return new Response('CREATE TABLE exported (id INTEGER);');
+          };
+          await finishExport({...env,ACCOUNT_ID:'account',DATABASE_ID:'db',D1_EXPORT_TOKEN:'token'}, id, 'checkpoint');
+          return new Response('exported');
+        }
         if (path === '/seed') {
           const body = 'CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (42);';
           const bytes = new TextEncoder().encode(body);
@@ -25,6 +34,8 @@ test('R2-backed backup integrity verification runs in workerd', async () => {
   }, bundle: true, format: 'esm', platform: 'browser', conditions: ['workerd', 'worker', 'browser'], write: false })
   const mf = new Miniflare(convertV4MiniflareOptions({ modules: true, script: bundle.outputFiles[0].text, r2Buckets: ['BACKUP_BUCKET'] }))
   try {
+    assert.equal((await mf.dispatchFetch('https://backup.internal/export')).status, 200)
+    assert.equal((await mf.dispatchFetch(`https://backup.internal/backups/${'a'.repeat(64)}/verify`)).status, 200)
     assert.equal((await mf.dispatchFetch('https://backup.internal/seed')).status, 200)
     const verified = await mf.dispatchFetch(`https://backup.internal/backups/${'a'.repeat(64)}/verify`)
     assert.equal(verified.status, 200)

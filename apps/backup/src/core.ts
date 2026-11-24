@@ -101,15 +101,16 @@ export async function finishExport(env: BackupEnv, id: string, bookmark: string)
     })
   } catch { throw new Error('D1 export is unavailable') }
   if (!response.ok) throw new Error('D1 export is unavailable')
-  let result: { success?: boolean; result?: { signed_url?: unknown } }
+  let result: { success?: boolean; result?: { signed_url?: unknown; result?: { signed_url?: unknown } } }
   try { result = await response.json() as typeof result } catch { throw new Error('D1 export is unavailable') }
-  if (!result.success || typeof result.result?.signed_url !== 'string') throw new Error('D1 export is not ready')
+  const signedUrl = result.result?.result?.signed_url ?? result.result?.signed_url
+  if (!result.success || typeof signedUrl !== 'string') throw new Error('D1 export is not ready')
   let signed: URL
-  try { signed = new URL(result.result.signed_url) }
+  try { signed = new URL(signedUrl) }
   catch { throw new Error('Invalid export download') }
   if (signed.protocol !== 'https:' || signed.username || signed.password) throw new Error('Invalid export download')
   let download: Response
-  try { download = await fetch(signed.toString(), { redirect: 'error' }) }
+  try { download = await fetch(signed.toString(), { redirect: 'manual' }) }
   catch { throw new Error('D1 export download failed') }
   if (!download.ok || !download.body) throw new Error('D1 export download failed')
   const saved = await env.BACKUP_BUCKET.put(objectKey(id), download.body, { httpMetadata: { contentType: 'application/sql' } })

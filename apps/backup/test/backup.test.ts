@@ -87,9 +87,9 @@ test('exports, stores, verifies, and detects corruption without leaking credenti
       if (!body.current_bookmark) return Response.json({ success: true, result: { at_bookmark: 'checkpoint' } })
       assert.equal(body.current_bookmark, 'checkpoint')
       if (polls++ === 0) return Response.json({ success: true, result: {} })
-      return Response.json({ success: true, result: { signed_url: 'https://download.example/backup.sql?secret=never-log' } })
+      return Response.json({ success: true, result: { status: 'complete', result: { signed_url: 'https://download.example/backup.sql?secret=never-log' } } })
     }
-    assert.equal(init?.redirect, 'error')
+    assert.equal(init?.redirect, 'manual')
     assert.equal(init?.headers, undefined)
     return new Response('CREATE TABLE example (id INTEGER); INSERT INTO example VALUES (1);')
   }
@@ -123,4 +123,14 @@ test('fails closed on an unavailable export and malformed backup identifiers', a
   await assert.rejects(beginExport(env), error => error instanceof Error && error.message === 'D1 export could not be started')
   globalThis.fetch = async () => new Response('private-token in malformed JSON')
   await assert.rejects(finishExport(env,id,'checkpoint'), error => error instanceof Error && error.message === 'D1 export is unavailable')
+})
+
+test('does not follow redirects from the signed export URL', async () => {
+  const { env } = fixture()
+  globalThis.fetch = async (input, init) => {
+    if (String(input).startsWith('https://api.cloudflare.com/')) return Response.json({ success: true, result: { result: { signed_url: 'https://download.example/backup.sql' } } })
+    assert.equal(init?.redirect, 'manual')
+    return new Response(null, { status: 302, headers: { location: 'https://other.example/' } })
+  }
+  await assert.rejects(finishExport(env,id,'checkpoint'), /download failed/)
 })
