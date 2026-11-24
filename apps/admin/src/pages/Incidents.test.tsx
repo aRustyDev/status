@@ -290,6 +290,21 @@ describe('IncidentsPage', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
   })
 
+  it('shows a retired association and lets an operator remove it', async () => {
+    const user = userEvent.setup()
+    mockGets([{ ...incidents[0]!, monitorIds: [10, 99], monitorNames: { 99: 'Retired service' } }])
+    vi.mocked(api.patch).mockResolvedValue({})
+    renderPage()
+    await user.click(await screen.findByText('Checkout errors'))
+    expect(screen.getByText('Retired service')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Edit Checkout errors' }))
+    const retired = screen.getByRole('checkbox', { name: 'Retired service (retired)' })
+    expect(retired).toBeChecked()
+    await user.click(retired)
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/incidents/1', expect.objectContaining({ monitorIds: [10] })))
+  })
+
   it('sends nothing when the edit changes nothing', async () => {
     const user = userEvent.setup()
     renderPage()

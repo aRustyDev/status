@@ -6,7 +6,7 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { api } from '../../api/client'
 import MonitorFormModal from './MonitorFormModal'
 
-vi.mock('../../api/client', () => ({ api: { get: vi.fn(), post: vi.fn(), patch: vi.fn() } }))
+vi.mock('../../api/client', () => ({ api: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), put: vi.fn() } }))
 vi.mock('@better-forge/ui', async () => {
   const actual = await vi.importActual<typeof import('@better-forge/ui')>('@better-forge/ui')
   return { ...actual, getCurrentUser: () => ({ role: 'admin' }) }
@@ -24,6 +24,7 @@ beforeEach(() => {
     throw new Error(`Unexpected request ${path}`)
   })
   vi.mocked(api.patch).mockResolvedValue({})
+  vi.mocked(api.put).mockResolvedValue({})
 })
 
 function renderModal() {
@@ -50,4 +51,34 @@ it('saves the approved check in a separate versioned request', async () => {
   await user.click(await screen.findByRole('button', { name: 'Save check' }))
   await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/checks/check-uuid', { componentId: 'component-uuid', endpointId: 'api', enabled: true, intervalMinutes: 1, expectedStatus: 200, version: 3 }))
   expect(api.patch).toHaveBeenCalledTimes(1)
+})
+
+it('saves non-secret additional HTTP checks as one versioned operation', async () => {
+  const user = userEvent.setup()
+  renderModal()
+  await user.click(await screen.findByLabelText('Use additional HTTP settings'))
+  await user.click(screen.getByRole('button', { name: 'Add status range' }))
+  await user.type(screen.getByLabelText('Required response keyword'), 'healthy')
+  await user.click(screen.getByRole('button', { name: 'Add response assertion' }))
+  await user.type(screen.getByLabelText('Header name'), 'x-health')
+  await user.click(screen.getByRole('button', { name: 'Save additional HTTP settings' }))
+  await waitFor(() => expect(api.put).toHaveBeenCalledWith('/admin/checks/check-uuid/advanced', {
+    version: 3,
+    advancedConfig: { method: 'GET', timeoutMs: 10000, attempts: 1, acceptedStatusRanges: [{ min: 200, max: 299 }], keyword: 'healthy', assertions: [{ type: 'header', name: 'x-health', op: 'exists' }] },
+  }))
+  expect(api.put).toHaveBeenCalledTimes(1)
+  expect(api.patch).not.toHaveBeenCalled()
+  expect(api.post).not.toHaveBeenCalled()
+  expect(screen.getByText(/Comparison values must not contain secrets/)).toBeInTheDocument()
+})
+
+it('rejects a scheduled timeout budget over ten seconds without a write', async () => {
+  const user = userEvent.setup()
+  renderModal()
+  await user.click(await screen.findByLabelText('Use additional HTTP settings'))
+  await user.clear(screen.getByLabelText('Attempts'))
+  await user.type(screen.getByLabelText('Attempts'), '2')
+  await user.click(screen.getByRole('button', { name: 'Save additional HTTP settings' }))
+  expect(screen.getByText('Timeout multiplied by attempts must not exceed 10,000 ms for scheduled checks.')).toBeInTheDocument()
+  expect(api.put).not.toHaveBeenCalled()
 })

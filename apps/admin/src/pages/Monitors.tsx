@@ -24,6 +24,7 @@ const STATUS_FILTERS: { value: StatusFilter; label: string }[] = [
 ]
 
 const COMPACT_KEY = 'bsp.monitors.compact'
+const MAX_STATUS_AGE_MS = 60_000
 function readCompact(): boolean {
   try { return localStorage.getItem(COMPACT_KEY) === '1' } catch { return false }
 }
@@ -69,11 +70,13 @@ export default function MonitorsPage() {
     try { localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...next])) } catch { /* the choice is just not remembered */ }
   }
 
-  const { data: monitors = [], isPending, isError, refetch } = useQuery<MonitorListItem[]>({
+  const { data: monitors = [], dataUpdatedAt, isPending, isError, refetch } = useQuery<MonitorListItem[]>({
     queryKey: ['monitors'],
-    queryFn: () => api.get('/admin/monitors'),
+    queryFn: () => api.get('/admin/monitors', { timeoutMs: 15_000 }),
     refetchInterval: 30_000,
   })
+  const statusOutdated = dataUpdatedAt > 0 && now - dataUpdatedAt >= MAX_STATUS_AGE_MS
+  const statusUnavailable = isError || statusOutdated
 
   const deleteMutation = useMutation({
     mutationFn: (monitor: Monitor) => api.delete(`/admin/monitors/${monitor.id}`),
@@ -158,7 +161,7 @@ export default function MonitorsPage() {
     <PageContainer>
       <PageHeader
         title="Monitors"
-        subtitle={isPending || isError ? undefined : `${monitors.length} monitor${monitors.length !== 1 ? 's' : ''}`}
+        subtitle={isPending || statusUnavailable ? undefined : `${monitors.length} monitor${monitors.length !== 1 ? 's' : ''}`}
         actions={<>
           <button type="button" onClick={() => openCreate()} className="btn btn-primary">
             <span className="material-symbols-outlined" aria-hidden="true">add_circle</span>
@@ -179,7 +182,7 @@ export default function MonitorsPage() {
       {!capabilities.runNow && <p id="monitor-run-now-unavailable" className="text-sm">Run-now checks are unavailable.</p>}
 
       {/* Tag filter bar */}
-      {allTags.length > 0 && (
+      {!statusUnavailable && allTags.length > 0 && (
         <div className="flex items-center gap-2 flex-wrap" role="group" aria-label="Filter by tag">
           <span className="font-mono text-xs uppercase tracking-wider" style={{ color: 'var(--m3-secondary)' }}>Filter:</span>
           {allTags.map((t) => {
@@ -203,7 +206,7 @@ export default function MonitorsPage() {
         </div>
       )}
 
-      {monitors.length > 0 && (
+      {!statusUnavailable && monitors.length > 0 && (
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative flex-1 min-w-[180px]">
             <span className="material-symbols-outlined absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" aria-hidden="true" style={{ fontSize: '18px', color: 'var(--m3-secondary)' }}>search</span>
@@ -266,6 +269,8 @@ export default function MonitorsPage() {
         <LoadingState label="Loading monitors…" />
       ) : isError ? (
         <ErrorState message="Couldn't load monitors." onRetry={() => void refetch()} />
+      ) : statusOutdated ? (
+        <ErrorState message="Monitor status is out of date. Refresh to see the latest status." onRetry={() => void refetch()} />
       ) : monitors.length === 0 ? (
         <section aria-label="What should we check first?" className="p-6">
           <h2 className="font-bold mb-3">What should we check first?</h2>
@@ -340,7 +345,10 @@ export default function MonitorsPage() {
                   </td>
                   <td className={cell}>
                     <div className={compact ? 'flex items-center gap-2 min-w-0' : undefined}>
-                      <Link to={`/admin/monitors/${monitor.id}`} className={`font-medium hover:underline focus-ring rounded ${compact ? 'shrink-0' : ''}`} style={{ color: 'var(--m3-on-surface)' }}>{monitor.name}</Link>
+                      {monitor.source === 'gatus'
+                        ? <span className="font-medium" style={{ color: 'var(--m3-on-surface)' }}>{monitor.name}</span>
+                        : <Link to={`/admin/monitors/${monitor.id}`} className={`font-medium hover:underline focus-ring rounded ${compact ? 'shrink-0' : ''}`} style={{ color: 'var(--m3-on-surface)' }}>{monitor.name}</Link>}
+                      {monitor.source === 'gatus' && <div className="text-xs" style={{ color: 'var(--m3-secondary)' }}>Managed in Gatus</div>}
                       {(monitorEndpoint(monitor) || monitor.intervalSecs != null) && <div className={`font-mono text-xs truncate ${compact ? 'max-w-[240px]' : 'mt-0.5 max-w-[320px]'}`} style={{ color: 'var(--m3-secondary)' }} title={[monitorEndpoint(monitor), monitor.intervalSecs != null ? `every ${monitor.intervalSecs} s` : ''].filter(Boolean).join(' · ')}>
                         {[monitorEndpoint(monitor), monitor.intervalSecs != null ? `every ${monitor.intervalSecs} s` : ''].filter(Boolean).join(' · ')}
                       </div>}
@@ -378,7 +386,7 @@ export default function MonitorsPage() {
                   </td>
                   <td className={`${cell}`}>
                     <div className="flex items-center justify-end gap-1">
-                      {monitor.type !== 'webhook' && (
+                      {monitor.source !== 'gatus' && monitor.type !== 'webhook' && (
                         <ActionBtn
                           onClick={() => checkNowMutation.mutate(monitor)}
                           label={checkingId === monitor.id ? `Checking ${monitor.name}…` : `Check ${monitor.name} now`}
@@ -389,13 +397,13 @@ export default function MonitorsPage() {
                           <IconRefresh spinning={checkingId === monitor.id} />
                         </ActionBtn>
                       )}
-                      <ActionMenu
+                      {monitor.source !== 'gatus' && <ActionMenu
                         label={`More actions for ${monitor.name}`}
                         items={[
                           { label: 'Edit', icon: 'edit', onSelect: () => setEditingMonitor(monitor) },
 
                         ]}
-                      />
+                      />}
                     </div>
                   </td>
                 </tr>
@@ -417,6 +425,7 @@ export default function MonitorsPage() {
       {(showCreate || editingMonitor) && (
         <MonitorFormModal
           monitor={editingMonitor}
+          statusUnavailable={!!editingMonitor && statusUnavailable}
           initialType={createType}
           allTags={allTags}
           allGroups={allGroups}

@@ -40,6 +40,18 @@ describe('getJSON', () => {
     respond('not json', { status: 200 })
     await expect(getJSON('/x')).rejects.toMatchObject({ name: 'ApiError', message: 'Invalid JSON in response', status: 200 })
   })
+
+  it('times out and aborts a stalled status response body', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true, status: 200, json: () => new Promise(() => {}) } as Response)
+      const request = getJSON('/api/v1/public/status', { cache: 'no-cache' }, 15_000)
+      const rejected = expect(request).rejects.toMatchObject({ name: 'ApiError', status: 0, message: 'Request timed out' })
+      await vi.advanceTimersByTimeAsync(15_001)
+      await rejected
+      expect((fetchMock.mock.calls[0]![1] as RequestInit).signal?.aborted).toBe(true)
+    } finally { vi.useRealTimers() }
+  })
 })
 
 describe('postJSON', () => {

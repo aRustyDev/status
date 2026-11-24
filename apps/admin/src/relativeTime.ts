@@ -26,8 +26,15 @@ export function formatSpan(ms: number): string {
 export function useNow(intervalMs = 5_000): number {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), intervalMs)
-    return () => clearInterval(timer)
+    const refresh = () => { if (document.visibilityState === 'visible') setNow(Date.now()) }
+    const timer = setInterval(refresh, intervalMs)
+    document.addEventListener('visibilitychange', refresh)
+    window.addEventListener('focus', refresh)
+    return () => {
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', refresh)
+      window.removeEventListener('focus', refresh)
+    }
   }, [intervalMs])
   return now
 }

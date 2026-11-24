@@ -92,7 +92,7 @@ export default function DashboardPage() {
   const now = useNow()
   const monitorsQuery = useQuery<MonitorListItem[]>({
     queryKey: ['monitors'],
-    queryFn: () => api.get('/admin/monitors'),
+    queryFn: () => api.get('/admin/monitors', { timeoutMs: 15_000 }),
     refetchInterval: 15_000,
   })
   const monitors = monitorsQuery.data ?? []
@@ -191,13 +191,14 @@ export default function DashboardPage() {
     />
   )
 
-  if (monitorsQuery.isPending || monitorsQuery.isError) {
+  const statusOutdated = monitorsQuery.dataUpdatedAt > 0 && now - monitorsQuery.dataUpdatedAt >= 60_000
+  if (monitorsQuery.isPending || monitorsQuery.isError || statusOutdated) {
     return (
       <PageContainer className="max-w-[1440px] mx-auto">
         {header}
         {monitorsQuery.isPending
           ? <LoadingState label="Loading monitors…" />
-          : <ErrorState message="Couldn't load monitors." onRetry={() => void monitorsQuery.refetch()} />}
+          : <ErrorState message={monitorsQuery.isError ? "Couldn't load monitors." : 'Monitor status is out of date. Refresh to see the latest status.'} onRetry={() => void monitorsQuery.refetch()} />}
       </PageContainer>
     )
   }

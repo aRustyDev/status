@@ -41,8 +41,8 @@ export function IncidentCard({ incident, monitors = [] }: { incident: Incident; 
   const updates  = incident.updates ?? []
 
   const affectedMonitors = (incident.monitorIds ?? [])
-    .map((id) => monitors.find((m) => m.id === id))
-    .filter(Boolean) as PublicMonitor[]
+    .map((id) => ({ id, name: monitors.find((m) => m.id === id)?.name ?? incident.monitorNames?.[id] }))
+    .filter((item): item is { id: number; name: string } => typeof item.name === 'string')
 
   /* ── Resolved: collapsible row ──────────────────────────────────── */
   if (!isActive) {
