@@ -1,0 +1,19 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "status-backups",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-24",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true, "traces": { "enabled": false } },
+  "env": {
+    "staging": {
+      "name": "status-backups-staging",
+      "workers_dev": false,
+      "preview_urls": false,
+      "vars": { "ACCOUNT_ID": "REPLACE_ACCOUNT_ID", "DATABASE_ID": "REPLACE_STAGING_D1_ID" },
+      "r2_buckets": [{ "binding": "BACKUP_BUCKET", "bucket_name": "status-backups-staging" }],
+      "workflows": [{ "binding": "BACKUP_WORKFLOW", "name": "status-backup-staging", "class_name": "D1BackupWorkflow", "concurrency": { "limit": 1 } }]
+    }
+  }
+}

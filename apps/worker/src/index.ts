@@ -15,6 +15,8 @@ interface Env {
   ENDPOINTS: string
   GATUS?: GatusBinding
   GATUS_REQUIRED?: string
+  BACKUPS?: Fetcher
+  BACKUPS_READY?: string
 }
 
 type Role = 'viewer' | 'operator' | 'admin'
@@ -720,7 +722,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     return json({ id: saved.result_alias, version: saved.result_version }, saved.status)
   }
   if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now() })
-  if (route === '/capabilities' && method === 'GET') return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log'], subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+  if (route === '/capabilities' && method === 'GET') return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : [])], subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
   if (method === 'GET' && route === '/public/access') return json({ private: true, signedIn: true, email: user.email, role: user.role, passwordChangeRequired: false, branding: null })
@@ -835,6 +837,26 @@ export default {
       const url = new URL(request.url)
       const user = await authenticate(request, env)
       if (!['GET','HEAD','OPTIONS'].includes(request.method) && request.headers.get('origin') !== url.origin) throw new HttpError(403,'Invalid request origin')
+      if (url.pathname === '/api/v1/bsp/admin/backups' || /^\/api\/v1\/bsp\/admin\/backups\/[a-f0-9]{64}\/(verify|download)$/.test(url.pathname)) {
+        requireRole(user, 'admin')
+        if (!env.BACKUPS || env.BACKUPS_READY !== 'true') throw new HttpError(503, 'Backups are unavailable')
+        const path = url.pathname.slice('/api/v1/bsp/admin'.length)
+        const headers = new Headers()
+        let backupId = ''
+        if (request.method === 'POST' && path === '/backups') {
+          const intent = await receiptContext(request, user)
+          if (!intent || Object.keys(intent.body).length) return bad('An idempotent empty backup request is required')
+          const bytes = new TextEncoder().encode(`${user.id}\n${intent.key}`)
+          backupId = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(value => value.toString(16).padStart(2, '0')).join('')
+          headers.set('x-backup-id', backupId)
+          headers.set('x-backup-created-at', intent.key.slice(0, 13))
+        } else if (request.method !== 'GET') throw new HttpError(405, 'Method not allowed')
+        const result = await env.BACKUPS.fetch(new Request(`https://backup.internal${path}${request.method === 'GET' ? url.search : ''}`, { method: request.method, headers }))
+        if (backupId && result.status === 202) {
+          await stmt(env.DB, 'INSERT OR IGNORE INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES (?,?,?,?,?,?,?)', `backup-${backupId}`, user.email, 'create', 'backup', backupId, Date.now(), '{}').run()
+        }
+        return result
+      }
       if (!['GET','HEAD','OPTIONS'].includes(request.method) && request.headers.has('Idempotency-Key')) {
         const normalized = url.pathname.replace(/^\/api\/v1\/bsp\//, '/api/v1/')
         const resource = /^\/api\/v1\/admin\/([^/]+)/.exec(normalized)?.[1]
