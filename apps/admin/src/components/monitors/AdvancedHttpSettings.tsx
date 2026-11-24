@@ -17,6 +17,7 @@ type Props = { checkId: string; version: number; config: AdvancedHttpConfig | nu
 
 /** A separately versioned operation: it never writes check or component fields. */
 export default function AdvancedHttpSettings({ checkId, version, config, onSaved }: Props) {
+  const [initialVersion] = useState(version)
   const [enabled, setEnabled] = useState(config !== null)
   const [method, setMethod] = useState<'GET' | 'HEAD'>(config?.method ?? 'GET')
   const [ranges, setRanges] = useState(config?.acceptedStatusRanges ?? [])
@@ -48,7 +49,7 @@ export default function AdvancedHttpSettings({ checkId, version, config, onSaved
         ...(assertions.length ? { assertions } : {}),
         ...(degradedAboveMs ? { degradedAboveMs: Number(degradedAboveMs) } : {}),
       } : null
-      await api.put(`/admin/checks/${checkId}/advanced`, { version, advancedConfig })
+      await api.put(`/admin/checks/${checkId}/advanced`, { version: initialVersion, advancedConfig })
       onSaved()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not save advanced settings')

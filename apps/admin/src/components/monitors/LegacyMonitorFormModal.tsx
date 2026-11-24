@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { Monitor, MonitorType } from '@bsp/shared'
 import { Alert, Field, Modal, ModalFooter, getCurrentUser } from '@better-forge/ui'
@@ -28,6 +28,7 @@ function CheckForm({ componentId, check, endpoints, onSaved }: { componentId: st
   const [expectedStatus, setExpectedStatus] = useState(check?.expectedStatus ?? 200)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const hasStatusRanges = Boolean(initialCheck?.advancedConfig?.acceptedStatusRanges?.length)
   async function save(event: React.FormEvent) {
     event.preventDefault()
     setBusy(true)
@@ -57,8 +58,9 @@ function CheckForm({ componentId, check, endpoints, onSaved }: { componentId: st
       </select>
     </Field>
     <Field label="Expected HTTP status">
-      <input type="number" min={100} max={599} required value={expectedStatus} onChange={event => setExpectedStatus(Number(event.target.value))} className="input-sig" />
+      <input type="number" min={100} max={599} required disabled={hasStatusRanges || initialCheck?.advancedConfigInvalid} aria-describedby={hasStatusRanges ? 'status-range-explanation' : undefined} value={expectedStatus} onChange={event => setExpectedStatus(Number(event.target.value))} className="input-sig" />
     </Field>
+    {hasStatusRanges && <p id="status-range-explanation" className="text-sm">Status ranges in additional HTTP settings determine the accepted status. Remove the ranges and save those settings to use a single expected status.</p>}
     <label><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> Enabled</label>
     {error && <Alert tone="error">{error}</Alert>}
     <button type="submit" disabled={busy || !endpointId} className="btn btn-primary">Save check</button>
@@ -67,6 +69,7 @@ function CheckForm({ componentId, check, endpoints, onSaved }: { componentId: st
 
 export default function MonitorFormModal({ monitor, onClose, onSaved, statusUnavailable = false }: Props) {
   const component = monitor as Component | null
+  const [initialComponent] = useState(component)
   const [name, setName] = useState(component?.name ?? '')
   const [manualStatus, setManualStatus] = useState(component?.manualStatus ?? 'operational')
   const [position, setPosition] = useState(component?.position ?? 0)
@@ -77,6 +80,12 @@ export default function MonitorFormModal({ monitor, onClose, onSaved, statusUnav
   const history = useQuery<History>({ queryKey: ['monitor-history', component?.id], queryFn: () => api.get(`/admin/monitors/${component!.id}/history`), enabled: !!component && !managedInGatus })
   const checks = useQuery<Check[]>({ queryKey: ['checks'], queryFn: () => api.get('/admin/checks'), enabled: isAdmin && !!component && !managedInGatus, refetchOnMount: 'always' })
   const endpoints = useQuery<Endpoint[]>({ queryKey: ['endpoints'], queryFn: () => api.get('/admin/endpoints'), enabled: isAdmin && !!component && !managedInGatus, refetchOnMount: 'always' })
+  const [checkSettings, setCheckSettings] = useState<{ checks: Check[]; endpoints: Endpoint[] } | null>(null)
+  useEffect(() => {
+    if (!checkSettings && checks.isFetchedAfterMount && endpoints.isFetchedAfterMount && !checks.isError && !endpoints.isError && checks.data && endpoints.data) {
+      setCheckSettings({ checks: checks.data, endpoints: endpoints.data })
+    }
+  }, [checkSettings, checks.isFetchedAfterMount, endpoints.isFetchedAfterMount, checks.isError, endpoints.isError, checks.data, endpoints.data])
   if (managedInGatus) return <Modal title="Monitor" icon="edit" onClose={onClose} flush>
     <div className="p-6 space-y-3"><p className="font-bold">{component.name}</p><p>Managed in Gatus. Change this monitor in Gatus.</p></div>
     <ModalFooter><button type="button" onClick={onClose} className="btn btn-secondary">Close</button></ModalFooter>
@@ -87,7 +96,7 @@ export default function MonitorFormModal({ monitor, onClose, onSaved, statusUnav
     setError('')
     try {
       const body = { name, manualStatus, position }
-      if (component) await api.patch(`/admin/components/${component.uuid}`, { ...body, version: component.version })
+      if (initialComponent) await api.patch(`/admin/components/${initialComponent.uuid}`, { ...body, version: initialComponent.version })
       else await api.post('/admin/components', body)
       onSaved()
     } catch (err) {
@@ -109,12 +118,12 @@ export default function MonitorFormModal({ monitor, onClose, onSaved, statusUnav
         {error && <Alert tone="error">{error}</Alert>}
         <button type="submit" disabled={busy} className="btn btn-primary">Save service</button>
       </form>
-      {component && isAdmin && checks.isFetchedAfterMount && endpoints.isFetchedAfterMount && !checks.isError && !endpoints.isError && checks.data && endpoints.data && <>
-        <CheckForm componentId={component.uuid} check={checks.data.find(item => item.componentId === component.uuid)} endpoints={endpoints.data} onSaved={onSaved} />
-        {checks.data.filter(item => item.componentId === component.uuid).map(check => check.advancedConfigInvalid
+      {component && isAdmin && checkSettings && <div style={{ display: checks.isError || endpoints.isError ? 'none' : undefined }}>
+        <CheckForm componentId={component.uuid} check={checkSettings.checks.find(item => item.componentId === component.uuid)} endpoints={checkSettings.endpoints} onSaved={onSaved} />
+        {checkSettings.checks.filter(item => item.componentId === component.uuid).map(check => check.advancedConfigInvalid
           ? <Alert key={check.id} tone="error">Additional HTTP settings are invalid. Contact an administrator to review the configuration.</Alert>
           : <AdvancedHttpSettings key={check.id} checkId={check.id} version={check.version} config={check.advancedConfig ?? null} onSaved={onSaved} />)}
-      </>}
+      </div>}
       {component && isAdmin && (!checks.isFetchedAfterMount || !endpoints.isFetchedAfterMount) && !checks.isError && !endpoints.isError && <p role="status">Loading check settings…</p>}
       {component && isAdmin && (checks.isError || endpoints.isError) && <Alert tone="error">Could not load check settings.</Alert>}
       {component && <section aria-label="Check history">

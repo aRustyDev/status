@@ -42,6 +42,48 @@ it('preserves an unchanged legacy check when saving service settings', async () 
   await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', { name: 'API', manualStatus: 'operational', position: 1, version: 4 }))
 })
 
+it('shows and preserves configured status ranges while editing other check settings', async () => {
+  const user = userEvent.setup()
+  const ranges = [{ min: 200, max: 299 }, { min: 401, max: 401 }]
+  vi.mocked(api.post).mockResolvedValue({ overall: 'ok', steps: [], totalMs: 5 })
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [{ ...check, advancedConfig: { acceptedStatusRanges: ranges } }]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor)
+  expect(await screen.findByText(/200–299, 401–401/)).toBeInTheDocument()
+  expect(screen.getByLabelText('Expected status')).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Checks' }))
+  await user.type(screen.getByLabelText('Keyword (optional)'), 'ready')
+  await user.click(screen.getByRole('button', { name: 'Test' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors/test', expect.objectContaining({ advancedConfig: expect.objectContaining({ acceptedStatusRanges: ranges, keyword: 'ready' }) }), expect.anything()))
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.objectContaining({ acceptedStatusRanges: ranges, keyword: 'ready' }) }) })))
+})
+
+it('replaces status ranges only when the operator chooses a single expected status', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.post).mockResolvedValue({ overall: 'ok', steps: [], totalMs: 5 })
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [{ ...check, advancedConfig: { acceptedStatusRanges: [{ min: 200, max: 299 }] } }]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor)
+  await user.click(await screen.findByRole('button', { name: 'Use a single expected status' }))
+  const expected = screen.getByLabelText('Expected status')
+  expect(expected).toBeEnabled()
+  await user.clear(expected)
+  await user.type(expected, '201')
+  await user.click(screen.getByRole('button', { name: 'Test' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors/test', expect.objectContaining({ expectedStatus: 201, advancedConfig: expect.not.objectContaining({ acceptedStatusRanges: expect.anything() }) }), expect.anything()))
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ check: expect.objectContaining({ expectedStatus: 201, advancedConfig: expect.not.objectContaining({ acceptedStatusRanges: expect.anything() }) }) })))
+})
+
 it('creates a service and disabled check using the upstream Checks panel', async () => {
   const user = userEvent.setup()
   renderModal(null)

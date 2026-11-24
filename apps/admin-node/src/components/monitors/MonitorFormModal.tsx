@@ -201,6 +201,14 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
     setConfig((prev) => ({ ...prev, [key]: value }))
   }
 
+  function useExpectedStatus() {
+    invalidateCloudflareTest()
+    setConfig((prev) => {
+      const { acceptedStatusRanges: _ranges, ...rest } = prev
+      return rest
+    })
+  }
+
   function invalidateCloudflareTest() {
     if (!cloudflare) return
     testRevision.current += 1
@@ -386,7 +394,11 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
               <Field label="Approved destination"><select value={endpointId} onChange={e => { invalidateCloudflareTest(); setEndpointId(e.target.value) }} className="input-sig"><option value="">No check</option>{cloudflare.endpoints.map(endpoint => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>
               {endpointId && <>
                 <div className="grid grid-cols-2 gap-3"><Field label="Method"><select value={String(config['method'] ?? 'GET')} onChange={e => updateConfig('method', e.target.value)} className="input-sig"><option>GET</option><option>HEAD</option></select></Field>
-                <Field label="Expected status"><input type="number" min={100} max={599} required value={Number(config['expectedStatus'] ?? 200)} onChange={e => updateConfig('expectedStatus', Number(e.target.value))} className="input-sig" /></Field></div>
+                <Field label="Expected status"><input type="number" min={100} max={599} required disabled={Array.isArray(config['acceptedStatusRanges']) && config['acceptedStatusRanges'].length > 0} value={Number(config['expectedStatus'] ?? 200)} onChange={e => updateConfig('expectedStatus', Number(e.target.value))} className="input-sig" /></Field></div>
+                {Array.isArray(config['acceptedStatusRanges']) && config['acceptedStatusRanges'].length > 0 && <div className="text-sm space-y-2">
+                  <p>This check accepts status ranges: {config['acceptedStatusRanges'].map((range: { min: number; max: number }) => `${range.min}–${range.max}`).join(', ')}. The expected status is not used while these ranges are configured.</p>
+                  <button type="button" className="btn btn-secondary" onClick={useExpectedStatus}>Use a single expected status</button>
+                </div>}
                 <label><input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} /> Enabled</label>
               </>}
             </>}
