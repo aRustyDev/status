@@ -41,7 +41,11 @@ function wrapFetch(original, options = {}) {
     return (async () => {
       const liveOpts = { ...args[1], cache: null, preferOnline: true, preferOffline: false, offline: false, strictSSL: true };
       const res = await Reflect.apply(target, receiver, [args[0], liveOpts]);
-      if (res.status !== 200 || await res.clone().text() !== 'OK\r\n') return res;
+      if (res.status !== 200) return res;
+      // Consume the response once. Reading a clone while the original stream is
+      // unconsumed can stall the stream tee on a large, valid attestation.
+      const body = await res.text();
+      if (body !== 'OK\r\n') return { json: async () => JSON.parse(body) };
       const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
       const locked = lock.packages[`node_modules/@better-forge/${info.name}`];
       if (!locked || locked.version !== info.version || locked.integrity !== info.integrity) throw Error('Attestation recovery does not match lockfile');

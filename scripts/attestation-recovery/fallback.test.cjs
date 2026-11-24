@@ -9,7 +9,7 @@ const [url, info] = targets.entries().next().value;
 const data = JSON.parse(fs.readFileSync(path.join(__dirname, `${info.name}.json`), 'utf8'));
 const metadata = { name: `@better-forge/${info.name}`, version: info.version, dist: { integrity: info.integrity,
   attestations: { url, provenance: { predicateType: 'https://slsa.dev/provenance/v1' } } } };
-const response = (status, text, json) => ({ status, clone: () => ({ text: async () => text }), json: async () => json });
+const response = (status, text, json) => ({ status, text: async () => text, json: async () => json });
 const good = response(200, 'OK\r\n');
 function fixture(first = good, meta = metadata, root) {
   const calls = [];
@@ -24,11 +24,15 @@ test('known response uses recovered original attestations with live metadata', a
   assert.equal(f.calls.length, 2);
   for (const [, opts] of f.calls) { assert.equal(opts.cache, null); assert.equal(opts.preferOnline, true); assert.equal(opts.preferOffline, false); assert.equal(opts.strictSSL, true); }
 });
-test('other addresses pass through, and other bodies or HTTP errors are never replaced', async () => {
+test('other addresses and HTTP errors pass through; valid JSON is returned unchanged', async () => {
   const f = fixture(); await f.fetch(url.replace('registry.npmjs.org', 'example.com')); assert.equal(f.calls.length, 1);
-  for (const res of [response(404, 'OK\r\n'), response(200, '{}'), response(200, 'OK\n')]) {
-    const f = fixture(res); assert.equal(await f.fetch(url), res); assert.equal(f.calls.length, 1);
-  }
+  const httpError = response(404, 'OK\r\n'); const errorFixture = fixture(httpError);
+  assert.equal(await errorFixture.fetch(url), httpError); assert.equal(errorFixture.calls.length, 1);
+  const data = { attestations: [{ payload: 'a'.repeat(1024 * 1024) }] };
+  const valid = fixture(response(200, JSON.stringify(data)));
+  assert.deepEqual(await (await valid.fetch(url)).json(), data); assert.equal(valid.calls.length, 1);
+  const malformed = fixture(response(200, 'OK\n'));
+  await assert.rejects((await malformed.fetch(url)).json(), SyntaxError); assert.equal(malformed.calls.length, 1);
 });
 test('transport error is not hidden', async () => {
   const wrapped = wrapFetch(async () => { throw Error('network failed'); });
