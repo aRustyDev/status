@@ -281,7 +281,8 @@ export default function MonitorDetailPage() {
   const monitor = monitorQuery.data
   const stats = statsQuery.data
   const beyondRetention = stats !== undefined && hours > stats.retentionDays * 24
-  const typeLabel = MONITOR_TYPES.find((t) => (t.types ?? [t.value]).includes(monitor.type))?.label ?? monitor.type
+  const monitorType = monitor.type
+  const typeLabel = monitorType === 'gatus' ? 'Gatus' : MONITOR_TYPES.find((t) => (t.types ?? [t.value]).includes(monitorType))?.label ?? monitorType
   const target = monitorTarget(monitor)
   const certificate = certificateText(monitor)
   const dependencyNames = (dependenciesQuery.data?.dependsOnIds ?? []).map((depId) => monitors.find((m) => m.id === depId)?.name ?? `Monitor ${depId}`)
