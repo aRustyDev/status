@@ -70,6 +70,10 @@ For a separately configured standalone production board, replace `staging` with 
 
 After the board is deployed and protected by Access, the intended administrator signs in once. A verified Access identity is created as a viewer. A Cloudflare administrator then queries the selected environment's D1 `users` table for the account's `id`, `issuer`, `subject`, `email`, `role`, and `version`. Confirm the identity and application before updating that exact row to `admin` and incrementing `version`. Use the D1 console or `wrangler d1 execute` with `--remote`, the board config, and the explicit environment. Do not paste tokens or credentials into logs or chat. The promoted user can assign roles in the admin interface after refreshing.
 
+## Audit history
+
+The administrator-only Audit Log lists application mutations, including monitor, check, incident, maintenance, and role changes. It does not record Cloudflare Access sign-ins or denied requests; use Access logs for those events. Filters and pagination use the operations API, and details are restricted to an allowlist of non-sensitive values. Check events retain the associated monitor UUID and basic scheduling and status settings. Names, incident text, endpoint identifiers, advanced check configuration and credentials are not included in new audit details. Existing records are filtered on read, but their stored values are not rewritten; treat database access and backups accordingly. Deploy both operations and monitoring Workers to apply the new recording rules to both mutation paths.
+
 ## Staging verification
 
 1. Sign in as a viewer, operator, and administrator. Confirm unauthenticated requests are rejected, viewers cannot write, operators cannot change roles, and administrators can view audit events. Check the JSON endpoints directly as well as the pages.

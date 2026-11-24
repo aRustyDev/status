@@ -143,6 +143,48 @@ test('Access identity, roles and same-origin mutations are enforced', async () =
   assert.equal((await request('/api/v1/admin/users', adminToken)).response.status, 200)
 })
 
+test('audit log is admin-only, paginated, filtered and redacts legacy sensitive details', async () => {
+  const email = 'audit-fixture@example.com'
+  const statements = Array.from({ length: 55 }, (_, i) => db.prepare('INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) VALUES (?,?,?,?,?,?,?)')
+    .bind(`audit-fixture-${String(i).padStart(2, '0')}`, email, i % 2 ? 'publish' : 'update', 'incident', `target-${i}`, 1000 + i, JSON.stringify({ status: 'monitoring', componentId: 'secret-invalid-id', title: 'secret-title', token: 'secret-token', nested: { password: 'secret-password' } })))
+  await db.batch(statements)
+  try {
+    const path = '/api/v1/bsp/admin/audit-log'
+    assert.equal((await request(path, viewerToken)).response.status, 403)
+    assert.equal((await request(path, operatorToken)).response.status, 403)
+    const result = await request(`${path}?userEmail=audit-fixture%40example.com&entityType=incident&limit=50`, adminToken)
+    assert.equal(result.response.status, 200)
+    const data = result.body as unknown as {entries: Array<{id:string;diff:unknown}>; total:number; pages:number}
+    assert.equal(data.total, 55); assert.equal(data.pages, 2); assert.equal(data.entries.length, 50)
+    assert.equal(data.entries[0].id, 'audit-fixture-54')
+    assert.deepEqual(data.entries[0].diff, { status: 'monitoring' })
+    assert.doesNotMatch(JSON.stringify(data), /secret-/)
+    const second = (await request(`${path}?userEmail=audit-fixture%40example.com&limit=50&page=2`, adminToken)).body as unknown as {entries:unknown[]}
+    assert.equal(second.entries.length, 5)
+    const filtered = (await request(`${path}?userEmail=audit-fixture%40example.com&action=publish&from=1005&to=1010`, adminToken)).body as unknown as {total:number}
+    assert.equal(filtered.total, 3)
+    const escaped = (await request(`${path}?userEmail=%25`, adminToken)).body as unknown as {total:number}
+    assert.equal(escaped.total, 0)
+    for (const query of ['page=0', 'page=1.5', 'limit=101', 'from=2&to=1', 'action=' + 'x'.repeat(201)]) assert.equal((await request(`${path}?${query}`, adminToken)).response.status, 400)
+    const legacy = await request('/api/v1/admin/audit', adminToken)
+    assert.doesNotMatch(JSON.stringify(legacy.body), /secret-/)
+  } finally { await db.prepare("DELETE FROM audit_events WHERE actor_email=?").bind(email).run() }
+})
+
+test('audit pagination orders same-millisecond events by insertion order', async () => {
+  const email = 'audit-order@example.com'
+  const insert = (id: string, action: string) => db.prepare('INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) VALUES (?,?,?,?,?,?,?)')
+    .bind(id, email, action, 'incident', 'same-incident', 1000, '{}')
+  await db.batch([insert('ffffffff-ffff-4fff-afff-ffffffffffff', 'create'), insert('00000000-0000-4000-8000-000000000000', 'publish')])
+  try {
+    const path = '/api/v1/bsp/admin/audit-log?userEmail=audit-order%40example.com&limit=1'
+    const first = (await request(`${path}&page=1`, adminToken)).body as unknown as {entries: Array<{action:string}>}
+    const second = (await request(`${path}&page=2`, adminToken)).body as unknown as {entries: Array<{action:string}>}
+    assert.equal(first.entries[0]?.action, 'publish')
+    assert.equal(second.entries[0]?.action, 'create')
+  } finally { await db.prepare('DELETE FROM audit_events WHERE actor_email=?').bind(email).run() }
+})
+
 test('idempotent creates survive an ambiguous response and concurrent retries without storing bodies', async () => {
   const key = `${Date.now()}.${crypto.randomUUID()}`
   const payload = { name: '  Receipt private fixture  ', manualStatus: 'operational', position: 0 }
@@ -383,7 +425,18 @@ test('check configuration requires an approved endpoint and rejects stale change
   assert.equal((await request('/api/v1/admin/checks', operatorToken, 'POST', { ...config, endpointId: 'api' })).response.status, 403)
   const created = await request('/api/v1/admin/checks', adminToken, 'POST', { ...config, endpointId: 'api' })
   assert.equal(created.response.status, 201)
-  assert.equal((await request(`/api/v1/admin/checks/${created.body.id}`, adminToken, 'PATCH', { ...config, endpointId: 'api', expectedStatus: 204, version: 1 })).response.status, 200)
+  const newComponent = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Moved check target' })
+  assert.equal((await request(`/api/v1/admin/checks/${created.body.id}`, adminToken, 'PATCH', { ...config, componentId: newComponent.body.id, endpointId: 'api', expectedStatus: 204, version: 1 })).response.status, 200)
+  const checkEvents = await db.prepare("SELECT action, details FROM audit_events WHERE entity_type='check' AND entity_id=? ORDER BY rowid").bind(created.body.id).all<{action:string;details:string}>()
+  assert.deepEqual(checkEvents.results.map(event => [event.action, JSON.parse(event.details)]), [
+    ['create', { componentId, enabled: true, intervalMinutes: 1, expectedStatus: 200 }],
+    ['update', { componentId: newComponent.body.id, enabled: true, intervalMinutes: 1, expectedStatus: 204 }],
+  ])
+  const page = (await request('/api/v1/bsp/admin/audit-log?entityType=check', adminToken)).body as unknown as {entries: Array<{entityId:string;diff:unknown}>}
+  assert.deepEqual(page.entries.filter(event => event.entityId === created.body.id).map(event => event.diff), [
+    { componentId: newComponent.body.id, enabled: true, intervalMinutes: 1, expectedStatus: 204 },
+    { componentId, enabled: true, intervalMinutes: 1, expectedStatus: 200 },
+  ])
   const audits = Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count)
   assert.equal((await request(`/api/v1/admin/checks/${created.body.id}`, adminToken, 'PATCH', { ...config, endpointId: 'api', version: 1 })).response.status, 409)
   assert.equal(Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count), audits)
@@ -929,6 +982,12 @@ test('atomic monitor writes preserve checks and reject stale versions', async ()
   assert.equal(replay.value.id, created.value.id)
   const stored = await db.prepare("SELECT h.* FROM http_checks h JOIN entity_aliases a ON a.entity_id=h.component_id WHERE a.alias=? AND a.entity_type='component'").bind(created.value.id).first<{id:string;config_version:number;advanced_config:string}>()
   assert.ok(stored)
+  const monitor = await db.prepare("SELECT entity_id FROM entity_aliases WHERE alias=? AND entity_type='component'").bind(created.value.id).first<{entity_id:string}>()
+  assert.ok(monitor)
+  const checkAudits = () => db.prepare("SELECT action, details FROM audit_events WHERE entity_type='check' AND entity_id=? ORDER BY rowid").bind(stored.id).all<{action:string;details:string}>()
+  assert.deepEqual((await checkAudits()).results.map(row => row.action), ['create'])
+  assert.deepEqual(JSON.parse((await checkAudits()).results[0].details), { componentId: monitor.entity_id, enabled: false, intervalMinutes: 1, expectedStatus: 200 })
+  assert.doesNotMatch(JSON.stringify((await checkAudits()).results), /keyword|atomic-target/)
   assert.deepEqual(JSON.parse(stored.advanced_config), body.check.advancedConfig)
   const listedChecks = await request('/api/v1/bsp/admin/checks', adminToken)
   assert.deepEqual((listedChecks.body as unknown as { id: string; advancedConfig: unknown }[]).find(item => item.id === stored.id)?.advancedConfig, body.check.advancedConfig)
@@ -943,10 +1002,13 @@ test('atomic monitor writes preserve checks and reject stale versions', async ()
   assert.equal(after?.expected_status, 200)
   const invalidCheck = await save('PATCH', `/admin/monitors/${created.value.id}`, { name: 'Rejected', version: 2, check: { ...body.check, id: stored.id, version: stored.config_version + 1 } }, key())
   assert.equal(invalidCheck.response.status, 409)
+  assert.deepEqual((await checkAudits()).results.map(row => row.action), ['create'])
   const unchanged = await db.prepare("SELECT c.name FROM components c JOIN entity_aliases a ON a.entity_id=c.id WHERE a.alias=? AND a.entity_type='component'").bind(created.value.id).first<{name:string}>()
   assert.equal(unchanged?.name, 'Renamed')
   const updated = await save('PATCH', `/admin/monitors/${created.value.id}`, { name: 'Changed', version: 2, check: { ...body.check, id: stored.id, version: stored.config_version, expectedStatus: 201 } }, key())
   assert.equal(updated.response.status, 200)
+  assert.deepEqual((await checkAudits()).results.map(row => row.action), ['create', 'update'])
+  assert.deepEqual(JSON.parse((await checkAudits()).results[1].details), { componentId: monitor.entity_id, enabled: false, intervalMinutes: 1, expectedStatus: 201 })
   const revised = await db.prepare('SELECT config_version, expected_status FROM http_checks WHERE id=?').bind(stored.id).first<{config_version:number;expected_status:number}>()
   assert.equal(revised?.config_version, stored.config_version + 1)
   assert.equal(revised?.expected_status, 201)
