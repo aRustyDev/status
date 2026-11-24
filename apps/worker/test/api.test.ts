@@ -6,6 +6,8 @@ import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 import worker from '../src/index.ts'
 import { endpointFingerprint } from '../src/endpoint-config.ts'
+import { syncGatusCatalog } from '../src/gatus-catalog.ts'
+import { gatusSourceId, type GatusCatalogEntry } from '../src/gatus.ts'
 
 // This adapter executes actual SQLite statements, including atomic batches, to
 // exercise the API independently of a running Cloudflare account.
@@ -13,10 +15,11 @@ class SQLiteStatement {
   private values: unknown[] = []
   constructor(private sql: string, private database: DatabaseSync) {}
   bind(...values: unknown[]) { this.values = values; return this }
-  async run() {
+  runSync() {
     const result = this.database.prepare(this.sql).run(...this.values as never[])
     return { success: true, meta: { changes: Number(result.changes) } }
   }
+  async run() { return this.runSync() }
   async first<T = Record<string, unknown>>() { return (this.database.prepare(this.sql).get(...this.values as never[]) ?? null) as T | null }
   async all<T>() { return { results: this.database.prepare(this.sql).all(...this.values as never[]) as T[] } }
 }
@@ -27,7 +30,7 @@ class SQLiteD1 {
     this.db.exec('BEGIN')
     try {
       const result = []
-      for (const statement of statements) result.push(await statement.run())
+      for (const statement of statements) result.push(statement.runSync())
       this.db.exec('COMMIT')
       return result
     } catch (error) { this.db.exec('ROLLBACK'); throw error }
@@ -65,16 +68,22 @@ let db: TestDatabase = sqlite
 let miniflare: Miniflare | undefined
 const issuer = 'https://test.cloudflareaccess.com'
 const audience = 'status-test'
-const env = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
+const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> } } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
 const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
 let sign: (subject: string, email: string, aud?: string, expires?: string) => Promise<string>
 let adminToken: string, operatorToken: string, viewerToken: string
 
-async function request(path: string, token?: string, method = 'GET', body?: unknown, origin = 'https://status.example') {
+async function request(path: string, token?: string, method = 'GET', body?: unknown, origin = 'https://status.example', idempotencyKey?: string, idempotencyActor?: string) {
   const headers: Record<string, string> = {}
   if (token) headers['Cf-Access-Jwt-Assertion'] = token
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey
+    const subject = token === adminToken ? 'admin-id' : token === operatorToken ? 'operator-id' : token === viewerToken ? 'viewer-id' : ''
+    const actor = subject ? await db.prepare('SELECT id FROM users WHERE subject=?').bind(subject).first<{id:string}>() : null
+    if (idempotencyActor ?? actor?.id) headers['Idempotency-Actor'] = (idempotencyActor ?? actor!.id)
+  }
   if (method !== 'GET') { headers.origin = origin; headers['content-type'] = 'application/json' }
   const response = await worker.fetch(new Request(`https://status.example${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) }), env as never)
   return { response, body: await response.json() as TestResponseBody }
@@ -85,18 +94,23 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql']) {
-      const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8')
-      const parts = sql.split(/(?=CREATE TRIGGER )/)
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql']) {
+      const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
+      const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
       statements.push(...parts.map(value => value.trim()).filter(Boolean))
-      await db.batch(statements.map(statement => db.prepare(statement)))
+      try {
+        await db.batch(statements.map(statement => db.prepare(statement)))
+      } catch (error) { throw new Error(`Failed test migration ${file}`, { cause: error }) }
     }
   } else {
     sqlite.db.exec(readFileSync(new URL('../migrations/0001_board.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0002_checks.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0003_endpoint_registry.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0004_aliases.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0005_gatus_sources.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0007_idempotency.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -127,6 +141,138 @@ test('Access identity, roles and same-origin mutations are enforced', async () =
   assert.equal((await request('/api/v1/admin/users', operatorToken)).response.status, 403)
   assert.equal((await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'API' }, 'https://evil.example')).response.status, 403)
   assert.equal((await request('/api/v1/admin/users', adminToken)).response.status, 200)
+})
+
+test('audit log is admin-only, paginated, filtered and redacts legacy sensitive details', async () => {
+  const email = 'audit-fixture@example.com'
+  const statements = Array.from({ length: 55 }, (_, i) => db.prepare('INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) VALUES (?,?,?,?,?,?,?)')
+    .bind(`audit-fixture-${String(i).padStart(2, '0')}`, email, i % 2 ? 'publish' : 'update', 'incident', `target-${i}`, 1000 + i, JSON.stringify({ status: 'monitoring', componentId: 'secret-invalid-id', title: 'secret-title', token: 'secret-token', nested: { password: 'secret-password' } })))
+  await db.batch(statements)
+  try {
+    const path = '/api/v1/bsp/admin/audit-log'
+    assert.equal((await request(path, viewerToken)).response.status, 403)
+    assert.equal((await request(path, operatorToken)).response.status, 403)
+    const result = await request(`${path}?userEmail=audit-fixture%40example.com&entityType=incident&limit=50`, adminToken)
+    assert.equal(result.response.status, 200)
+    const data = result.body as unknown as {entries: Array<{id:string;diff:unknown}>; total:number; pages:number}
+    assert.equal(data.total, 55); assert.equal(data.pages, 2); assert.equal(data.entries.length, 50)
+    assert.equal(data.entries[0].id, 'audit-fixture-54')
+    assert.deepEqual(data.entries[0].diff, { status: 'monitoring' })
+    assert.doesNotMatch(JSON.stringify(data), /secret-/)
+    const second = (await request(`${path}?userEmail=audit-fixture%40example.com&limit=50&page=2`, adminToken)).body as unknown as {entries:unknown[]}
+    assert.equal(second.entries.length, 5)
+    const filtered = (await request(`${path}?userEmail=audit-fixture%40example.com&action=publish&from=1005&to=1010`, adminToken)).body as unknown as {total:number}
+    assert.equal(filtered.total, 3)
+    const escaped = (await request(`${path}?userEmail=%25`, adminToken)).body as unknown as {total:number}
+    assert.equal(escaped.total, 0)
+    for (const query of ['page=0', 'page=1.5', 'limit=101', 'from=2&to=1', 'action=' + 'x'.repeat(201)]) assert.equal((await request(`${path}?${query}`, adminToken)).response.status, 400)
+    const legacy = await request('/api/v1/admin/audit', adminToken)
+    assert.doesNotMatch(JSON.stringify(legacy.body), /secret-/)
+  } finally { await db.prepare("DELETE FROM audit_events WHERE actor_email=?").bind(email).run() }
+})
+
+test('audit pagination orders same-millisecond events by insertion order', async () => {
+  const email = 'audit-order@example.com'
+  const insert = (id: string, action: string) => db.prepare('INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) VALUES (?,?,?,?,?,?,?)')
+    .bind(id, email, action, 'incident', 'same-incident', 1000, '{}')
+  await db.batch([insert('ffffffff-ffff-4fff-afff-ffffffffffff', 'create'), insert('00000000-0000-4000-8000-000000000000', 'publish')])
+  try {
+    const path = '/api/v1/bsp/admin/audit-log?userEmail=audit-order%40example.com&limit=1'
+    const first = (await request(`${path}&page=1`, adminToken)).body as unknown as {entries: Array<{action:string}>}
+    const second = (await request(`${path}&page=2`, adminToken)).body as unknown as {entries: Array<{action:string}>}
+    assert.equal(first.entries[0]?.action, 'publish')
+    assert.equal(second.entries[0]?.action, 'create')
+  } finally { await db.prepare('DELETE FROM audit_events WHERE actor_email=?').bind(email).run() }
+})
+
+test('idempotent creates survive an ambiguous response and concurrent retries without storing bodies', async () => {
+  const key = `${Date.now()}.${crypto.randomUUID()}`
+  const payload = { name: '  Receipt private fixture  ', manualStatus: 'operational', position: 0 }
+  const before = (await db.prepare('SELECT COUNT(*) AS n FROM components').first<{n:number}>())!.n
+  const [one, two] = await Promise.all([
+    request('/api/v1/admin/components', adminToken, 'POST', payload, 'https://status.example', key),
+    request('/api/v1/admin/components', adminToken, 'POST', payload, 'https://status.example', key),
+  ])
+  assert.equal(one.response.status, 201); assert.equal(two.response.status, 201)
+  assert.deepEqual(one.body, two.body)
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM components').first<{n:number}>())!.n, before + 1)
+  const retry = await request('/api/v1/admin/components', adminToken, 'POST', payload, 'https://status.example', key)
+  assert.deepEqual(retry.body, one.body)
+  assert.equal((await request('/api/v1/admin/components', adminToken, 'POST', { ...payload, name: 'different' }, 'https://status.example', key)).response.status, 409)
+  const stored = await db.prepare('SELECT * FROM mutation_receipts WHERE request_key=?').bind(key).first<Record<string, unknown>>()
+  assert.ok(stored); assert.doesNotMatch(JSON.stringify(stored), /Receipt private fixture/)
+  const expired = `${Date.now() - 25 * 3600000}.${crypto.randomUUID()}`
+  const admin = (await db.prepare("SELECT id,version FROM users WHERE subject='admin-id'").first<{id:string;version:number}>())!
+  await db.prepare('INSERT INTO mutation_receipts (actor_id,request_key,request_hash,actor_version,attempt_token,status,expires_at) VALUES (?,?,?,?,?,201,?)')
+    .bind(admin.id,expired,'expired-hash',admin.version,crypto.randomUUID(),Date.now()-1).run()
+  const old = await request('/api/v1/admin/components', adminToken, 'POST', payload, 'https://status.example', expired)
+  assert.equal(old.response.status, 409)
+  assert.equal((old.body as unknown as {code:string}).code, 'IDEMPOTENCY_EXPIRED')
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM components').first<{n:number}>())!.n, before + 1)
+})
+
+test('receipt replay is scoped to an authorized identity and preserves alias results', async () => {
+  const key = `${Date.now()}.${crypto.randomUUID()}`
+  const payload = { title: 'One incident', status: 'investigating', impact: 'minor', body: 'Details', monitorIds: [], draft: true }
+  assert.equal((await request('/api/v1/bsp/admin/incidents', operatorToken, 'POST', payload, 'https://status.example', key, 'different-account')).response.status, 403)
+  const first = await request('/api/v1/bsp/admin/incidents', operatorToken, 'POST', payload, 'https://status.example', key)
+  assert.equal(first.response.status, 201)
+  const other = await request('/api/v1/bsp/admin/incidents', adminToken, 'POST', payload, 'https://status.example', key)
+  assert.equal(other.response.status, 201); assert.notEqual(other.body.id, first.body.id)
+  const user = (await db.prepare("SELECT id FROM users WHERE subject='operator-id'").first<{id:string}>())!
+  await db.prepare("UPDATE users SET role='viewer',version=version+1 WHERE id=?").bind(user.id).run()
+  try { assert.equal((await request('/api/v1/bsp/admin/incidents', operatorToken, 'POST', payload, 'https://status.example', key)).response.status, 403) }
+  finally { await db.prepare("UPDATE users SET role='operator',version=version+1 WHERE id=?").bind(user.id).run() }
+  const replay = await request('/api/v1/bsp/admin/incidents', operatorToken, 'POST', payload, 'https://status.example', key)
+  assert.equal(replay.response.status, 201); assert.deepEqual(replay.body, first.body)
+})
+
+test('versioned keyed mutations replay once and roll back receipts for stale versions', async () => {
+  const created = await request('/api/v1/admin/components', adminToken, 'POST', { name: 'Versioned receipt' })
+  const id = created.body.id, key = `${Date.now()}.${crypto.randomUUID()}`
+  const path = `/api/v1/admin/components/${id}`
+  const payload = { name: '  Updated name  ', manualStatus: 'degraded', position: 2, version: 1 }
+  const changed = await request(path, adminToken, 'PATCH', payload, 'https://status.example', key)
+  assert.equal(changed.response.status, 200)
+  const retry = await request(path, adminToken, 'PATCH', payload, 'https://status.example', key)
+  assert.deepEqual(retry.body, changed.body)
+  const count = await db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_type='component' AND entity_id=? AND action='update'").bind(id).first<{n:number}>()
+  assert.equal(count!.n, 1)
+  const staleKey = `${Date.now()}.${crypto.randomUUID()}`
+  assert.equal((await request(path, adminToken, 'PATCH', payload, 'https://status.example', staleKey)).response.status, 409)
+  assert.equal(await db.prepare('SELECT request_key FROM mutation_receipts WHERE request_key=?').bind(staleKey).first(), null)
+  assert.equal((await request('/api/v1/admin/maintenance', adminToken, 'POST', { name: 'X', startsAt: 1, endsAt: 2 }, 'https://status.example', key)).response.status, 409)
+})
+
+test('concurrent conflicting intents cannot both commit and maintenance aliases replay exactly', async () => {
+  const key = `${Date.now()}.${crypto.randomUUID()}`
+  const [a, b] = await Promise.all([
+    request('/api/v1/admin/components', adminToken, 'POST', { name: 'First competing intent' }, 'https://status.example', key),
+    request('/api/v1/admin/components', adminToken, 'POST', { name: 'Second competing intent' }, 'https://status.example', key),
+  ])
+  assert.deepEqual([a.response.status, b.response.status].sort(), [201, 409])
+  const winner = a.response.status === 201 ? a : b
+  const alias = await db.prepare("SELECT alias FROM entity_aliases WHERE entity_type='component' AND entity_id=?").bind(winner.body.id).first<{alias:number}>()
+  assert.ok(alias)
+  const maintenanceKey = `${Date.now()}.${crypto.randomUUID()}`
+  const body = { name: '  Planned work  ', description: '  note  ', startsAt: Date.now() + 300000, endsAt: Date.now() + 600000, monitorIds: [alias.alias, alias.alias] }
+  const first = await request('/api/v1/bsp/admin/maintenance', adminToken, 'POST', body, 'https://status.example', maintenanceKey)
+  assert.equal(first.response.status, 201)
+  const retry = await request('/api/v1/bsp/admin/maintenance', adminToken, 'POST', body, 'https://status.example', maintenanceKey)
+  assert.equal(retry.response.status, 201); assert.deepEqual(retry.body, first.body)
+})
+
+test('keyed role changes replay the complete response and reject a missing actor binding', async () => {
+  const viewer = (await db.prepare("SELECT id,version FROM users WHERE subject='viewer-id'").first<{id:string;version:number}>())!
+  const path = `/api/v1/admin/users/${viewer.id}`, key = `${Date.now()}.${crypto.randomUUID()}`, body = { role: 'operator', version: viewer.version }
+  const absent = await worker.fetch(new Request(`https://status.example${path}`, { method:'PATCH', headers: { 'Cf-Access-Jwt-Assertion':adminToken, origin:'https://status.example', 'content-type':'application/json', 'Idempotency-Key':key }, body:JSON.stringify(body) }), env as never)
+  assert.equal(absent.status, 403)
+  try {
+    const first = await request(path, adminToken, 'PATCH', body, 'https://status.example', key)
+    const replay = await request(path, adminToken, 'PATCH', body, 'https://status.example', key)
+    assert.equal(first.response.status, 200); assert.deepEqual(replay.body, first.body)
+    assert.equal((replay.body as unknown as {role:string}).role, 'operator')
+  } finally { await db.prepare("UPDATE users SET role='viewer',version=version+1 WHERE id=?").bind(viewer.id).run() }
 })
 
 test('viewer writes and operator role changes are denied without mutations or audit events', async () => {
@@ -279,7 +425,18 @@ test('check configuration requires an approved endpoint and rejects stale change
   assert.equal((await request('/api/v1/admin/checks', operatorToken, 'POST', { ...config, endpointId: 'api' })).response.status, 403)
   const created = await request('/api/v1/admin/checks', adminToken, 'POST', { ...config, endpointId: 'api' })
   assert.equal(created.response.status, 201)
-  assert.equal((await request(`/api/v1/admin/checks/${created.body.id}`, adminToken, 'PATCH', { ...config, endpointId: 'api', expectedStatus: 204, version: 1 })).response.status, 200)
+  const newComponent = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Moved check target' })
+  assert.equal((await request(`/api/v1/admin/checks/${created.body.id}`, adminToken, 'PATCH', { ...config, componentId: newComponent.body.id, endpointId: 'api', expectedStatus: 204, version: 1 })).response.status, 200)
+  const checkEvents = await db.prepare("SELECT action, details FROM audit_events WHERE entity_type='check' AND entity_id=? ORDER BY rowid").bind(created.body.id).all<{action:string;details:string}>()
+  assert.deepEqual(checkEvents.results.map(event => [event.action, JSON.parse(event.details)]), [
+    ['create', { componentId, enabled: true, intervalMinutes: 1, expectedStatus: 200 }],
+    ['update', { componentId: newComponent.body.id, enabled: true, intervalMinutes: 1, expectedStatus: 204 }],
+  ])
+  const page = (await request('/api/v1/bsp/admin/audit-log?entityType=check', adminToken)).body as unknown as {entries: Array<{entityId:string;diff:unknown}>}
+  assert.deepEqual(page.entries.filter(event => event.entityId === created.body.id).map(event => event.diff), [
+    { componentId: newComponent.body.id, enabled: true, intervalMinutes: 1, expectedStatus: 204 },
+    { componentId, enabled: true, intervalMinutes: 1, expectedStatus: 200 },
+  ])
   const audits = Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count)
   assert.equal((await request(`/api/v1/admin/checks/${created.body.id}`, adminToken, 'PATCH', { ...config, endpointId: 'api', version: 1 })).response.status, 409)
   assert.equal(Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count), audits)
@@ -524,4 +681,374 @@ test('BSP contract keeps aliases, visibility and versioned uptime across the leg
   const mismatchHistory = await request(`/api/v1/bsp/admin/monitors/${monitor.id}/history`, operatorToken)
   assert.equal((mismatchHistory.body as unknown as {results:unknown[]}).results.length, 0)
   env.ENDPOINTS = '[]'
+})
+
+test('Gatus inventory is read-only, preserves aliases and incidents, and fails closed on drift', async () => {
+  await db.prepare("UPDATE incidents SET status='resolved', resolved_at=? WHERE status<>'resolved'").bind(Date.now()).run()
+  const component = 'gatus-fixture-component'
+  const sourceId = JSON.stringify(['gatus', 'endpoint', 'Fixture group', 'Fixture service'])
+  const suiteComponent = 'gatus-fixture-suite'
+  const suiteId = JSON.stringify(['gatus', 'suite', 'Fixture group', 'Fixture suite'])
+  const raw = (key: string, name: string) => ({ key, name, group: 'Fixture group', results: [
+    { success: true, timestamp: new Date().toISOString(), duration: 2_000_000, hostname: 'never-expose.example' },
+  ] })
+  const statuses = [raw('fixture_service', 'Fixture service')]
+  const suites = [raw('fixture_suite', 'Fixture suite')]
+  try {
+    for (const [id, name, source, kind, key] of [
+      [component, 'Fixture service', sourceId, 'endpoint', 'fixture_service'],
+      [suiteComponent, 'Fixture suite', suiteId, 'suite', 'fixture_suite'],
+    ]) {
+      await db.prepare('INSERT INTO components (id,name,position,updated_at) VALUES (?,?,?,?)').bind(id, name, 1000, Date.now()).run()
+      await db.prepare(`INSERT INTO gatus_sources (source_id,component_id,kind,source_key,source_name,source_group,stale_after_seconds,advisory)
+        VALUES (?,?,?,?,?,?,?,?)`).bind(source, id, kind, key, name, 'Fixture group', 180, 0).run()
+    }
+    env.GATUS = { async fetch(request) { return Response.json(new URL(request.url).pathname.includes('/endpoints/') ? statuses : suites) } }
+    const publicStatus = await request('/api/v1/bsp/public/status', viewerToken)
+    assert.equal(publicStatus.response.status, 200)
+    const body = publicStatus.body as unknown as {monitors:Array<{id:number;uuid:string;source?:string;type:string;group:string;currentStatus:string}>}
+    const monitor = body.monitors.find(item => item.uuid === component)
+    assert.ok(monitor)
+    assert.deepEqual([monitor.source, monitor.type, monitor.group, monitor.currentStatus], ['gatus', 'gatus', 'Fixture group', 'up'])
+    assert.doesNotMatch(JSON.stringify(body), /never-expose\.example|fixture_service/)
+    const publicAgain = await request('/api/v1/bsp/public/status', viewerToken)
+    assert.equal((publicAgain.body as unknown as {monitors:Array<{id:number;uuid:string}>}).monitors.find(item => item.uuid === component)?.id, monitor.id)
+    const legacy = await request('/api/v1/public/status', viewerToken)
+    assert.equal(legacy.body.components.find(item => item.id === component)?.status, 'operational')
+    const originalDb = env.DB
+    const nativeCheckLookups: unknown[] = []
+    env.DB = {
+      prepare(sql) {
+        const inner = originalDb.prepare(sql)
+        if (sql !== 'SELECT endpoint_id, interval_minutes FROM http_checks WHERE component_id=?') return inner
+        return {
+          bind(...values) { nativeCheckLookups.push(values[0]); return inner.bind(...values) },
+          run: () => inner.run(), first: <T>() => inner.first<T>(), all: <T>() => inner.all<T>(),
+        }
+      },
+      batch: statements => originalDb.batch(statements),
+    }
+    try {
+      const adminList = await request('/api/v1/bsp/admin/monitors', operatorToken)
+      assert.equal((adminList.body as unknown as Array<{uuid:string;source?:string}>).find(item => item.uuid === component)?.source, 'gatus')
+      assert.equal(nativeCheckLookups.includes(component), false)
+      assert.equal(nativeCheckLookups.includes(suiteComponent), false)
+    } finally { env.DB = originalDb }
+    const layout = await request('/api/v1/bsp/public/layout', viewerToken)
+    const children = (layout.body as unknown as {tree:{children:Array<{type:string;label?:string;children?:Array<{monitorId:number;showUptimeBar:boolean}>}>}}).tree.children
+    const group = children.find(child => child.type === 'group' && child.label === 'Fixture group')
+    assert.equal(group?.children?.find(child => child.monitorId === monitor.id)?.showUptimeBar, false)
+    const uptime = await request(`/api/v1/bsp/public/monitor/${monitor.id}/uptime?days=14`, viewerToken)
+    assert.equal((uptime.body as unknown as {overallUptimePct:number|null}).overallUptimePct, null)
+    const history = await request(`/api/v1/bsp/admin/monitors/${monitor.id}/history`, operatorToken)
+    assert.deepEqual(history.body, { source: 'gatus', historyAvailable: false, retentionDays: 0, results: [] })
+    for (const prefix of ['/api/v1', '/api/v1/bsp']) {
+      const edit = await request(`${prefix}/admin/components/${component}`, operatorToken, 'PATCH', { name: 'Spoof', version: 1 })
+      assert.equal(edit.response.status, 403)
+      const check = await request(`${prefix}/admin/checks`, adminToken, 'POST', { componentId: component, endpointId: 'x', enabled: true, intervalMinutes: 1, expectedStatus: 200 })
+      assert.equal(check.response.status, 403)
+    }
+    assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}`, operatorToken, 'DELETE', {})).response.status, 403)
+    const mutationKey = `${Date.now()}.${crypto.randomUUID()}`
+    assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}`, adminToken, 'PATCH', { name: 'Spoof', version: 1 }, 'https://status.example', mutationKey)).response.status, 403)
+    assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}/check-now`, operatorToken, 'POST', {})).response.status, 403)
+    assert.equal((await request(`/api/v1/admin/components/${component}`, operatorToken, 'DELETE', {})).response.status, 403)
+    await assert.rejects(db.prepare('UPDATE components SET name=? WHERE id=?').bind('Spoof', component).run(), /read-only/i)
+    await assert.rejects(db.prepare('INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status) VALUES (?,?,?,?,?,?)').bind('gatus-check', component, 'fixture', 1, 1, 200).run(), /read-only/i)
+    const incident = await request('/api/v1/bsp/admin/incidents', operatorToken, 'POST', { title: 'Gatus incident', body: 'Issue', impact: 'major', status: 'identified', draft: false, monitorIds: [monitor.id] })
+    assert.equal(incident.response.status, 201)
+    const affected = await request('/api/v1/bsp/public/status', viewerToken)
+    assert.equal((affected.body as unknown as {monitors:Array<{uuid:string;currentStatus:string}>}).monitors.find(item => item.uuid === component)?.currentStatus, 'down')
+    const resolved = await request(`/api/v1/bsp/admin/incidents/${incident.body.id}/updates`, operatorToken, 'POST', { version: 1, body: 'Resolved', status: 'resolved' })
+    assert.equal(resolved.response.status, 200)
+    statuses.push(raw('unexpected_service', 'Unapproved service'))
+    const messages: string[] = []
+    const previousError = console.error
+    console.error = (...args: unknown[]) => { messages.push(args.map(String).join(' ')) }
+    let drift: Awaited<ReturnType<typeof request>>
+    let disconnected: Awaited<ReturnType<typeof request>>
+    try {
+      drift = await request('/api/v1/bsp/public/status', viewerToken)
+      delete env.GATUS
+      disconnected = await request('/api/v1/bsp/public/status', viewerToken)
+    } finally { console.error = previousError }
+    const driftBody = drift.body as unknown as {monitors:Array<{uuid:string;currentStatus:string}>}
+    assert.equal(driftBody.monitors.find(item => item.uuid === component)?.currentStatus, 'pending')
+    assert.equal(driftBody.monitors.find(item => item.uuid === suiteComponent)?.currentStatus, 'pending')
+    assert.doesNotMatch(JSON.stringify(driftBody), /Unapproved service|never-expose\.example/)
+    assert.equal((disconnected.body as unknown as {monitors:Array<{uuid:string;currentStatus:string}>}).monitors.find(item => item.uuid === component)?.currentStatus, 'pending')
+    assert.deepEqual(messages.map(message => JSON.parse(message)), [{ event: 'gatus_snapshot_unavailable' }, { event: 'gatus_snapshot_unavailable' }])
+    await db.prepare('UPDATE gatus_sources SET active=0 WHERE component_id=?').bind(component).run()
+    assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}`, operatorToken, 'DELETE', {})).response.status, 403)
+    assert.equal((await request(`/api/v1/admin/components/${component}`, operatorToken, 'PATCH', { name: 'Spoof', version: 1 })).response.status, 403)
+    await db.prepare('UPDATE gatus_sources SET active=0 WHERE component_id=?').bind(suiteComponent).run()
+    env.GATUS = { async fetch() { return Response.json([]) } }
+    assert.equal((await request('/api/v1/bsp/public/status', viewerToken)).response.status, 503)
+    delete env.GATUS
+    env.GATUS_REQUIRED = 'true'
+    assert.equal((await request('/api/v1/bsp/public/status', viewerToken)).response.status, 503)
+    env.GATUS_REQUIRED = 'false'
+    assert.equal((await request('/api/v1/bsp/public/status', viewerToken)).response.status, 200)
+    env.GATUS_REQUIRED = 'invalid'
+    assert.equal((await request('/api/v1/bsp/public/status', viewerToken)).response.status, 503)
+  } finally {
+    delete env.GATUS_REQUIRED
+    delete env.GATUS
+  }
+})
+
+test('reviewed Gatus catalog reconciliation is atomic, idempotent, and preserves old aliases', async () => {
+  const first: GatusCatalogEntry = { kind: 'endpoint', key: 'catalog_a', name: 'Service A', group: 'Catalog', staleAfterSeconds: 180, advisory: false }
+  const second: GatusCatalogEntry = { kind: 'suite', key: 'catalog_b', name: 'Suite B', group: 'Catalog', staleAfterSeconds: 900, advisory: true }
+  const getSources = async () => (await db.prepare('SELECT source_id,component_id,source_key,active FROM gatus_sources WHERE source_id IN (?,?) ORDER BY source_id')
+    .bind(gatusSourceId(first), gatusSourceId(second)).all<{source_id:string;component_id:string;source_key:string;active:number}>()).results
+  const getAlias = async (componentId: string) => await db.prepare('SELECT alias FROM entity_aliases WHERE entity_type=? AND entity_id=?')
+    .bind('component', componentId).first<{alias:number}>()
+
+  await syncGatusCatalog(db as never, [first, second], 42)
+  const created = await getSources()
+  assert.equal(created.length, 2)
+  assert.ok(created.every(row => row.active === 1))
+  const firstRow = created.find(row => row.source_id === gatusSourceId(first))!
+  const alias = await getAlias(firstRow.component_id)
+  assert.ok(alias)
+  const incident = await request('/api/v1/bsp/admin/incidents', operatorToken, 'POST', { title: 'Catalog incident', body: 'Issue', impact: 'minor', status: 'identified', draft: false, monitorIds: [alias.alias] })
+  assert.equal(incident.response.status, 201)
+  const window = await request('/api/v1/bsp/admin/maintenance', operatorToken, 'POST', { name: 'Catalog window', startsAt: Date.now() + 60_000, endsAt: Date.now() + 120_000, monitorIds: [alias.alias] })
+  assert.equal(window.response.status, 201)
+  const windowAlias = await db.prepare('SELECT alias FROM entity_aliases WHERE entity_type=? AND entity_id=?').bind('maintenance', window.body.id).first<{alias:number}>()
+  assert.ok(windowAlias)
+  await syncGatusCatalog(db as never, [first, second], 43)
+  assert.deepEqual(await getSources(), created)
+  assert.deepEqual(await getAlias(firstRow.component_id), alias)
+  await syncGatusCatalog(db as never, [second], 44)
+  assert.equal((await getSources()).find(row => row.source_id === gatusSourceId(first))?.active, 0)
+  const incidents = await request('/api/v1/bsp/public/incidents', viewerToken)
+  const retiredIncident = (incidents.body as unknown as Array<{title:string;monitorIds:number[];monitorNames:Record<number,string>}>).find(item => item.title === 'Catalog incident')
+  assert.ok(retiredIncident?.monitorIds.includes(alias.alias))
+  assert.equal(retiredIncident.monitorNames[alias.alias], 'Service A')
+  const windows = await request('/api/v1/bsp/public/maintenances', viewerToken)
+  const retiredWindow = (windows.body as unknown as Array<{name:string;monitorNames:Record<number,string>}>).find(item => item.name === 'Catalog window')
+  assert.equal(retiredWindow?.monitorNames[alias.alias], 'Service A')
+  const visible = await request('/api/v1/bsp/public/status', viewerToken)
+  assert.equal((visible.body as unknown as {monitors:Array<{id:number}>}).monitors.some(item => item.id === alias.alias), false)
+  const retain = await request(`/api/v1/bsp/admin/incidents/${incident.body.id}`, operatorToken, 'PATCH', { title: 'Catalog retained', version: 1, monitorIds: [alias.alias] })
+  assert.equal(retain.response.status, 200)
+  const remove = await request(`/api/v1/bsp/admin/incidents/${incident.body.id}`, operatorToken, 'PATCH', { title: 'Catalog removed', version: 2, monitorIds: [] })
+  assert.equal(remove.response.status, 200)
+  const beforeReadd = await db.prepare('SELECT COUNT(*) AS count FROM audit_events').first<{count:number}>()
+  const readd = await request(`/api/v1/bsp/admin/incidents/${incident.body.id}`, operatorToken, 'PATCH', { title: 'Must not persist', version: 3, monitorIds: [alias.alias] })
+  assert.equal(readd.response.status, 409)
+  assert.deepEqual(await db.prepare('SELECT COUNT(*) AS count FROM audit_events').first<{count:number}>(), beforeReadd)
+  const persisted = await request('/api/v1/bsp/public/incidents', viewerToken)
+  assert.ok((persisted.body as unknown as Array<{title:string;monitorIds:number[]}>).some(item => item.title === 'Catalog removed' && item.monitorIds.length === 0))
+  const createWithInactive = await request('/api/v1/bsp/admin/incidents', operatorToken, 'POST', { title: 'Invalid inactive', body: 'Issue', impact: 'minor', status: 'identified', draft: false, monitorIds: [alias.alias] })
+  assert.equal(createWithInactive.response.status, 409)
+  assert.equal(await db.prepare('SELECT id FROM incidents WHERE title=?').bind('Invalid inactive').first(), null)
+  const retainWindow = await request(`/api/v1/bsp/admin/maintenance/${windowAlias.alias}`, operatorToken, 'PATCH', { name: 'Catalog window retained', version: 1, monitorIds: [alias.alias] })
+  assert.equal(retainWindow.response.status, 200)
+  const removeWindow = await request(`/api/v1/bsp/admin/maintenance/${windowAlias.alias}`, operatorToken, 'PATCH', { name: 'Catalog window removed', version: 2, monitorIds: [] })
+  assert.equal(removeWindow.response.status, 200)
+  const beforeWindowReadd = await db.prepare('SELECT COUNT(*) AS count FROM audit_events').first<{count:number}>()
+  const readdWindow = await request(`/api/v1/bsp/admin/maintenance/${windowAlias.alias}`, operatorToken, 'PATCH', { name: 'Must not persist', version: 3, monitorIds: [alias.alias] })
+  assert.equal(readdWindow.response.status, 409)
+  assert.deepEqual(await db.prepare('SELECT COUNT(*) AS count FROM audit_events').first<{count:number}>(), beforeWindowReadd)
+  const invalidMaintenance = await request('/api/v1/bsp/admin/maintenance', operatorToken, 'POST', { name: 'Invalid inactive window', startsAt: Date.now() + 60_000, endsAt: Date.now() + 120_000, monitorIds: [alias.alias] })
+  assert.equal(invalidMaintenance.response.status, 409)
+  assert.equal(await db.prepare('SELECT id FROM maintenance WHERE name=?').bind('Invalid inactive window').first(), null)
+  await syncGatusCatalog(db as never, [first, second], 45)
+  assert.deepEqual(await getSources(), created)
+  assert.deepEqual(await getAlias(firstRow.component_id), alias)
+
+  const before = await getSources()
+  await assert.rejects(syncGatusCatalog(db as never, [], 46), /Invalid/)
+  await assert.rejects(syncGatusCatalog(db as never, [first, first], 46), /Ambiguous/)
+  await assert.rejects(syncGatusCatalog(db as never, [{ ...second, url: 'https://do-not-accept.example' } as GatusCatalogEntry], 46), /Invalid/)
+  // The new inventory is internally valid but conflicts with a retained inactive source.
+  await assert.rejects(syncGatusCatalog(db as never, [{ ...second, kind: 'endpoint', key: first.key }], 46))
+  assert.deepEqual(await getSources(), before)
+  assert.deepEqual(await getAlias(firstRow.component_id), alias)
+  const nativeComponent = 'catalog-native-fixture'
+  await db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').bind(nativeComponent, 'Native', Date.now()).run()
+  await db.prepare('INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status) VALUES (?,?,?,?,?,?)').bind('catalog-native-check', nativeComponent, 'fixture', 0, 1, 200).run()
+  await assert.rejects(db.prepare(`INSERT INTO gatus_sources (source_id,component_id,kind,source_key,source_name,source_group,stale_after_seconds,advisory)
+    VALUES (?,?,?,?,?,?,?,?)`).bind('conflicting-source', nativeComponent, 'endpoint', 'other', 'Other', 'Catalog', 180, 0).run(), /native check/i)
+  await assert.rejects(db.prepare('UPDATE gatus_sources SET component_id=? WHERE source_id=?').bind(nativeComponent, gatusSourceId(first)).run(), /cannot be reassigned/i)
+  assert.equal((await request(`/api/v1/bsp/admin/incidents/${incident.body.id}/updates`, operatorToken, 'POST', { body: 'Resolved', status: 'resolved', version: 3 })).response.status, 200)
+})
+
+test('advanced HTTP settings are admin-only, versioned, non-secret and no-op aware', async () => {
+  const endpoint = { id: 'advanced-api', name: 'Advanced', url: 'https://advanced.example/health' }
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  await db.prepare('INSERT INTO endpoint_registry(endpoint_id, fingerprint) VALUES (?, ?)').bind(endpoint.id, await endpointFingerprint(endpoint)).run()
+  const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Advanced check target' })
+  const created = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: false, intervalMinutes: 1, expectedStatus: 200 })
+  assert.equal(created.response.status, 201)
+  const path = `/api/v1/bsp/admin/checks/${created.body.id}/advanced`
+  const config = { method: 'GET', keyword: 'ready', assertions: [{ type: 'header', name: 'x-health', op: 'exists' }] }
+  const originalAudit = Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count)
+  assert.equal((await request(path, operatorToken, 'PUT', { version: 1, advancedConfig: config })).response.status, 403)
+  assert.equal((await request('/api/v1/bsp/admin/checks', viewerToken)).response.status, 403)
+  for (const bad of [
+    { headers: { Authorization: 'not-persisted' } }, { body: 'not-persisted' },
+    { method: 'POST' }, { assertions: [{ type: 'json', path: '$.bad[', op: 'exists' }] },
+    { assertions: [{ type: 'header', name: 'x', op: 'exists', auth: 'not-persisted' }] },
+    { method: 'HEAD', keyword: 'unreadable' },
+  ]) {
+    assert.equal((await request(path, adminToken, 'PUT', { version: 1, advancedConfig: bad })).response.status, 400)
+  }
+  assert.equal(Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count), originalAudit)
+  assert.equal((await db.prepare('SELECT advanced_config FROM http_checks WHERE id=?').bind(created.body.id).first())?.advanced_config, null)
+  const saved = await request(path, adminToken, 'PUT', { version: 1, advancedConfig: config })
+  assert.equal(saved.response.status, 200)
+  assert.equal(saved.body.version, 2)
+  const audits = Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count)
+  assert.equal(audits, originalAudit + 1)
+  const list = await request('/api/v1/bsp/admin/checks', adminToken)
+  const item = list.body.find(check => check.id === created.body.id) as unknown as { version: number; advancedConfig: unknown }
+  assert.equal(item.version, 2)
+  assert.deepEqual(item.advancedConfig, config)
+  const noChange = await request(path, adminToken, 'PUT', { version: 2, advancedConfig: { assertions: config.assertions, keyword: config.keyword, method: config.method } })
+  assert.equal(noChange.response.status, 200)
+  assert.equal(noChange.body.version, 2)
+  assert.equal(Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count), audits)
+  assert.equal((await request(path, adminToken, 'PUT', { version: 1, advancedConfig: null })).response.status, 409)
+  assert.equal(Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count), audits)
+  const publicText = JSON.stringify((await request('/api/v1/public/status', viewerToken)).body)
+  assert.ok(!publicText.includes('x-health'))
+  assert.ok(!publicText.includes('ready'))
+  const audit = await db.prepare('SELECT details FROM audit_events WHERE entity_id=? ORDER BY created_at DESC LIMIT 1').bind(created.body.id).first()
+  assert.ok(!String(audit?.details).includes('ready'))
+  assert.ok(!String(audit?.details).includes('x-health'))
+  const removed = await request(path, adminToken, 'PUT', { version: 2, advancedConfig: null })
+  assert.equal(removed.response.status, 200)
+  assert.equal(removed.body.version, 3)
+})
+
+test('effective degraded state survives new reads and legacy-probe fallback uses its latest status', async () => {
+  const endpoint = { id: 'advanced-status-api', name: 'Advanced status', url: 'https://status.example.test/health' }
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  await db.prepare('INSERT INTO endpoint_registry(endpoint_id, fingerprint) VALUES (?, ?)').bind(endpoint.id, await endpointFingerprint(endpoint)).run()
+  const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Advanced status target' })
+  const created = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: true, intervalMinutes: 1, expectedStatus: 200 })
+  const now = Date.now()
+  await db.prepare('UPDATE http_checks SET last_status=?,last_effective_status=?,last_scheduled_at=?,last_effective_scheduled_at=?,last_result_at=? WHERE id=?').bind('down', 'degraded', now, now, now, created.body.id).run()
+  const findComponent = async () => (await request('/api/v1/public/status', viewerToken)).body.components.find(item => item.id === component.body.id)
+  assert.equal((await findComponent())?.status, 'degraded')
+  // A pre-migration probe does not write the watermark; newer readers must
+  // use the latest legacy status instead of the earlier effective status.
+  await db.prepare('UPDATE http_checks SET last_status=?,last_scheduled_at=?,last_result_at=? WHERE id=?').bind('up', now + 60_000, now, created.body.id).run()
+  assert.equal((await findComponent())?.status, 'operational')
+})
+
+test('draft monitor tests require an admin and forward only approved destinations', async () => {
+  env.ENDPOINTS = JSON.stringify([{ id: 'draft-target', name: 'Draft target', url: 'https://example.com' }])
+  let forwarded: unknown
+  env.PROBE = { async fetch(request) { forwarded = await request.json(); return Response.json({ overall: 'ok', steps: [], totalMs: 1 }) } }
+  try {
+    const body = { endpointId: 'draft-target', expectedStatus: 200, advancedConfig: { method: 'GET', timeoutMs: 5000, attempts: 1 } }
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test', operatorToken, 'POST', body)).response.status, 403)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test', adminToken, 'POST', { ...body, endpointId: 'unknown' })).response.status, 400)
+    const result = await request('/api/v1/bsp/admin/monitors/test', adminToken, 'POST', body)
+    assert.equal(result.response.status, 200)
+    assert.deepEqual(forwarded, body)
+  } finally { delete env.PROBE; env.ENDPOINTS = '[]' }
+})
+
+test('atomic monitor writes preserve checks and reject stale versions', async () => {
+  const actor = await db.prepare("SELECT id, version FROM users WHERE subject='admin-id'").first<{id:string;version:number}>()
+  assert.ok(actor)
+  env.ENDPOINTS = JSON.stringify([{ id: 'atomic-target', name: 'Atomic target', url: 'https://example.com' }])
+  async function save(method: string, path: string, body: unknown, key: string) {
+    const response = await worker.fetch(new Request(`https://status.example/api/v1/bsp${path}`, {
+      method, headers: { 'Cf-Access-Jwt-Assertion': adminToken, origin: 'https://status.example', 'content-type': 'application/json', 'Idempotency-Key': key, 'Idempotency-Actor': actor!.id }, body: JSON.stringify(body),
+    }), env as never)
+    return { response, value: await response.json() as { id: number; version: number } }
+  }
+  const identity = await request('/api/v1/bsp/auth/me', adminToken)
+  assert.ok(Math.abs(Date.now() - (identity.body as unknown as {serverTime:number}).serverTime) < 5000)
+  const expired = await save('POST', '/admin/monitors', { name: 'Expired' }, `${Date.now() - 86_400_001}.${crypto.randomUUID()}`)
+  assert.equal(expired.response.status, 409)
+  assert.equal((expired.value as unknown as {code:string}).code, 'IDEMPOTENCY_EXPIRED')
+  await db.prepare('INSERT INTO mutation_receipts (actor_id,request_key,request_hash,actor_version,attempt_token,status,expires_at) VALUES (?,?,?,?,?,?,?)')
+    .bind(actor.id, 'expired-monitor-fixture', 'hash', actor.version, 'token', 200, Date.now() - 1).run()
+  const key = () => `${Date.now()}.${crypto.randomUUID()}`
+  const body = { name: 'Atomic API', check: { endpointId: 'atomic-target', enabled: false, intervalMinutes: 1, expectedStatus: 200, advancedConfig: { method: 'GET', timeoutMs: 5000, attempts: 1, keyword: 'ok', acceptedStatusRanges: [{ min: 200, max: 204 }] } } }
+  const createKey = key()
+  const created = await save('POST', '/admin/monitors', body, createKey)
+  assert.equal(created.response.status, 201)
+  assert.equal(await db.prepare("SELECT request_key FROM mutation_receipts WHERE request_key='expired-monitor-fixture'").first(), null)
+  const replay = await save('POST', '/admin/monitors', body, createKey)
+  assert.equal(replay.value.id, created.value.id)
+  const stored = await db.prepare("SELECT h.* FROM http_checks h JOIN entity_aliases a ON a.entity_id=h.component_id WHERE a.alias=? AND a.entity_type='component'").bind(created.value.id).first<{id:string;config_version:number;advanced_config:string}>()
+  assert.ok(stored)
+  const monitor = await db.prepare("SELECT entity_id FROM entity_aliases WHERE alias=? AND entity_type='component'").bind(created.value.id).first<{entity_id:string}>()
+  assert.ok(monitor)
+  const checkAudits = () => db.prepare("SELECT action, details FROM audit_events WHERE entity_type='check' AND entity_id=? ORDER BY rowid").bind(stored.id).all<{action:string;details:string}>()
+  assert.deepEqual((await checkAudits()).results.map(row => row.action), ['create'])
+  assert.deepEqual(JSON.parse((await checkAudits()).results[0].details), { componentId: monitor.entity_id, enabled: false, intervalMinutes: 1, expectedStatus: 200 })
+  assert.doesNotMatch(JSON.stringify((await checkAudits()).results), /keyword|atomic-target/)
+  assert.deepEqual(JSON.parse(stored.advanced_config), body.check.advancedConfig)
+  const listedChecks = await request('/api/v1/bsp/admin/checks', adminToken)
+  assert.deepEqual((listedChecks.body as unknown as { id: string; advancedConfig: unknown }[]).find(item => item.id === stored.id)?.advancedConfig, body.check.advancedConfig)
+  const invalidRange = await save('PATCH', `/admin/monitors/${created.value.id}`, { name: 'Invalid range', version: 1, check: { ...body.check, id: stored.id, version: stored.config_version, advancedConfig: { ...body.check.advancedConfig, acceptedStatusRanges: [{ min: 400, max: 200 }] } } }, key())
+  assert.equal(invalidRange.response.status, 400)
+  const changed = await save('PATCH', `/admin/monitors/${created.value.id}`, { name: 'Renamed', manualStatus: 'operational', position: 0, version: 1 }, key())
+  assert.equal(changed.response.status, 200)
+  const stale = await save('PATCH', `/admin/monitors/${created.value.id}`, { name: 'Stale', manualStatus: 'operational', position: 0, version: 1, check: { ...body.check, id: stored.id, version: stored.config_version, expectedStatus: 201 } }, key())
+  assert.equal(stale.response.status, 409)
+  const after = await db.prepare('SELECT config_version, expected_status FROM http_checks WHERE id=?').bind(stored.id).first<{config_version:number;expected_status:number}>()
+  assert.equal(after?.config_version, stored.config_version)
+  assert.equal(after?.expected_status, 200)
+  const invalidCheck = await save('PATCH', `/admin/monitors/${created.value.id}`, { name: 'Rejected', version: 2, check: { ...body.check, id: stored.id, version: stored.config_version + 1 } }, key())
+  assert.equal(invalidCheck.response.status, 409)
+  assert.deepEqual((await checkAudits()).results.map(row => row.action), ['create'])
+  const unchanged = await db.prepare("SELECT c.name FROM components c JOIN entity_aliases a ON a.entity_id=c.id WHERE a.alias=? AND a.entity_type='component'").bind(created.value.id).first<{name:string}>()
+  assert.equal(unchanged?.name, 'Renamed')
+  const updated = await save('PATCH', `/admin/monitors/${created.value.id}`, { name: 'Changed', version: 2, check: { ...body.check, id: stored.id, version: stored.config_version, expectedStatus: 201 } }, key())
+  assert.equal(updated.response.status, 200)
+  assert.deepEqual((await checkAudits()).results.map(row => row.action), ['create', 'update'])
+  assert.deepEqual(JSON.parse((await checkAudits()).results[1].details), { componentId: monitor.entity_id, enabled: false, intervalMinutes: 1, expectedStatus: 201 })
+  const revised = await db.prepare('SELECT config_version, expected_status FROM http_checks WHERE id=?').bind(stored.id).first<{config_version:number;expected_status:number}>()
+  assert.equal(revised?.config_version, stored.config_version + 1)
+  assert.equal(revised?.expected_status, 201)
+  const fingerprint = await endpointFingerprint({ id: 'atomic-target', name: 'Atomic target', url: 'https://example.com' })
+  await db.prepare('INSERT INTO endpoint_registry (endpoint_id, fingerprint) VALUES (?,?)').bind('atomic-target', fingerprint).run()
+  const registered = await db.prepare('SELECT config_version FROM http_checks WHERE id=?').bind(stored.id).first<{config_version:number}>()
+  assert.ok(registered)
+  const now = Date.now()
+  await db.prepare("UPDATE http_checks SET enabled=1,last_scheduled_at=?,last_result_at=?,last_status='down',last_effective_status='degraded',last_effective_scheduled_at=? WHERE id=?").bind(now, now, now, stored.id).run()
+  await db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,?,?,?,'down','degraded',200,12)").bind(stored.id, registered.config_version, now, now).run()
+  const history = await request(`/api/v1/bsp/admin/monitors/${created.value.id}/history`, adminToken)
+  assert.equal((history.body as unknown as {results: {status:string}[]}).results[0]?.status, 'degraded')
+  const uptime = await request(`/api/v1/bsp/public/monitor/${created.value.id}/uptime?days=1`, adminToken)
+  assert.equal((uptime.body as unknown as {days: {status:string}[]}).days[0]?.status, 'degraded')
+})
+
+test('atomic monitor writes enforce roles for manual services and check changes', async () => {
+  const key = () => `${Date.now()}.${crypto.randomUUID()}`
+  const path = '/api/v1/bsp/admin/monitors'
+  env.ENDPOINTS = JSON.stringify([{ id: 'role-target', name: 'Role target', url: 'https://example.com' }])
+  try {
+    const manual = { name: 'Operator manual service', manualStatus: 'operational', position: 0 }
+    const viewer = await request(path, viewerToken, 'POST', manual, 'https://status.example', key())
+    assert.equal(viewer.response.status, 403)
+    const operatorCreate = await request(path, operatorToken, 'POST', manual, 'https://status.example', key())
+    assert.equal(operatorCreate.response.status, 201)
+    const alias = operatorCreate.body.id
+    const unauthorized = await request(`${path}/${alias}`, operatorToken, 'PATCH', {
+      ...manual, name: 'Must not save', version: 1,
+      check: { endpointId: 'role-target', enabled: false, intervalMinutes: 1, expectedStatus: 200, advancedConfig: null },
+    }, 'https://status.example', key())
+    assert.equal(unauthorized.response.status, 403)
+    const row = await db.prepare("SELECT c.id,c.name,c.version FROM components c JOIN entity_aliases a ON a.entity_id=c.id AND a.entity_type='component' WHERE a.alias=?")
+      .bind(alias).first<{id:string;name:string;version:number}>()
+    assert.equal(row?.name, manual.name)
+    assert.equal(row?.version, 1)
+    assert.equal(await db.prepare('SELECT id FROM http_checks WHERE component_id=?').bind(row!.id).first(), null)
+    const updated = await request(`${path}/${alias}`, operatorToken, 'PATCH', { ...manual, name: 'Operator updated', version: 1 }, 'https://status.example', key())
+    assert.equal(updated.response.status, 200)
+    const stale = await request(`${path}/${alias}`, operatorToken, 'PATCH', { ...manual, name: 'Stale update', version: 1 }, 'https://status.example', key())
+    assert.equal(stale.response.status, 409)
+  } finally { env.ENDPOINTS = '[]' }
 })

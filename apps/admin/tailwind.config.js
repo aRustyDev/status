@@ -4,5 +4,5 @@ import uiPreset, { uiContent } from '@better-forge/ui/tailwind-preset'
 export default {
   presets: [uiPreset],
   // Relative to this file, not the working directory (see postcss.config.js).
-  content: { relative: true, files: ['./index.html', './src/**/*.{ts,tsx}', uiContent] },
+  content: { relative: true, files: ['./index.html', './src/**/*.{ts,tsx}', '../admin-node/src/components/**/*.{ts,tsx}', uiContent] },
 }

@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
-import { render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { Monitor } from '@bsp/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -51,8 +51,7 @@ const monitors = [
   { id: 3, name: 'Deploy hook', type: 'webhook', intervalSecs: 300, currentStatus: 'pending', activity: { maintenance: false, windows: [], incident: null }, lastCheckedAt: null, tags: [] },
 ].map((m) => ({ ...m, health: HEALTH })) as unknown as Monitor[]
 
-function renderPage() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+function renderPage(queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   return render(<QueryClientProvider client={queryClient}><MemoryRouter><ToastProvider><MonitorsPage /></ToastProvider></MemoryRouter></QueryClientProvider>)
 }
 
@@ -110,6 +109,60 @@ describe('MonitorsPage', () => {
     const action = screen.getByRole('button', { name: 'Check Checkout API now' })
     expect(action).toBeDisabled()
     expect(action).toHaveAccessibleDescription('Run-now checks are unavailable.')
+  })
+
+  it('shows Gatus-managed monitors without controls that imply they can be edited here', async () => {
+    vi.mocked(api.get).mockImplementation(async (path: string) => {
+      if (path === '/admin/monitors') return [{ ...monitors[0], source: 'gatus' }]
+      if (path === '/auth/session') return {}
+      throw new Error(`Unexpected GET ${path}`)
+    })
+    renderPage()
+    const row = (await screen.findByText('Checkout API')).closest('tr')!
+    expect(within(row).getByText('Managed in Gatus')).toBeVisible()
+    expect(within(row).queryByRole('link', { name: 'Checkout API' })).not.toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: /Check Checkout API now/ })).not.toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: /More actions for Checkout API/ })).not.toBeInTheDocument()
+  })
+
+  it('hides stale health and counts after a hidden tab returns, then restores a fresh response', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    let resolveRefresh!: (value: Monitor[]) => void
+    vi.mocked(api.get).mockResolvedValueOnce(monitors).mockImplementation(() => new Promise(resolve => { resolveRefresh = resolve }))
+    const time = vi.spyOn(Date, 'now')
+    const visibility = Object.getOwnPropertyDescriptor(document, 'visibilityState')
+    try {
+      renderPage(client)
+      expect(await screen.findByText('Checkout API')).toBeVisible()
+      const updatedAt = client.getQueryState(['monitors'])!.dataUpdatedAt
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+      fireEvent(document, new Event('visibilitychange', { bubbles: true }))
+      time.mockReturnValue(updatedAt + 61_000)
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+      fireEvent(document, new Event('visibilitychange', { bubbles: true }))
+      await waitFor(() => expect(api.get).toHaveBeenCalledTimes(2))
+      expect(await screen.findByText(/Monitor status is out of date/)).toBeVisible()
+      expect(screen.queryByText('Checkout API')).not.toBeInTheDocument()
+      expect(screen.queryByRole('group', { name: 'Filter by status' })).not.toBeInTheDocument()
+      await act(async () => { resolveRefresh(monitors.map(item => ({ ...item, currentStatus: 'pending' })) as Monitor[]) })
+      expect(await screen.findByText('Checkout API')).toBeVisible()
+      expect(screen.queryByText(/Monitor status is out of date/)).not.toBeInTheDocument()
+    } finally {
+      time.mockRestore()
+      if (visibility) Object.defineProperty(document, 'visibilityState', visibility)
+      else delete (document as unknown as { visibilityState?: string }).visibilityState
+    }
+  })
+
+  it('hides prior health and counts when a refetch fails', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    vi.mocked(api.get).mockResolvedValueOnce(monitors).mockRejectedValue(new Error('network unavailable'))
+    renderPage(client)
+    expect(await screen.findByText('Checkout API')).toBeVisible()
+    await act(async () => { await client.invalidateQueries({ queryKey: ['monitors'] }) })
+    expect(await screen.findByText("Couldn't load monitors.")).toBeVisible()
+    expect(screen.queryByText('Checkout API')).not.toBeInTheDocument()
+    expect(screen.queryByRole('group', { name: 'Filter by status' })).not.toBeInTheDocument()
   })
 
   it('disables unsupported import and export', async () => {

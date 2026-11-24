@@ -1,13 +1,15 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api } from '../../api/client'
 import { DEFAULT_CERT_WARN_DAYS, DEFAULT_EXPIRY_WARN_DAYS, DEFAULT_LATENCY_ALERT, supportsLatencyAlert } from '@bsp/shared'
 import type { Action, HttpAssertion, Monitor, MonitorAction, MonitorType, NotificationChannel, MonitorTag } from '@bsp/shared'
 import { ModalFooter, ModalHeader, ModalShell } from '@better-forge/ui'
 import { YamlViewModal } from '../YamlViewModal'
 import { AuthSection, readAuth } from './AuthSection'
+import { CloudflareSideTabStrip } from './CloudflareSideTabStrip'
 import { SidePanelFrame, SideTabStrip, type SideTab } from '@better-forge/ui'
 import { ActionsSection, ChannelsSection, CredentialsSection, DependenciesSection, PANEL_META, RequestSection, hasAccountCredentials, hasDatabaseCredentials, usesCredentials, type SidePanelKey } from './MonitorSidePanel'
 import { HttpAssertionsFields } from './HttpAssertionsFields'
+import { StatusRangesFields, statusRangesProblem, type StatusRange } from './StatusRangesFields'
 import { MonitorTypeConfigFields } from './MonitorTypeConfigFields'
 import { Field, type SecretSummary, type VaultSummary } from '@better-forge/ui'
 import { DATABASE_DEFAULT_PORTS, DATABASE_DEFAULT_QUERIES, isDatabaseType } from './monitorTypes'
@@ -20,7 +22,22 @@ import { GroupCombobox } from './GroupCombobox'
 import { TestResultPanel, type TestResult } from './TestResultPanel'
 import { Alert } from '@better-forge/ui'
 
+export interface CloudflareProfile {
+  isAdmin: boolean
+  statusUnavailable?: boolean | undefined
+  settingsUnavailable?: boolean | undefined
+  retrySettings?: (() => void) | undefined
+  endpoints: { id: string; name: string }[]
+  check?: { id: string; version: number; endpointId: string; enabled: boolean | number; intervalMinutes: number; expectedStatus: number; advancedConfig?: Record<string, unknown> | null; advancedConfigInvalid?: boolean } | undefined
+  manualStatus: string
+  position: number
+  history?: React.ReactNode
+  save: (draft: { name: string; manualStatus: string; position: number; check?: Record<string, unknown> }) => Promise<void>
+  test: (draft: { endpointId: string; expectedStatus: number; advancedConfig: Record<string, unknown> }) => Promise<TestResult>
+}
+
 interface Props {
+  cloudflare?: CloudflareProfile | undefined
   monitor: Monitor | null
   /** Type preselected when creating a monitor; ignored when editing. */
   initialType?: MonitorType | undefined
@@ -63,17 +80,24 @@ function actionLinkProblem(links: MonitorAction[] | null): string | null {
   return null
 }
 
-export default function MonitorFormModal({ monitor, initialType = 'https', allTags = [], allGroups = [], onClose, onSaved }: Props) {
+export default function MonitorFormModal({ monitor, initialType = 'https', allTags = [], allGroups = [], onClose, onSaved, cloudflare }: Props) {
   const isEdit = !!monitor
+  // The form fields are initialized once; its optimistic revision must come
+  // from the same snapshot even if a background query later refreshes.
+  const [initialCloudflareCheck] = useState(cloudflare?.check)
+  const [manualStatus, setManualStatus] = useState(cloudflare?.manualStatus ?? 'operational')
+  const [position, setPosition] = useState(cloudflare?.position ?? 0)
+  const [endpointId, setEndpointId] = useState(cloudflare?.check?.endpointId ?? '')
+  const [enabled, setEnabled] = useState(Boolean(cloudflare?.check?.enabled))
   const [showYaml, setShowYaml] = useState(false)
   const [name, setName]               = useState(monitor?.name ?? '')
   const [type, setType]               = useState<MonitorType>(monitor?.type as MonitorType ?? initialType)
-  const [intervalSecs, setIntervalSecs] = useState(monitor?.intervalSecs ?? 60)
-  const [timeoutMs, setTimeoutMs]     = useState(monitor?.timeoutMs ?? 10000)
+  const [intervalSecs, setIntervalSecs] = useState(cloudflare?.check ? cloudflare.check.intervalMinutes * 60 : monitor?.intervalSecs ?? 60)
+  const [timeoutMs, setTimeoutMs]     = useState(cloudflare?.check ? Number(cloudflare.check.advancedConfig?.timeoutMs ?? 5000) : monitor?.timeoutMs ?? 10000)
   const [config, setConfig]           = useState<Record<string, unknown>>(
-    monitor ? (monitor.config as unknown as Record<string, unknown>) : (defaultConfigs[initialType] as Record<string, unknown>),
+    cloudflare ? { method: 'GET', expectedStatus: cloudflare.check?.expectedStatus ?? 200, ...cloudflare.check?.advancedConfig } : monitor ? (monitor.config as unknown as Record<string, unknown>) : (defaultConfigs[initialType] as Record<string, unknown>),
   )
-  const [retries, setRetries]           = useState(monitor?.retries ?? 1)
+  const [retries, setRetries]           = useState(cloudflare?.check ? Number(cloudflare.check.advancedConfig?.attempts ?? 1) : monitor?.retries ?? 1)
   const [failureThreshold, setFailureThreshold]   = useState(monitor?.failureThreshold ?? 1)
   const [recoveryThreshold, setRecoveryThreshold] = useState(monitor?.recoveryThreshold ?? 1)
   const [autoIncident, setAutoIncident] = useState<AutoIncidentValues>({
@@ -97,6 +121,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   const [error, setError]     = useState('')
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<TestResult | null>(null)
+  const testRevision = useRef(0)
 
   const [vaults, setVaults]                 = useState<VaultSummary[]>([])
   const [secretsByVault, setSecretsByVault] = useState<Record<number, SecretSummary[]>>({})
@@ -109,6 +134,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   const [selectedDependsOnIds, setSelectedDependsOnIds] = useState<Set<number>>(new Set())
 
   useEffect(() => {
+    if (cloudflare) return
     api.get<VaultSummary[]>('/admin/vaults').then(setVaults).catch(() => {})
     api.get<NotificationChannel[]>('/admin/notifications/channels').then(setChannels).catch(() => {})
     api.get<{ id: number; name: string }[]>('/admin/monitors').then(setAllMonitors).catch(() => {})
@@ -122,12 +148,12 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         .then((r) => setSelectedDependsOnIds(new Set(r.dependsOnIds)))
         .catch(() => {})
     }
-  }, [monitor])
+  }, [monitor, cloudflare])
 
   // Pre-load secrets for any vault already configured in the monitor being edited
   // The initial monitor configuration is immutable for the lifetime of the modal.
   useEffect(() => {
-    if (!monitor) return
+    if (!monitor || cloudflare) return
     const cfg = monitor.config as unknown as Record<string, unknown>
     const authCfg = cfg['auth'] as Record<string, unknown> | undefined
     const ids = [
@@ -152,6 +178,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   }
 
   function handleTypeChange(newType: MonitorType) {
+    invalidateCloudflareTest()
     setType(newType)
     setConfig(defaultConfigs[newType] as Record<string, unknown>)
     if (isDatabaseType(newType)) setSidePanel('credentials')
@@ -172,7 +199,22 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   }
 
   function updateConfig(key: string, value: unknown) {
+    invalidateCloudflareTest()
     setConfig((prev) => ({ ...prev, [key]: value }))
+  }
+
+  function useExpectedStatus() {
+    invalidateCloudflareTest()
+    setConfig((prev) => {
+      const { acceptedStatusRanges: _ranges, ...rest } = prev
+      return rest
+    })
+  }
+
+  function invalidateCloudflareTest() {
+    if (!cloudflare) return
+    testRevision.current += 1
+    setTestResult(null)
   }
 
   /** Errors propagate so the webhook section can show why the token was not rotated. */
@@ -189,14 +231,25 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
   async function handleTest() {
     if (!isTestable) return
+    if (cloudflare) {
+      const problem = statusRangesProblem((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? [])
+      if (problem) { setError(problem); setSidePanel('checks'); return }
+      if (config['method'] === 'HEAD' && (config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).some(assertion => assertion.type === 'json'))) {
+        setError('HEAD responses have no body. Remove the keyword and JSON checks or use GET.')
+        setSidePanel('checks')
+        return
+      }
+      setError('')
+    }
+    const revision = testRevision.current
     setTesting(true)
     setTestResult(null)
     try {
       // monitorId lets the server test with the stored value of a secret the form only shows masked.
-      const result = await api.post<TestResult>('/admin/monitors/test', { type, config, timeoutMs, ...(isEdit ? { monitorId: monitor.id } : {}) })
-      setTestResult(result)
+      const result = cloudflare ? await cloudflare.test({ endpointId, expectedStatus: Number(config['expectedStatus'] ?? 200), advancedConfig: cloudflareConfig() }) : await api.post<TestResult>('/admin/monitors/test', { type, config, timeoutMs, ...(isEdit ? { monitorId: monitor.id } : {}) })
+      if (!cloudflare || revision === testRevision.current) setTestResult(result)
     } catch (err) {
-      setTestResult({ overall: 'error', steps: [{ label: 'Test request failed', status: 'error', detail: err instanceof Error ? err.message : String(err) }], totalMs: 0 })
+      if (!cloudflare || revision === testRevision.current) setTestResult({ overall: 'error', steps: [{ label: 'Test request failed', status: 'error', detail: err instanceof Error ? err.message : String(err) }], totalMs: 0 })
     } finally {
       setTesting(false)
     }
@@ -209,12 +262,46 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
     await api.put(`/admin/actions/monitor/${monitorId}`, { actions: actionLinks })
   }
 
+  function comparable(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(comparable).join(',')}]`
+    if (value && typeof value === 'object') return `{${Object.entries(value).filter(([, item]) => item !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${comparable(item)}`).join(',')}}`
+    return JSON.stringify(value) ?? 'null'
+  }
+
+  function cloudflareConfig(): Record<string, unknown> {
+    const { expectedStatus: _expectedStatus, ...advanced } = config
+    return { ...advanced, timeoutMs, attempts: retries }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     // "Done" after webhook creation — just close and refresh
     if (type === 'webhook' && !isEdit && webhookToken) { onSaved(); return }
 
     setError('')
+    if (cloudflare) {
+      setLoading(true)
+      try {
+        const advanced = cloudflareConfig()
+        const rangeProblem = statusRangesProblem((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? [])
+        if (rangeProblem) { setSidePanel('checks'); throw new Error(rangeProblem) }
+        if (cloudflare.isAdmin && !endpointId && (((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []).length || config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).length || config['degradedAboveMs'] !== undefined)) {
+          throw new Error('Select an approved destination to save check settings.')
+        }
+        if (timeoutMs * retries > 10000) throw new Error('Timeout multiplied by attempts must not exceed 10,000 ms.')
+        if (config['method'] === 'HEAD' && (config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).some(assertion => assertion.type === 'json'))) throw new Error('HEAD responses have no body. Remove the keyword and JSON checks or use GET.')
+        const previous = initialCloudflareCheck
+        if (previous && !endpointId) throw new Error('Select an approved destination for this check.')
+        const previousAdvanced = { method: 'GET', ...previous?.advancedConfig, timeoutMs: Number(previous?.advancedConfig?.timeoutMs ?? 5000), attempts: Number(previous?.advancedConfig?.attempts ?? 1) }
+        const advancedUnchanged = comparable(advanced) === comparable(previousAdvanced)
+        const basicUnchanged = previous && endpointId === previous.endpointId && enabled === Boolean(previous.enabled) && intervalSecs === previous.intervalMinutes * 60 && Number(config['expectedStatus'] ?? 200) === previous.expectedStatus
+        if (previous?.advancedConfigInvalid && !(basicUnchanged && advancedUnchanged)) throw new Error('Check settings are invalid. Contact an administrator to review the configuration.')
+        const check = cloudflare.isAdmin && endpointId && !(basicUnchanged && advancedUnchanged) ? { ...(previous ? { id: previous.id, version: previous.version } : {}), endpointId, enabled, intervalMinutes: intervalSecs / 60, expectedStatus: Number(config['expectedStatus'] ?? 200), advancedConfig: previous && advancedUnchanged ? previous.advancedConfig ?? null : advanced } : undefined
+        await cloudflare.save({ name, manualStatus, position, ...(check ? { check } : {}) })
+        onSaved()
+      } catch (err) { setError(err instanceof Error ? err.message : 'Save failed') } finally { setLoading(false) }
+      return
+    }
     if (isDatabaseType(type) && !hasDatabaseCredentials(config)) {
       setSidePanel('credentials')
       setError(config['mode'] === 'connectionString' ? 'Choose the Vault secret that holds the connection string.' : 'Enter the database user and password, or choose a secret from Vault.')
@@ -265,7 +352,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   const isTestable = type !== 'webhook'
   const webhookCreated = type === 'webhook' && !isEdit && !!webhookToken
 
-  const sideTabs: SideTab<SidePanelKey>[] = [
+  const sideTabs: SideTab<SidePanelKey>[] = cloudflare ? (cloudflare.isAdmin ? [{ key: 'checks', badge: checkCount > 0 ? String(checkCount) : null }] : []) : [
     ...(usesCredentials(type) ? [
       { key: 'credentials' as const, badge: isDatabaseType(type) ? (hasDatabaseCredentials(config) ? '✓' : '!') : (hasAccountCredentials(config) ? '✓' : null) },
     ] : []),
@@ -298,7 +385,8 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         {/* Header */}
         <ModalHeader icon="radio_button_checked" title={isEdit ? 'Edit Monitor' : 'New Monitor'} onClose={onClose} />
 
-        <form onSubmit={handleSubmit}>
+        {cloudflare?.statusUnavailable && <div className="p-6"><Alert tone="error">{cloudflare.settingsUnavailable ? 'Check settings are unavailable. Your draft is preserved.' : 'Monitor status is unavailable. Your draft is preserved while the latest status is loaded.'}</Alert>{cloudflare.retrySettings && <button type="button" className="btn btn-secondary mt-2" onClick={cloudflare.retrySettings}>Retry check settings</button>}</div>}
+        <form onSubmit={handleSubmit} style={{ display: cloudflare?.statusUnavailable ? 'none' : undefined }}>
         <div className="p-6 space-y-4">
           {error && <Alert tone="error">{error}</Alert>}
 
@@ -306,33 +394,49 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
             <input value={name} onChange={(e) => setName(e.target.value)} required className="input-sig" placeholder="My Service" />
           </Field>
 
-          <Field label="Group">
+          {!cloudflare && <Field label="Group">
             {({ id }) => <GroupCombobox id={id} value={group} groups={allGroups} onChange={setGroup} />}
-          </Field>
+          </Field>}
 
 
-          <MonitorTypePicker value={type} onChange={handleTypeChange} />
+          {(!cloudflare || cloudflare.isAdmin) && <MonitorTypePicker value={type} onChange={handleTypeChange} allowedTypes={cloudflare ? ['https'] : undefined} />}
 
-          <MonitorTypeConfigFields
-            type={type}
-            config={config}
-            updateConfig={updateConfig}
-            onEngineChange={handleEngineChange}
-            webhook={{ token: webhookToken, canReset: isEdit, resetting: resettingToken, onReset: handleResetToken }}
-          />
+          {cloudflare ? <>
+            <details><summary>Service settings</summary>
+              <Field label="Manual health"><select value={manualStatus} onChange={e => setManualStatus(e.target.value)} className="input-sig"><option value="operational">Operational</option><option value="degraded">Degraded</option><option value="down">Down</option></select></Field>
+              <Field label="Order"><input type="number" min={0} value={position} onChange={e => setPosition(Number(e.target.value))} className="input-sig" /></Field>
+            </details>
+            {cloudflare.check?.advancedConfigInvalid && <Alert tone="error">Check settings are invalid. Contact an administrator to review the configuration.</Alert>}
+            {cloudflare.isAdmin && <>
+              <Field label="Approved destination"><select value={endpointId} onChange={e => { invalidateCloudflareTest(); setEndpointId(e.target.value) }} className="input-sig"><option value="">No check</option>{cloudflare.endpoints.map(endpoint => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>
+              {endpointId && <>
+                <div className="grid grid-cols-2 gap-3"><Field label="Method"><select value={String(config['method'] ?? 'GET')} onChange={e => updateConfig('method', e.target.value)} className="input-sig"><option>GET</option><option>HEAD</option></select></Field>
+                <Field label="Expected status"><input type="number" min={100} max={599} required disabled={Array.isArray(config['acceptedStatusRanges']) && config['acceptedStatusRanges'].length > 0} value={Number(config['expectedStatus'] ?? 200)} onChange={e => updateConfig('expectedStatus', Number(e.target.value))} className="input-sig" /></Field></div>
+                {Array.isArray(config['acceptedStatusRanges']) && config['acceptedStatusRanges'].length > 0 && <div className="text-sm space-y-2">
+                  <p>This check accepts status ranges: {config['acceptedStatusRanges'].map((range: { min: number; max: number }) => `${range.min}–${range.max}`).join(', ')}. The expected status is not used while these ranges are configured.</p>
+                  <button type="button" className="btn btn-secondary" onClick={useExpectedStatus}>Use a single expected status</button>
+                </div>}
+                <label><input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} /> Enabled</label>
+              </>}
+            </>}
+            {cloudflare.history}
+          </> : <MonitorTypeConfigFields
+            type={type} config={config} updateConfig={updateConfig} onEngineChange={handleEngineChange}
+            webhook={{ token: webhookToken, canReset: isEdit, resetting: resettingToken, onReset: handleResetToken }} />}
 
           <div style={{ borderTop: '1px solid var(--m3-outline-variant)' }} />
 
-          <ScheduleSection
+          {(!cloudflare || (cloudflare.isAdmin && endpointId)) && <ScheduleSection
+            cloudflare={!!cloudflare}
             values={{ intervalSecs, timeoutMs, retries, failureThreshold, recoveryThreshold }}
             onChange={(p) => {
               if (p.intervalSecs !== undefined) setIntervalSecs(p.intervalSecs)
-              if (p.timeoutMs !== undefined) setTimeoutMs(p.timeoutMs)
-              if (p.retries !== undefined) setRetries(p.retries)
+              if (p.timeoutMs !== undefined) { invalidateCloudflareTest(); setTimeoutMs(p.timeoutMs) }
+              if (p.retries !== undefined) { invalidateCloudflareTest(); setRetries(p.retries) }
               if (p.failureThreshold !== undefined) setFailureThreshold(p.failureThreshold)
               if (p.recoveryThreshold !== undefined) setRecoveryThreshold(p.recoveryThreshold)
             }}
-          />
+          />}
 
           {/* ── Test result panel ─────────────────────────────────────────── */}
           {testResult && <TestResultPanel result={testResult} />}
@@ -341,13 +445,13 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
         <ModalFooter
           start={<>
-            {isEdit && (
+            {isEdit && !cloudflare && (
               <button type="button" onClick={() => setShowYaml(true)} title="The saved monitor as YAML" className="btn btn-secondary">
                 <span className="material-symbols-outlined" aria-hidden="true">data_object</span>
                 YAML
               </button>
             )}
-            {isTestable && (
+            {isTestable && (!cloudflare || (cloudflare.isAdmin && endpointId)) && (
               <button type="button" onClick={handleTest} disabled={testing || loading} className="btn btn-outline">
                 {testing
                   ? <><span className="material-symbols-outlined animate-spin" aria-hidden="true">progress_activity</span> Testing…</>
@@ -369,9 +473,12 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
       {/* ── Side panel ─────────────────────────────────────────────────── */}
       {sidePanel && (
-        <SidePanelFrame meta={PANEL_META[sidePanel]} layout="responsive">
+        <SidePanelFrame meta={PANEL_META[sidePanel]} layout="responsive" className={cloudflare?.statusUnavailable ? 'hidden' : undefined}>
           {sidePanel === 'request' && <RequestSection config={config} updateConfig={updateConfig} />}
           {sidePanel === 'checks' && (
+            <>
+            {cloudflare && <StatusRangesFields ranges={(config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []} onChange={ranges => updateConfig('acceptedStatusRanges', ranges.length ? ranges : undefined)} />}
+            {cloudflare && <p className="text-xs">HEAD responses have no body, so keyword and JSON checks require GET. Redirects are not followed.</p>}
             <HttpAssertionsFields
               keyword={keyword}
               onKeywordChange={(value) => updateConfig('keyword', value)}
@@ -379,7 +486,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
               degradedAboveMs={degradedAboveMs}
               onAssertionsChange={(list) => updateConfig('assertions', list.length > 0 ? list : undefined)}
               onDegradedAboveMsChange={(ms) => updateConfig('degradedAboveMs', ms)}
+              followsRedirects={!cloudflare}
             />
+            </>
           )}
           {sidePanel === 'credentials' && <CredentialsSection config={config} updateConfig={updateConfig} vaultPicker={vaultPicker} userKey={isDatabaseType(type) ? 'user' : 'username'} />}
           {sidePanel === 'auth' && <AuthSection auth={auth} onChange={(next) => updateConfig('auth', next)} vaultPicker={vaultPicker} />}
@@ -405,7 +514,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
       )}
 
       {/* ── Vertical tab strip ──────────────────────────────────────────── */}
-      <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" />
+      {cloudflare
+        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} checkCount={checkCount} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
+        : <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" />}
 
       </div>{/* outer flex row */}
       {showYaml && monitor && <YamlViewModal kind="Monitor" objectKey={monitor.key} title={monitor.name} onClose={() => setShowYaml(false)} />}

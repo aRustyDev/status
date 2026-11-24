@@ -809,7 +809,7 @@ function MaintenanceBlock({ config, maintenances, monitors }: {
       {shown.map((win) => {
         const covered = win.monitorIds.length === 0
           ? t('maintenance.allServices')
-          : win.monitorIds.map((id) => monitors.find((m) => m.id === id)?.name).filter(Boolean).join(', ')
+          : win.monitorIds.map((id) => monitors.find((m) => m.id === id)?.name ?? win.monitorNames?.[id]).filter(Boolean).join(', ')
         const affected = covered ? `${t('uptime.affected')}: ${covered}` : null
         const date = (
           <>

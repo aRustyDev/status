@@ -9,6 +9,7 @@ interface Props {
   onKeywordChange: (keyword: string) => void
   onAssertionsChange: (assertions: HttpAssertion[]) => void
   onDegradedAboveMsChange: (ms: number | undefined) => void
+  followsRedirects?: boolean | undefined
 }
 
 const OP_LABELS: Record<string, string> = {
@@ -24,7 +25,7 @@ const OP_LABELS: Record<string, string> = {
 const needsValue = (op: string) => op !== 'exists' && op !== 'not-exists'
 
 /** Response checks beyond the status code: a keyword in the body, headers, fields of a JSON body and a slow-response limit. */
-export function HttpAssertionsFields({ keyword, assertions, degradedAboveMs, onKeywordChange, onAssertionsChange, onDegradedAboveMsChange }: Props) {
+export function HttpAssertionsFields({ keyword, assertions, degradedAboveMs, onKeywordChange, onAssertionsChange, onDegradedAboveMsChange, followsRedirects = true }: Props) {
   const update = (index: number, next: HttpAssertion) => onAssertionsChange(assertions.map((a, i) => (i === index ? next : a)))
   const remove = (index: number) => onAssertionsChange(assertions.filter((_, i) => i !== index))
   const switchKind = (index: number, type: HttpAssertion['type']) =>
@@ -76,7 +77,7 @@ export function HttpAssertionsFields({ keyword, assertions, degradedAboveMs, onK
         )}
         {assertions.some((a) => a.type === 'json') && (
           <p className="text-xs" style={{ color: 'var(--m3-secondary)' }}>
-            Checked on the final response, after redirects. JSON paths look like <code>$.queue.length</code> or <code>$.items[0].id</code>; a JSON body over 1 MB is not parsed.
+            {followsRedirects ? 'Checked on the final response, after redirects.' : 'Redirects are not followed.'} JSON paths look like <code>$.queue.length</code> or <code>$.items[0].id</code>; a JSON body over 1 MB is not parsed.
           </p>
         )}
       </div>

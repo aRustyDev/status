@@ -23,6 +23,8 @@ For a standalone legacy board, configure `apps/worker/wrangler.jsonc` with the m
 
 The probe Worker uses the same environment's D1 database. In both Worker configs, set `ENDPOINTS` to the same JSON array of approved endpoints. Each item has an `id`, `name`, and absolute `url`. Public targets use HTTPS. Private targets also specify the configured VPC Service binding and service ID, as in `[{"id":"api","name":"API","url":"https://api.internal/health","binding":"PRIVATE_API","serviceId":"<VPC_SERVICE_ID>","revision":"1"}]`. The optional `revision` identifies the target configuration and must be changed whenever the service itself is changed without changing its ID. Configure the VPC Service binding in `apps/probe/wrangler.jsonc`. Infrastructure administrators manage the endpoint list and bindings. Keep staging and production databases, routes, and endpoint lists separate. A component displays the most severe of its manual status, enabled HTTP check status, and active incident impact. An enabled check with no recent result is unknown; active maintenance appears separately and does not hide an incident or a failure.
 
+In the Cloudflare monitor editor, the Checks panel supports an optional keyword, header and JSON assertions, a degraded latency threshold, and up to 20 accepted HTTP status ranges. A configured range replaces the single expected status; removing the last range restores it. Test and scheduled checks use the same validation and evaluator. GET and HEAD are supported, but HEAD cannot use keyword or JSON checks. Redirects are not followed, even if their status appears in an accepted range. Only approved destinations can be checked.
+
 Add the binding to the selected probe environment with its Cloudflare VPC Service ID:
 
 ```jsonc
@@ -68,6 +70,10 @@ For a separately configured standalone production board, replace `staging` with 
 
 After the board is deployed and protected by Access, the intended administrator signs in once. A verified Access identity is created as a viewer. A Cloudflare administrator then queries the selected environment's D1 `users` table for the account's `id`, `issuer`, `subject`, `email`, `role`, and `version`. Confirm the identity and application before updating that exact row to `admin` and incrementing `version`. Use the D1 console or `wrangler d1 execute` with `--remote`, the board config, and the explicit environment. Do not paste tokens or credentials into logs or chat. The promoted user can assign roles in the admin interface after refreshing.
 
+## Audit history
+
+The administrator-only Audit Log lists application mutations, including monitor, check, incident, maintenance, and role changes. It does not record Cloudflare Access sign-ins or denied requests; use Access logs for those events. Filters and pagination use the operations API, and details are restricted to an allowlist of non-sensitive values. Check events retain the associated monitor UUID and basic scheduling and status settings. Names, incident text, endpoint identifiers, advanced check configuration and credentials are not included in new audit details. Existing records are filtered on read, but their stored values are not rewritten; treat database access and backups accordingly. Deploy both operations and monitoring Workers to apply the new recording rules to both mutation paths.
+
 ## Staging verification
 
 1. Sign in as a viewer, operator, and administrator. Confirm unauthenticated requests are rejected, viewers cannot write, operators cannot change roles, and administrators can view audit events. Check the JSON endpoints directly as well as the pages.
@@ -82,6 +88,8 @@ A successful dry run validates packaging; it does not validate Access, D1, Tunne
 
 The staging rehearsal covered role enforcement, incidents, maintenance transitions, probe recovery, Access session expiry, and rollback. See the cutover plan for the recorded outcomes. Environment-specific identifiers and internal endpoints are maintained outside this public repository.
 
+On November 23, 2026 at 11:58 p.m. Eastern, the shared monitor editor was verified in staging. Draft tests returned HTTP 200 for both approved public and private destinations. An unexpected-status test failed as expected. A disabled verification monitor was created, edited, and reopened with its destination and response check intact. Existing scheduled public and private checks also returned HTTP 200 after the probe deployment. The verification monitor remains in staging with its check disabled. Staging had no Gatus-backed monitors, so Gatus read-only behavior was verified by the local integration suite. Later local draft-preservation and timeout fixes have not yet been verified on staging.
+
 ## Upstream UI staging gateway
 
 The cutover gateway is configured in `apps/gateway/wrangler.jsonc`. Its staging `UI_MODE` selects `legacy` or `upstream` HTML while both `/api/v1/` and `/api/v1/bsp/` remain routed to the internal Workers. The gateway serves the legacy board from the operations Worker and forwards upstream assets to the status and admin UI Workers. Keep both UI Workers deployed during a rollback so existing tabs can load their assets.
@@ -93,9 +101,10 @@ npm run build -w @bsp/shared
 npm run build -w @bsp/board
 npm run build -w @bsp/status
 npm run build -w @bsp/admin
-npx wrangler deploy --config apps/gateway/api.wrangler.jsonc --env staging
+npx wrangler deploy --config apps/probe/wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/status-api.wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/monitoring-api.wrangler.jsonc --env staging
+npx wrangler deploy --config apps/gateway/api.wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/status.wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/admin.wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/wrangler.jsonc --env staging
@@ -106,6 +115,8 @@ Run the checks and rollback rehearsal in `.agents/plans/2026-11-23-better-status
 These gateway configurations currently define staging only. Production needs separately reviewed environment-specific gateway, internal Worker, Access, D1, endpoint, and route settings; substituting `production` in the staging commands is not sufficient.
 
 The three API Worker configurations carry the same `ENDPOINTS` and D1 settings as the board and probe. Update all of them together when an approved target changes. The endpoint synchronization generator validates each configured gateway API environment against the probe before emitting SQL. Continue to use the probe drain, registry synchronization, and VPC revision procedures above.
+
+Apply migrations 0005 through 0007 before deploying the updated Workers. The monitoring API needs a `PROBE` service binding to the staging probe for draft tests. Set `MONITOR_MODAL` to `upstream` in the operations API environment to enable the shared monitor editor. Remove that setting and redeploy the operations API to restore the previous editor. Deploy the probe and monitoring API before enabling the editor, and deploy the gateway so monitor test requests reach the monitoring API.
 
 ## Production deployment and rollback
 

@@ -4,6 +4,7 @@ import { ErrorBoundary, LoadingState, ModalShell, ToastProvider, clearSession, s
 import { api } from './api/client'
 import { ALL_SECTIONS } from './components/Layout'
 import { CapabilitiesContext, type Capabilities } from './capabilities'
+import { setMutationActor } from '@bsp/shared'
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const Monitors = lazy(() => import('./pages/Monitors'))
@@ -13,7 +14,7 @@ const Maintenance = lazy(() => import('./pages/Maintenance'))
 const Users = lazy(() => import('./pages/Users'))
 const Audit = lazy(() => import('./pages/AuditLog'))
 
-type Identity = { id: string; email: string; role: 'viewer' | 'operator' | 'admin' }
+type Identity = { id: string; email: string; role: 'viewer' | 'operator' | 'admin'; serverTime?: number }
 
 function Shell({ identity, capabilities }: { identity: Identity; capabilities: Capabilities }) {
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -87,16 +88,21 @@ export default function App() {
   const [expired, setExpired] = useState(false)
   const [error, setError] = useState('')
   const [generation, setGeneration] = useState(0)
+  const reconnectSequence = useRef(0)
 
   const reconnect = useCallback(async () => {
+    const sequence = ++reconnectSequence.current
     try {
       const next = await api.get<Identity>('/auth/me')
+      if (sequence !== reconnectSequence.current) return
       if (next.role === 'viewer') {
         window.location.assign('/')
         return
       }
       const available = await api.get<Capabilities>('/capabilities')
+      if (sequence !== reconnectSequence.current) return
       if (previousIdentity.current && next.id !== previousIdentity.current.id) setGeneration(value => value + 1)
+      setMutationActor(next.id, next.serverTime)
       setSession({ userId: 0, email: next.email, role: next.role, mustChangePassword: false, twoFactorEnabled: false })
       previousIdentity.current = next
       setIdentity(next)
@@ -104,6 +110,7 @@ export default function App() {
       setExpired(false)
       setError('')
     } catch (err) {
+      if (sequence !== reconnectSequence.current) return
       setError(err instanceof Error ? err.message : 'Unable to verify your session')
     }
   }, [])

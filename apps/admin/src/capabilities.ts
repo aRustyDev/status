@@ -7,6 +7,7 @@ export interface Capabilities {
   recurringMaintenance?: boolean
   dependencies?: boolean
   runNow?: boolean
+  monitorModal?: boolean
   incidentDelete?: boolean
 }
 

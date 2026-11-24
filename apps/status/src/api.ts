@@ -49,17 +49,32 @@ async function parse<T>(res: Response): Promise<T> {
  * Fetches a public API path and parses the JSON body. Non-2xx responses and network failures both reject with
  * an {@link ApiError}, so callers never mistake an error payload for data.
  */
-export async function getJSON<T>(path: string, init?: RequestInit): Promise<T> {
-  if (SNAPSHOT_URL && path.startsWith('/api/v1/public/')) return answerFromSnapshot<T>(path, SNAPSHOT_URL)
-  let res: Response
-  try {
-    const headers = new Headers(init?.headers)
-    headers.set('X-Requested-With', 'XMLHttpRequest')
-    res = await fetch(path.replace(/^\/api\/v1\//, '/api/v1/bsp/'), { ...init, headers })
-  } catch (err) {
-    throw new ApiError(err instanceof Error && err.message ? err.message : 'Network request failed', 0)
+export async function getJSON<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
+  const controller = new AbortController()
+  const cancel = () => controller.abort()
+  init?.signal?.addEventListener('abort', cancel, { once: true })
+  if (init?.signal?.aborted) controller.abort()
+  const run = async () => {
+    if (SNAPSHOT_URL && path.startsWith('/api/v1/public/')) return answerFromSnapshot<T>(path, SNAPSHOT_URL)
+    let res: Response
+    try {
+      const headers = new Headers(init?.headers)
+      headers.set('X-Requested-With', 'XMLHttpRequest')
+      res = await fetch(path.replace(/^\/api\/v1\//, '/api/v1/bsp/'), { ...init, headers, ...(timeoutMs !== undefined ? { signal: controller.signal } : {}) })
+    } catch (err) {
+      throw new ApiError(err instanceof Error && err.message ? err.message : 'Network request failed', 0)
+    }
+    return parse<T>(res)
   }
-  return parse<T>(res)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    if (timeoutMs === undefined) return await run()
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new ApiError('Request timed out', 0)) }, timeoutMs) })
+    return await Promise.race([run(), timeout])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    init?.signal?.removeEventListener('abort', cancel)
+  }
 }
 
 /** Posts JSON to an API path, with the CSRF token of a signed-in session. Rejects like {@link getJSON}. */

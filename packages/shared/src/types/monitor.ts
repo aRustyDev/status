@@ -253,11 +253,13 @@ export interface MonitorTag {
 export type AutoIncidentMode = 'draft' | 'published'
 
 export interface Monitor {
+  /** Present for externally managed monitors whose checks are controlled in Gatus. */
+  source?: 'gatus'
   id: number
   /** Technical identifier used by the API and config files; unique, set when the monitor is created and never changed. */
   key: string
   name: string
-  type: MonitorType
+  type: MonitorType | 'gatus'
   intervalSecs: number
   timeoutMs: number
   retries: number
@@ -342,7 +344,7 @@ export interface MonitorHealth {
 
 export type MonitorListItem = MonitorWithActivity & { health: MonitorHealth }
 
-export type PublicMonitor = Pick<Monitor, 'id' | 'name' | 'type' | 'currentStatus' | 'lastCheckedAt'>
+export type PublicMonitor = Pick<Monitor, 'id' | 'name' | 'type' | 'currentStatus' | 'lastCheckedAt' | 'source'>
 
 export interface MonitorResult {
   id: number

@@ -29,7 +29,10 @@ let cached: { at: number; value: Promise<StatusSnapshot> } | null = null
 export function loadSnapshot(url: string): Promise<StatusSnapshot> {
   const now = Date.now()
   if (cached && now - cached.at < SNAPSHOT_REREAD_MS) return cached.value
-  const value = fetch(url, { cache: 'no-store' })
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new ApiError('Snapshot request timed out', 0)) }, 15_000) })
+  const request = fetch(url, { cache: 'no-store', signal: controller.signal })
     .then((res) => {
       if (!res.ok) throw new ApiError(`Snapshot request failed with status ${res.status}`, res.status)
       return res.json() as Promise<unknown>
@@ -39,10 +42,12 @@ export function loadSnapshot(url: string): Promise<StatusSnapshot> {
       if (!isSnapshot(body)) throw new ApiError('The saved copy is not in a format this page understands', 0)
       return body
     })
+  const value = Promise.race([request, deadline])
     .catch((err) => {
       if (cached?.value === value) cached = null
       throw err instanceof ApiError ? err : new ApiError('Snapshot request failed', 0)
     })
+    .finally(() => { if (timer !== undefined) clearTimeout(timer) })
   cached = { at: now, value }
   return value
 }

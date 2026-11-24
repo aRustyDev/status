@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { buildSyncSql } from '../scripts/sync-endpoints.ts'
-import { runChecks } from '../src/index.ts'
+import worker, { runChecks } from '../src/index.ts'
 
 const originalFetch = globalThis.fetch
 afterEach(() => { globalThis.fetch = originalFetch })
@@ -14,6 +14,7 @@ function fixture(count = 1) {
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0001_board.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0002_checks.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0003_endpoint_registry.sql', import.meta.url), 'utf8'))
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
   const now = 1_800_000_000_000
   const endpoints = []
   for (let i = 0; i < count; i++) {
@@ -33,6 +34,7 @@ function fixture(count = 1) {
     return {
       bind(...values: (string | number | null)[]) { params = values; return this },
       async all() { return { results: sqlite.prepare(sql).all(...params) } },
+      async first() { return sqlite.prepare(sql).get(...params) ?? null },
       runSync() { return sqlite.prepare(sql).run(...params) },
       async run() { return this.runSync() },
     }
@@ -54,6 +56,43 @@ function fixture(count = 1) {
   }
   return { sqlite, now, sync, env: { DB: db, ENDPOINTS: JSON.stringify(endpoints) } }
 }
+
+test('draft tests use the approved endpoint and do not record a check result', async () => {
+  const { sqlite, env } = fixture()
+  let calls = 0
+  globalThis.fetch = async () => { calls++; return new Response('ready', { status: 200 }) }
+  const request = () => new Request('https://probe.internal/test', { method: 'POST', body: JSON.stringify({ endpointId: 'endpoint-0', expectedStatus: 200, advancedConfig: { keyword: 'ready', timeoutMs: 5000, attempts: 1 } }) })
+  const response = await worker.fetch(request(), env as never)
+  assert.equal(response.status, 200)
+  assert.equal((await response.json() as { overall: string }).overall, 'ok')
+  assert.equal(calls, 1)
+  assert.equal(sqlite.prepare('SELECT COUNT(*) AS count FROM http_check_results').get()?.count, 0)
+  sqlite.prepare('DELETE FROM endpoint_registry').run()
+  assert.equal((await worker.fetch(request(), env as never)).status, 409)
+  assert.equal(calls, 1)
+  sqlite.close()
+})
+
+test('draft and scheduled checks agree on status ranges and assertion outcomes', async () => {
+  for (const scenario of [
+    { status: 201, body: 'ready', header: 'ok', expected: 'up', label: 'HTTP check passed' },
+    { status: 204, body: 'missing', header: 'ok', expected: 'degraded', label: 'HTTP check degraded' },
+    { status: 201, body: 'ready', header: 'wrong', expected: 'down', label: 'HTTP check failed' },
+    { status: 404, body: 'ready', header: 'ok', expected: 'down', label: 'HTTP check failed' },
+  ]) {
+    const { sqlite, now, env } = fixture()
+    const advancedConfig = { acceptedStatusRanges: [{ min: 200, max: 204 }], keyword: 'ready', assertions: [{ type: 'header', name: 'x-health', op: 'equals', value: 'ok', onFail: 'down' }], timeoutMs: 5000, attempts: 1 }
+    sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify(advancedConfig), 'check-0')
+    globalThis.fetch = async () => new Response(scenario.status === 204 ? null : scenario.body, { status: scenario.status, headers: { 'x-health': scenario.header } })
+    const request = new Request('https://probe.internal/test', { method: 'POST', body: JSON.stringify({ endpointId: 'endpoint-0', expectedStatus: 200, advancedConfig }) })
+    const response = await worker.fetch(request, env as never)
+    assert.equal(response.status, 200)
+    assert.equal((await response.json() as { steps: { label: string }[] }).steps[0]?.label, scenario.label)
+    await runChecks(now, env as never)
+    assert.equal(sqlite.prepare('SELECT effective_status FROM http_check_results').get()?.effective_status, scenario.expected)
+    sqlite.close()
+  }
+})
 
 test('checks use four concurrent requests and record nonmatching status', async () => {
   const { sqlite, now, env } = fixture(9)
@@ -245,5 +284,123 @@ test('registry sync preserves unchanged checks and invalidates changed or remove
   check = sqlite.prepare('SELECT config_version,last_status FROM http_checks').get()
   assert.equal(check?.config_version, Number(initialVersion) + 2)
   assert.equal(check?.last_status, null)
+  sqlite.close()
+})
+
+test('advanced response assertions store degraded alongside conservative legacy status', async () => {
+  const { sqlite, now, env } = fixture()
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({
+    acceptedStatusRanges: [{ min: 200, max: 204 }],
+    keyword: 'expected',
+    assertions: [{ type: 'header', name: 'x-probe', op: 'equals', value: 'ok' }],
+  }), 'check-0')
+  let calls = 0
+  globalThis.fetch = async (_url, init) => {
+    calls++
+    assert.equal(init?.method, 'GET')
+    assert.equal(init?.redirect, 'manual')
+    return new Response('other', { status: 201, headers: { 'x-probe': 'ok' } })
+  }
+  await runChecks(now, env as never)
+  assert.equal(calls, 1)
+  const result = sqlite.prepare('SELECT status, effective_status FROM http_check_results').get()
+  assert.equal(result?.status, 'down')
+  assert.equal(result?.effective_status, 'degraded')
+  const check = sqlite.prepare('SELECT last_status, last_effective_status FROM http_checks').get()
+  assert.equal(check?.last_status, 'down')
+  assert.equal(check?.last_effective_status, 'degraded')
+  sqlite.close()
+})
+
+test('changing advanced configuration invalidates previous status and fences in-flight results', async () => {
+  const { sqlite, now, env } = fixture()
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({ keyword: 'old' }), 'check-0')
+  const firstVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks').get()?.config_version)
+  globalThis.fetch = async () => {
+    sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({ keyword: 'new' }), 'check-0')
+    return new Response('old')
+  }
+  await runChecks(now, env as never)
+  let check = sqlite.prepare('SELECT config_version, last_status, last_effective_status FROM http_checks').get()
+  assert.equal(check?.config_version, firstVersion + 1)
+  assert.equal(check?.last_status, null)
+  assert.equal(check?.last_effective_status, null)
+  assert.equal(sqlite.prepare('SELECT COUNT(*) AS count FROM http_check_results').get()?.count, 0)
+  globalThis.fetch = async () => new Response('new')
+  await runChecks(now + 60_000, env as never)
+  check = sqlite.prepare('SELECT last_status, last_effective_status FROM http_checks').get()
+  assert.equal(check?.last_status, 'up')
+  assert.equal(check?.last_effective_status, 'up')
+  sqlite.close()
+})
+
+test('advanced config refuses credential, request-body and unapproved POST settings at write time', async () => {
+  const { sqlite } = fixture()
+  const sql = sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?')
+  const badSettings = [
+    { headers: { Authorization: 'do-not-log-secret' } },
+    { body: 'do-not-log-secret' },
+    { auth: { type: 'basic', password: 'do-not-log-secret' } },
+    { method: 'POST' },
+    { assertions: [{ type: 'header', name: 'x', op: 'exists', headers: { Authorization: 'do-not-log-secret' } }] },
+    { acceptedStatusRanges: [{ min: 200, max: 299, body: 'do-not-log-secret' }] },
+  ]
+  for (const bad of badSettings) assert.throws(() => sql.run(JSON.stringify(bad), 'check-0'), /invalid advanced check configuration/)
+  assert.equal(sqlite.prepare('SELECT advanced_config FROM http_checks').get()?.advanced_config, null)
+  sqlite.close()
+})
+
+test('invalid advanced assertion fails closed without a network call or value disclosure', async () => {
+  const { sqlite, now, env } = fixture()
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({ assertions: [{ type: 'json', path: '$.invalid[', op: 'exists' }] }), 'check-0')
+  let calls = 0
+  const events: string[] = []
+  const previous = console.error
+  console.error = (...args: unknown[]) => { events.push(args.map(String).join(' ')) }
+  globalThis.fetch = async () => { calls++; return new Response() }
+  try {
+    await runChecks(now, env as never)
+  } finally { console.error = previous }
+  assert.equal(calls, 0)
+  assert.equal(events.length, 1)
+  assert.ok(events.every(event => event.includes('probe_config_invalid')))
+  assert.ok(!events.some(event => event.includes('do-not-log-secret')))
+  assert.equal(sqlite.prepare('SELECT COUNT(*) AS count FROM http_check_results').get()?.count, 0)
+  assert.equal(sqlite.prepare('SELECT last_status FROM http_checks').get()?.last_status, null)
+  sqlite.close()
+})
+
+test('advanced HEAD checks use the approved VPC binding and accepted ranges', async () => {
+  const { sqlite, now, env, sync } = fixture()
+  const endpoints = [{ id: 'endpoint-0', name: 'Private', url: 'https://internal.example/health', binding: 'PRIVATE', serviceId: 'svc-1' }]
+  env.ENDPOINTS = JSON.stringify(endpoints)
+  sync(endpoints)
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({ method: 'head', acceptedStatusRanges: [{ min: 200, max: 204 }] }), 'check-0')
+  let calls = 0
+  const privateEnv = { ...env, PRIVATE: { fetch: async (url: string, init: RequestInit) => {
+    calls++
+    assert.equal(url, endpoints[0]!.url)
+    assert.equal(init.method, 'HEAD')
+    assert.equal(init.redirect, 'manual')
+    return new Response(null, { status: 204 })
+  } } }
+  globalThis.fetch = async () => { throw new Error('public fetch must not be used') }
+  await runChecks(now, privateEnv as never)
+  assert.equal(calls, 1)
+  const check = sqlite.prepare('SELECT last_status, last_effective_status, last_http_status FROM http_checks').get()
+  assert.equal(check?.last_status, 'up')
+  assert.equal(check?.last_effective_status, 'up')
+  assert.equal(check?.last_http_status, 204)
+  sqlite.close()
+})
+
+test('scheduled checks reject a total timeout budget over ten seconds before network access', async () => {
+  const { sqlite, now, env } = fixture()
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({ timeoutMs: 5001, attempts: 2 }), 'check-0')
+  let calls = 0
+  globalThis.fetch = async () => { calls++; return new Response() }
+  await runChecks(now, env as never)
+  assert.equal(calls, 0)
+  assert.equal(sqlite.prepare('SELECT COUNT(*) AS count FROM http_check_results').get()?.count, 0)
   sqlite.close()
 })

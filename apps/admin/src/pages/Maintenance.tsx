@@ -104,8 +104,8 @@ export default function MaintenancePage() {
 
   const tabCounts = { active: active.length, upcoming: upcoming.length, past: past.length, cancelled: cancelled.length }
 
-  function monitorName(id: number) {
-    return monitors.find((m) => m.id === id)?.name ?? `#${id}`
+  function monitorName(id: number, names?: Record<number, string>) {
+    return monitors.find((m) => m.id === id)?.name ?? names?.[id] ?? `#${id}`
   }
 
   return (
@@ -164,7 +164,7 @@ export default function MaintenancePage() {
           const isActive = occurrence.startsAt <= now && occurrence.endsAt >= now
           const affectedNames = win.monitorIds.length === 0
             ? ['All monitors']
-            : win.monitorIds.map(monitorName)
+            : win.monitorIds.map(id => monitorName(id, win.monitorNames))
 
           return (
             <div
@@ -588,7 +588,13 @@ function MaintenanceModal({
                     <span className="ml-auto font-mono text-xs" style={{ color: 'var(--m3-outline)' }}>{m.type}</span>
                   </label>
                 ))}
-                {monitors.length === 0 && (
+                {(initial?.monitorIds ?? []).filter(id => !monitors.some(m => m.id === id)).map(id => (
+                  <label key={id} className="flex items-center gap-2.5 text-sm cursor-pointer px-2 py-1.5 rounded-md hover:bg-surface-container-high">
+                    <input type="checkbox" checked={selectedMonitors.includes(id)} onChange={() => toggleMonitor(id)} />
+                    <span style={{ color: 'var(--m3-on-surface)' }}>{initial?.monitorNames?.[id] ?? `#${id}`} (retired)</span>
+                  </label>
+                ))}
+                {monitors.length === 0 && !(initial?.monitorIds.length) && (
                   <p className="text-xs px-2 py-2" style={{ color: 'var(--m3-secondary)' }}>No monitors available</p>
                 )}
               </div>
