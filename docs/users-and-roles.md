@@ -1,0 +1,228 @@
+# Users and roles
+
+Every person who signs in to BetterStatusPage has their own account with one of four roles: `admin`, `operator`, `branding` or `viewer`. This guide covers what each role can do, how administrators manage users, passwords and two-factor authentication, and the two admin pages that watch the instance itself: the **Audit Log** and **System Health**.
+
+## Roles
+
+| Role | Meant for |
+|------|-----------|
+| **admin** | Full access, including users, sign-in settings, vaults, the audit log, backups, API tokens and system health. |
+| **operator** | Day-to-day work: monitors, incidents, maintenance, notifications, subscribers, and the status page's look. |
+| **branding** | The status page's look only: page builder, branding and localization. |
+| **viewer** | Viewing a [private status page](private-status-page.md). No access to the admin console. |
+
+The role is checked by the API on every request, not only by the admin panel, so hiding a menu item is never the only protection.
+
+### Permission matrix
+
+| Area | admin | operator | branding | viewer |
+|------|:-----:|:--------:|:--------:|:------:|
+| **Dashboard** | Yes | Yes | No | No |
+| [**Monitors**](monitors.md), including the live status stream | Yes | Yes | No | No |
+| [**Incidents**](incidents-and-maintenance.md) | Yes | Yes | No | No |
+| [**Maintenance**](incidents-and-maintenance.md) | Yes | Yes | No | No |
+| [**Reports**](reports.md): uptime per monitor and CSV export | Yes | Yes | No | No |
+| **Delivery history**: [notifications](notification-channels.md#delivery-history) and [subscribers](subscriptions.md#delivery-history) | Yes | Yes | No | No |
+| [**Notifications**](notification-channels.md): channels, SMTP settings | Yes | Yes | No | No |
+| [**Actions**](actions.md): HTTP requests sent when a monitor goes down or recovers, and their run history | Yes | No | No | No |
+| [**Subscribers**](subscriptions.md) and subscription settings | Yes | Yes | No | No |
+| [**Page Builder**](customizing-the-status-page.md) | Yes | Yes | Yes | No |
+| [**Branding**](customizing-the-status-page.md) | Yes | Yes | Yes | No |
+| **Localization** | Yes | Yes | Yes | No |
+| **Settings** (own password, 2FA, sessions) | Yes | Yes | Yes | No |
+| Pick a vault secret in a monitor (names only, never values) | Yes | Yes | No | No |
+| [**Vault**](vault.md): create and edit vaults and secrets | Yes | No | No | No |
+| **Users**, **Single sign-on** (with account creation), **Status page access** | Yes | No | No | No |
+| **Audit Log** | Yes | No | No | No |
+| [**API tokens**](api.md) and the [**MCP** switches](mcp.md#turn-it-on) | Yes | No | No | No |
+| [**Import**](configuration-as-code.md): monitors and notification channels | Yes | Yes | No | No |
+| [**Backups**](backup-restore.md) | Yes | No | No | No |
+| **System Health** | Yes | No | No | No |
+| [Private status page](private-status-page.md) | Yes | Yes | Yes | Yes |
+
+The sidebar shows only the pages a role can open. Opening another page's address sends the user back to their start page: **Dashboard** for admins and operators, **Branding** for the branding role. A viewer who signs in on the admin sign-in page, or opens any admin address, is taken to the status page.
+
+## The first administrator
+
+The first account is created by the setup wizard at `/admin` on a new instance, see [Open the setup wizard](deployment.md#4-open-the-setup-wizard). It asks for an email and a password of 8 to 128 characters, gives that account the `admin` role and signs you in. The wizard runs only once; every further account is created in **Users**.
+
+## Managing users
+
+Open **Users** (administrators only). The table lists every account with its role and a status:
+
+| Status | Meaning |
+|--------|---------|
+| **Temp password** | The user has not yet replaced the temporary password they were given. |
+| **Active** | The user has their own password, or signs in through SSO. |
+| **2FA** | Two-factor authentication is turned on. |
+| **SSO** | The account is linked to an identity-provider account, see [Single sign-on](single-sign-on.md#how-it-works). |
+
+### Create a user
+
+1. Click **New User**, enter the email and pick a role (default **Branding**).
+2. Click **Create** and [confirm who you are](#confirming-sensitive-actions). A 12-character temporary password is shown **once**, with a copy button. Send it to the user.
+
+On their first sign-in the user must replace the temporary password before they can do anything else; the API refuses every other request until they do. A user who signs in through [single sign-on](single-sign-on.md#how-it-works) never needs the temporary password: the SSO sign-in revokes it.
+
+Each email can have only one account.
+
+### Change a role
+
+Click another role in the user's row and [confirm who you are](#confirming-sensitive-actions). Moving a user to a role with less access also warns you first. The change ends all of the user's sessions at once, so they sign in again with the new role. Moving an administrator to another role also deletes every [API token](api.md#api-tokens) they created, for good: promoting them again does not bring the tokens back.
+
+### Reset a password
+
+Click **Reset password** in the user's row and [confirm who you are](#confirming-sensitive-actions). The old password stops working, all of the user's sessions end, and a new temporary password is shown once. The user replaces it on their next sign-in. Resetting a password does not change the user's 2FA.
+
+### Reset two-factor authentication
+
+When a user has lost their authenticator app and their recovery codes, click **Reset 2FA** in their row. See [Recover access when 2FA is lost](deployment.md#recover-access-when-2fa-is-lost) for the details and for the command-line reset when no administrator can sign in.
+
+### Delete a user
+
+Click **Delete user** and confirm. The account is removed and all of its sessions end immediately. API tokens belong to no user and are not affected. There is no separate "disabled" state: to take access away, delete the account. Audit-log entries the user made stay, with their email.
+
+### Protection against locking yourself out
+
+You cannot change your own role, delete your own account, or reset your own 2FA from **Users** (turn it off in **Settings** instead). Since only administrators can change roles, the administrator doing it always remains, so the instance always keeps at least one admin.
+
+### Confirming sensitive actions
+
+Creating a user, changing a role, resetting another user's password or 2FA, creating an [API token](api.md#api-tokens), turning your own 2FA on or off, changing your password and changing the sign-in settings ask you to confirm who you are, so a stolen session alone cannot add an administrator or mint a token: with your current password, or, when you signed in through SSO, by signing in again at the identity provider. See [Confirming sensitive actions](single-sign-on.md#confirming-sensitive-actions). These actions accept at most 5 attempts per 15 minutes.
+
+## Your own account
+
+**Settings** (the link at the bottom of the sidebar) is available to admins, operators and the branding role. It has four sections.
+
+### Change your password
+
+Enter your current password (or [confirm through SSO](single-sign-on.md#confirming-sensitive-actions)), then the new password twice, and click **Update password**.
+
+- Passwords must be **8 to 128 characters**. There are no other composition rules.
+- Changing the password signs out every other session. The browser you changed it in stays signed in.
+- The change is written to the audit log; the password itself never is.
+
+The forced change after a temporary password (**Set your password**) works the same way but does not ask for the current password.
+
+Viewers have no **Settings** page. They replace a temporary password on the status page's sign-in screen, and an administrator resets their password when they forget it.
+
+### Sign out everywhere
+
+**Sign out everywhere** ends this session and every other session of your account. Sessions otherwise last 12 hours from sign-in.
+
+### Date and time format
+
+Under **Date and time format**, choose how the admin panel shows dates (`dd.mm.yyyy`, the default, `dd-mm-yyyy`, `mm/dd/yyyy`, `yyyy-mm-dd` or `yyyy.mm.dd`) and whether time is 24-hour (the default) or 12-hour. The choice is stored in the browser you make it in, so it applies to every user of that browser and is not synced between devices. The public status page is not affected.
+
+### Sign-in limits
+
+Password sign-in, the authentication-code step and the SSO endpoints accept at most **10 requests per 15 minutes** from one client address. After that they answer `429` until the window passes. There is no per-account lockout, so a flood of wrong passwords for someone's email does not lock that person out. Every refused sign-in is recorded in the audit log, see [Why a sign-in was refused](single-sign-on.md#why-a-sign-in-was-refused).
+
+To make sure an SSO-only setup cannot lock everyone out, see [Password sign-in and lockout protection](single-sign-on.md#password-sign-in-and-lockout-protection).
+
+### Documentation link and What's new
+
+The **Documentation** link in the sidebar opens [docs.betterstatuspage.dev](https://docs.betterstatuspage.dev) in a new tab.
+
+After an update, the first sign-in of each user shows **What's new**: the newest release since the one that user last saw in three collapsible sections, **New**, **Changed** and **Fixes**, each entry with its title and first sentence. **New** is open; opening one section closes the others, so the dialog stays small. Earlier releases are summarised in one line. A **Full changelog** button opens the [changelog](changelog.md) for the details. The notes are built into the admin console, so nothing is fetched. A user who has never seen it only has the current version recorded, so a new account starts with nothing to read. This is remembered per user in that browser.
+
+## Two-factor authentication
+
+Two-factor authentication (2FA) adds a 6-digit code from an authenticator app to every sign-in. It uses standard TOTP (30-second codes, SHA-1), so any authenticator app works.
+
+### Turn it on
+
+1. Open **Settings → Two-factor authentication**.
+2. Confirm who you are (current password, or SSO) and click **Set up 2FA**.
+3. Scan the QR code with your authenticator app. If you cannot scan it, open **Cannot scan the QR code?** and type the setup key, or use **Open in authenticator app**.
+4. Enter the code the app shows and click **Verify and enable**. The setup must be finished within 10 minutes.
+5. Eight **recovery codes** are shown, once. Copy them with **Copy codes** and store them somewhere safe.
+
+Turning 2FA on signs out your other sessions. The secret is stored encrypted with `VAULT_ENCRYPTION_KEY`; recovery codes are stored only as hashes.
+
+### Signing in with 2FA
+
+After the password, or after an SSO sign-in, the sign-in page asks for the **authentication code**. You have 5 minutes for this step. Instead of the app's code you can enter one of your recovery codes. Each recovery code works once; used codes are removed.
+
+The audit log records whether a sign-in included a code, and a wrong or late code is recorded as `invalid_two_factor_code` or `two_factor_expired`.
+
+### Turn it off
+
+In **Settings → Two-factor authentication**, confirm who you are, enter a current authentication code or a recovery code, and click **Disable 2FA**. This removes the secret and the remaining recovery codes and signs out your other sessions. To get new recovery codes, turn 2FA off and on again.
+
+### Lost your device
+
+Sign in with a recovery code. Without one, an administrator resets your 2FA in **Users**; if nobody can sign in, use the command-line reset. Both are described in [Recover access when 2FA is lost](deployment.md#recover-access-when-2fa-is-lost).
+
+## Audit log
+
+The **Audit Log** (administrators only) records who changed what and when. Each entry has a time, the user's email, an action, the entity and, for most entries, details. Drag the line on the right edge of a column title (or focus it and use the arrow keys) to change the column width; double-click restores the default. This works in every admin table, and the lists of users, monitors, channels, actions and tokens can also be sorted by clicking a column title (ascending, descending, off).
+
+### What is recorded
+
+| Entity | Recorded |
+|--------|----------|
+| Monitor, Incident, Maintenance | Create, update, delete |
+| Notification Channel, SMTP Settings | Create, update, delete |
+| Notification Delivery, Subscriber Delivery | Manual retry of a failed delivery |
+| Subscription Settings, Subscriber | Settings changes, subscriber deletion |
+| Vault, Vault Secret | Create, update, delete (secret values never) |
+| Branding, Status Page Layout, Language | Branding and page builder saves, translation changes |
+| User | Create (also accounts created through SSO, with the role of the person's group or Viewer), role change, password reset, delete |
+| Vault Secret (revealed) | An administrator revealed a secret value: **Allowed**, with who and which secret, never the value. |
+| API Token | Created or revoked: name, permissions, the first characters of the token and its expiry, never the token. |
+| Import | One entry for each import that changed something, with the counts (created, updated, unchanged). Every monitor and channel it changed also has an entry of its own. |
+| Monitor (heartbeat token) | Resetting the heartbeat token of a webhook monitor is recorded as `heartbeat_token_reset`, never the token. |
+| User Security | Password changed, 2FA turned on or off, 2FA reset by an administrator (`admin_recovery`) or from the command line (`emergency_cli`), SSO account linked, temporary password revoked by an SSO sign-in |
+| SSO Settings, SSO Account Creation, Status Page Access, MCP | Settings changes (for [MCP](mcp.md#turn-it-on), the two switches, never the password) |
+| Backup, Backup Schedule | Backup created, downloaded (**Allowed**) or deleted, schedule changes |
+| Sign-in | Every sign-in with a password or SSO: **Allowed** (with the method and whether a 2FA code was used) or **Denied** (with the reason) |
+
+A change made with an [API token](api.md#api-tokens) is recorded as `token: <name>`, not under a user.
+
+Refused sign-ins have no signed-in user, so they are recorded as user 0 with the email that was entered or that the identity provider sent. The reason codes are listed in [Why a sign-in was refused](single-sign-on.md#why-a-sign-in-was-refused).
+
+### Details and diffs
+
+Click a row to expand it:
+
+- **Updates** show a table of the changed fields with **Before** and **After** values. The row says how many fields changed. An update made by a [configuration import](configuration-as-code.md) lists the names of the changed settings (`changed`) instead, without values.
+- **Creates and deletes** show a snapshot of the main fields.
+- **Sign-ins** show **Show details** (allowed) or **Show reason** (denied).
+
+Any field whose name contains `password`, `secret`, `token`, `authorization`, `cookie`, `credential` or `recoverycode`, and the encrypted vault values and configuration, is stored as `[redacted]`. A changed secret therefore shows up as changed, but its value is never written.
+
+### Filters
+
+Filter by **User** (part of the email), **Entity** (the list is split into sections: **Monitoring**, **Notifications**, **Access & security**, **Appearance** and **System**), **Action** (**Create**, **Update**, **Delete**, **Allowed**, **Denied**) and a **From** / **To** date range. The list shows 50 entries per page, newest first.
+
+The API behind the page, `GET /api/v1/admin/audit`, takes the same filters as query parameters (`userEmail`, `entityType`, `action`, `from`, `to` in Unix milliseconds, `page`, `limit` up to 100).
+
+### Retention
+
+Entries are never deleted automatically. They are kept in the database and included in [backups](backup-restore.md).
+
+## System Health
+
+**System Health** (administrators only) shows whether this BetterStatusPage instance itself works. It refreshes every 15 seconds, or on **Refresh**. The banner at the top says **BetterStatusPage is healthy** or **BetterStatusPage needs attention**; the instance needs attention when the database is unavailable, the monitor scheduler is in error, or backups are in error.
+
+| Card | Shows | Status |
+|------|-------|--------|
+| **Application** | Version (with a link to the release when a newer one is published), process uptime | Always `ok` while the page loads. |
+| **Database** | Connection, response time of a test query | `error` when the database does not answer. |
+| **Monitor scheduler** | Whether the scheduler runs, configured and overdue monitors, latest stored check, last scheduler tick, its duration, checks due and failed jobs in it | `error` when the scheduler is stopped or its last tick failed; `attention` when checks failed or monitors are overdue. A monitor is overdue when it has never been checked or its last check is older than twice its interval. |
+| **Notification delivery** | Pending and failed deliveries, last delivery | `attention` when anything is pending or failed. See [notification channels](notification-channels.md). |
+| **Backups** | Automatic schedule, last operation, stored backups, latest backup, last completed operation | `disabled` when the schedule is off; `error` when the last backup failed or the backup folder cannot be read. See [backup and restore](backup-restore.md). |
+
+In the background, from the moment the server starts and then every 6 hours (every 5 minutes after a failure), the server asks GitHub (`api.github.com`) for the latest release and remembers the answer, so opening System Health never waits for it. The **Application** card shows a link such as **1.3.0 available** when that release is newer than the running version, and administrators see a quiet **Version 1.3.0 is available** link at the top of the Dashboard. Pre-releases are ignored, and nothing is shown when GitHub cannot be reached. Set `UPDATE_CHECK=false` in `.env` to stop the server from making this request; the installed version is the only thing it sends, inside the `User-Agent` header.
+
+## Health endpoints for load balancers
+
+Two unauthenticated endpoints sit at the root of the server, outside `/api`:
+
+| Endpoint | Answers | Use it for |
+|----------|---------|------------|
+| `GET /health` | Always `200 {"status":"ok"}` while the process serves requests. | Liveness: is the process up. The Docker Compose file uses it as the container healthcheck (`wget -qO- http://localhost:3000/health`). |
+| `GET /ready` | `200 {"status":"ready"}` after setup is finished and the database answers; otherwise `503 {"status":"not_ready"}`. | Readiness: should traffic go here. Returns `503` until the [setup wizard](deployment.md#4-open-the-setup-wizard) has run. |
+
+Neither endpoint reveals anything beyond these answers. For the detailed view, use the **System Health** page.

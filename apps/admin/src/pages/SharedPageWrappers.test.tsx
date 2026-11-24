@@ -1,0 +1,81 @@
+import { render, screen } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { api } from '../api/client'
+import userEvent from '@testing-library/user-event'
+import { describe, expect, it, vi } from 'vitest'
+import type { ReactNode } from 'react'
+import type { AuditEntities } from '@better-forge/ui'
+import type { TokenPreset, TokenResource } from '@better-forge/contracts'
+import AuditLog from './AuditLog'
+import ApiTokens from './ApiTokens'
+import Login from './Login'
+import Users from './Users'
+
+vi.mock('../api/client', () => ({ api: { get: vi.fn(), patch: vi.fn() } }))
+
+// The shared pages are tested in the interface package; here only what this product hands them is checked.
+vi.mock('@better-forge/ui', () => ({
+  PageContainer: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  PageHeader: ({ title }: { title: string }) => <h1>{title}</h1>,
+  ApiTokensPage: ({ resources, presets, actions }: { resources: TokenResource[]; presets: TokenPreset[]; actions: ReactNode }) => (
+    <div><p data-testid="tokens">{resources.map((resource) => resource.key).join(',')}|{presets.map((preset) => preset.label).join(',')}</p>{actions}</div>
+  ),
+  LoginPage: ({ headline, tagline, features }: { headline: ReactNode; tagline: string; features: Array<{ label: string }> }) => (
+    <div data-testid="login"><h2>{headline}</h2><p>{tagline}</p><p>{features.map((feature) => feature.label).join('|')}</p></div>
+  ),
+  UsersPage: ({ roles, roleRank, defaultRole, actions }: { roles: Array<{ value: string }>; roleRank: Record<string, number>; defaultRole: string; actions: Array<{ label: string; dialog: (close: () => void) => unknown }> }) => (
+    <p data-testid="users">{roles.map((role) => role.value).join(',')}|{Object.keys(roleRank).join(',')}|{defaultRole}|{actions.map((action) => action.label).join(',')}</p>
+  ),
+  AuditLogPage: ({ entities }: { entities: AuditEntities }) => (
+    <p data-testid="audit">{entities.groups.map((group) => group.label).join(',')}|{entities.labels['monitor']}|{entities.icons['monitor']}</p>
+  ),
+}))
+
+vi.mock('../components/McpSettingsModal', () => ({
+  McpSettingsModal: ({ onClose }: { onClose: () => void }) => <div role="dialog" aria-label="MCP for AI agents"><button type="button" onClick={onClose}>Close</button></div>,
+}))
+
+describe('shared pages as this product configures them', () => {
+  it('gives the API tokens page the permissions of this API and its presets', () => {
+    render(<ApiTokens />)
+    const text = screen.getByTestId('tokens').textContent!
+    expect(text).toContain('monitors,channels,actions,incidents')
+    expect(text).toContain('Report incidents,Deploy monitoring,Read only')
+  })
+
+  it('puts an MCP button next to New token that opens its own dialog', async () => {
+    const user = userEvent.setup()
+    render(<ApiTokens />)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'MCP' }))
+    expect(screen.getByRole('dialog', { name: 'MCP for AI agents' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('tells the sign-in page what this product is', () => {
+    render(<Login />)
+    const login = screen.getByTestId('login')
+    expect(login).toHaveTextContent('Monitor everything.Stay ahead of issues.')
+    expect(login).toHaveTextContent('uptime monitoring')
+    expect(login).toHaveTextContent('Live status updates|Incidents and maintenance notices|Alerts through your notification channels')
+  })
+
+
+  it('lists Access users with the supported role choices', async () => {
+    vi.mocked(api.get).mockResolvedValueOnce([{ id: 'u', email: 'admin@example.com', role: 'admin', version: 1 }])
+    render(<QueryClientProvider client={new QueryClient()}><Users /></QueryClientProvider>)
+    expect(await screen.findByText('admin@example.com')).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Viewer' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Operator' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Admin' })).toBeInTheDocument()
+  })
+
+
+  it('shows retained audit events from the Worker', async () => {
+    vi.mocked(api.get).mockResolvedValueOnce([{ id: 'e', actorEmail: 'admin@example.com', action: 'publish', entityType: 'incident', entityId: 'i', createdAt: 1 }])
+    render(<QueryClientProvider client={new QueryClient()}><AuditLog /></QueryClientProvider>)
+    expect(await screen.findByText(/admin@example.com · publish incident i/)).toBeInTheDocument()
+  })
+
+})

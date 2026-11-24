@@ -1,0 +1,53 @@
+@import '@better-forge/ui/styles.css';
+
+/* The icon font holds the admin's icons plus the ones in `@better-forge/ui/icons.json` (npm run build:icons). */
+@font-face { font-family: 'Material Symbols Outlined'; font-style: normal; font-weight: 400; font-display: block; src: url('./fonts/material-symbols-outlined-fill.woff2') format('woff2'); }
+
+/* What this product adds to the shared interface styles. */
+:root {
+  /* BSP branding aliases */
+  --bsp-bg:          var(--m3-surface);
+  --bsp-card-bg:     var(--m3-surface-container-low);
+  --bsp-card-border: var(--m3-outline-variant);
+  --bsp-text:        var(--m3-on-surface);
+  --bsp-text-muted:  var(--m3-secondary);
+  --bsp-primary:     var(--m3-primary);
+  --bsp-accent:      var(--m3-on-primary-container);
+  --bsp-up:          var(--m3-up-bar);
+  --bsp-down:        var(--m3-down);
+  --bsp-degraded:    var(--m3-degraded-bar);
+
+  --color-primary: var(--bsp-primary);
+  --color-accent:  var(--bsp-accent);
+
+}
+
+html.dark {
+}
+
+html:not(.dark) .maintenance-active-count {
+  background: var(--admin-selection) !important;
+  color: var(--admin-on-selection) !important;
+}
+
+/* ── Monitor dot ring ─────────────────────────────────────────────── */
+@keyframes dot-ping {
+  0%   { transform: scale(1);   opacity: 0.5; }
+  70%  { transform: scale(2.4); opacity: 0;   }
+  100% { transform: scale(2.4); opacity: 0;   }
+}
+.monitor-dot-ring {
+  position: absolute; inset: 0; border-radius: 50%;
+  animation: dot-ping 2s ease-out infinite;
+}
+
+/* Page builder: while a canvas item is dragged onto a group, it joins the group instead of taking a grid cell. */
+[data-joining-group] .react-grid-placeholder {
+  display: none;
+}
+
+/* Keep moving grid cards from intercepting a toolbox drop; groups remain drop targets. */
+[data-toolbox-dragging] [data-toolbox-grid-item],
+[data-toolbox-dragging] .react-grid-placeholder {
+  pointer-events: none;
+}

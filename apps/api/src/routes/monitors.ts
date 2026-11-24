@@ -1,0 +1,385 @@
+import type { FastifyInstance, FastifyRequest } from 'fastify'
+import { db } from '../db/client.js'
+import { monitors, monitorResults, monitorDependencies, monitorActions, incidentTemplates } from '../db/schema.js'
+import { eq, desc, gte, and, inArray } from 'drizzle-orm'
+import { withImmediateTransaction } from '../db/transaction.js'
+import { runCheck } from '../workers/scheduler.js'
+import { cancelRunsOfMonitor } from '../workers/actionRunner.js'
+import { testHttps, testSqlServer, testPostgres, testMysql, testMongo, testOracle, testPing, testDns, testDocker, testRedis, testMail, testSsh, testTlsCert, testDomain } from '../workers/testRunner.js'
+import { auditActor, writeAudit, diffObjects, snapshot } from '../kit/audit.js'
+import { requestIdentity } from '../kit/authMiddleware.js'
+import { refreshPublishedMonitorIds } from '../services/publishedMonitors.js'
+import { serveEventStream } from '../kit/sse.js'
+import { loadMonitorStats } from '../services/monitorStats.js'
+import { getSchedulerConfig } from '../config/scheduler.js'
+import { authenticateRequest } from '../kit/authSession.js'
+import { tokenAllows } from '@better-forge/contracts'
+import { keyForNew, type KeyOwner } from '@better-forge/config-as-code'
+import { vaultUseProblem } from '../kit/vaultUse.js'
+import { validateMonitorConfig } from '../services/monitorConfigSchema.js'
+import { MONITOR_TYPES, certResetsFor, generateWebhookToken, latencyResetsFor, parseMonitorPatch, parseNewMonitor } from '../services/monitorInput.js'
+import { baselineOf } from '../workers/latencyAnomaly.js'
+import { loadMonitorActivity } from '../services/monitorActivity.js'
+import { loadMonitorHealth } from '../services/monitorHealth.js'
+import { maskSecrets, restoreSecrets } from '../services/secretFields.js'
+import type { HttpsConfig, DatabaseConfig, PingConfig, DnsConfig, DockerConfig, RedisConfig, MailConfig, SshConfig, TlsCertConfig, DomainConfig, MonitorActivity, MonitorType } from '@bsp/shared'
+
+const MIN_TEST_TIMEOUT_MS = 500
+const MAX_TEST_TIMEOUT_MS = 60_000
+
+/**
+ * A monitor that (transitively) depends on itself would keep the whole loop 'affected' forever.
+ * Returns the first requested dependency from which `monitorId` is already reachable, or null.
+ * The monitor's own current edges are ignored because the request replaces them.
+ */
+function findDependencyCycle(
+  monitorId: number,
+  dependsOnIds: readonly number[],
+  edges: ReadonlyArray<{ dependentId: number; dependsOnId: number }>,
+): number | null {
+  const graph = new Map<number, number[]>()
+  for (const edge of edges) {
+    if (edge.dependentId === monitorId) continue
+    const targets = graph.get(edge.dependentId)
+    if (targets) targets.push(edge.dependsOnId)
+    else graph.set(edge.dependentId, [edge.dependsOnId])
+  }
+  const visited = new Set<number>()
+  for (const start of dependsOnIds) {
+    const stack = [start]
+    while (stack.length > 0) {
+      const current = stack.pop()!
+      if (current === monitorId) return start
+      if (visited.has(current)) continue
+      visited.add(current)
+      stack.push(...(graph.get(current) ?? []))
+    }
+  }
+  return null
+}
+
+export async function monitorRoutes(app: FastifyInstance) {
+  /** Monitors leave the API with their secrets masked; see services/secretFields.ts. */
+  /** Publishing incidents and choosing their wording is incidents:write territory, not something monitors:write may do on the side. */
+  function autoIncidentScopeProblem(req: FastifyRequest, fields: { autoIncidentMode?: string; autoIncidentTemplateId?: number | null }): string | null {
+    const token = requestIdentity(req).apiToken
+    if (!token || (fields.autoIncidentMode !== 'published' && (fields.autoIncidentTemplateId ?? null) === null)) return null
+    return tokenAllows(token.scopes, 'incidents:write') ? null : 'This token does not have the "incidents:write" permission needed to publish automatic incidents or choose their template'
+  }
+
+  async function templateExists(id: number | null): Promise<boolean> {
+    if (id === null) return true
+    return (await db.select({ id: incidentTemplates.id }).from(incidentTemplates).where(eq(incidentTemplates.id, id))).length > 0
+  }
+
+  function parseMonitor(m: typeof monitors.$inferSelect) {
+    return { ...m, config: maskSecrets('monitor', JSON.parse(m.config)), tags: JSON.parse(m.tags ?? '[]') }
+  }
+
+  /** The heartbeat token is the only credential of the heartbeat URL, so a read-only token must not see it. */
+  function readableBy<T extends { webhookToken: string | null }>(req: FastifyRequest, monitor: T): Omit<T, 'webhookToken'> | T {
+    const token = requestIdentity(req).apiToken
+    if (!token || tokenAllows(token.scopes, 'monitors:write')) return monitor
+    const { webhookToken: _hidden, ...rest } = monitor
+    return rest
+  }
+
+  /** Activity of monitors for a reader; the maintenance windows are left out for a token without the maintenance permission. */
+  async function activityFor(req: FastifyRequest): Promise<(monitorId: number) => MonitorActivity> {
+    const activityOf = await loadMonitorActivity()
+    const token = requestIdentity(req).apiToken
+    return token && !tokenAllows(token.scopes, 'maintenance:read')
+      ? (monitorId) => ({ ...activityOf(monitorId), windows: [] })
+      : activityOf
+  }
+
+  app.get('/', async (req) => {
+    const rows = await db.select().from(monitors)
+    const activityOf = await activityFor(req)
+    const parsed = rows.map((row) => parseMonitor(row))
+    const healthOf = await loadMonitorHealth(parsed)
+    return parsed.map((monitor) => ({ ...readableBy(req, monitor), activity: activityOf(monitor.id), health: healthOf(monitor.id) }))
+  })
+
+  // Live status of every monitor, internal ones included; the public stream only carries published ones.
+  // Signing out, a role change or a deleted account ends the stream right away (the session is
+  // revoked); the keep-alive also re-checks the session so an expired one cannot keep listening.
+  app.get('/events', async (req, reply) => {
+    const { sessionId, userId } = requestIdentity(req)
+    await serveEventStream(req, reply, {
+      session: { sessionId, userId },
+      stillAllowed: async () => {
+        const identity = await authenticateRequest(req, { allowApiToken: true })
+        return identity.apiToken ? tokenAllows(identity.apiToken.scopes, 'monitors:read') : identity.role === 'admin' || identity.role === 'operator'
+      },
+    })
+  })
+
+  const monitorKeyOwner: KeyOwner = async (key) =>
+    (await db.select({ id: monitors.id }).from(monitors).where(eq(monitors.key, key)))[0]?.id
+
+  app.post<{ Body: {
+    name: string; key?: string; type: string
+    intervalSecs?: number; timeoutMs?: number; retries?: number; config: unknown
+    failureThreshold?: number; recoveryThreshold?: number
+    autoIncidentMinutes?: number | null; autoIncidentMode?: string; autoIncidentTemplateId?: number | null
+    latencyAlertFactor?: number | null; latencyAlertWindowMinutes?: number; latencyAlertMinDeltaMs?: number; latencyAlertSustain?: number
+    tags?: Array<{ label: string; color: string }>; group?: string | null
+  } }>('/', async (req, reply) => {
+    const parsed = parseNewMonitor(req.body)
+    if ('error' in parsed) return reply.code(400).send({ error: parsed.error })
+    const fields = parsed.value
+    const secrets = restoreSecrets('monitor', fields.config, undefined)
+    if ('error' in secrets) return reply.code(400).send({ error: secrets.error })
+    const vaultProblem = vaultUseProblem(requestIdentity(req).apiToken, secrets.config, undefined)
+    if (vaultProblem) return reply.code(403).send({ error: vaultProblem })
+    const scopeProblem = autoIncidentScopeProblem(req, fields)
+    if (scopeProblem) return reply.code(403).send({ error: scopeProblem })
+    if (!await templateExists(fields.autoIncidentTemplateId)) return reply.code(400).send({ error: 'autoIncidentTemplateId does not match a template' })
+    const resolvedKey = await keyForNew(fields.name, req.body.key, monitorKeyOwner)
+    if ('error' in resolvedKey) return reply.code(resolvedKey.status).send({ error: resolvedKey.error })
+    const now = Date.now()
+    const results = await db.insert(monitors).values({
+      key: resolvedKey.key,
+      name: fields.name,
+      type: fields.type,
+      intervalSecs: fields.intervalSecs,
+      timeoutMs: fields.timeoutMs,
+      retries: fields.retries,
+      failureThreshold: fields.failureThreshold,
+      recoveryThreshold: fields.recoveryThreshold,
+      autoIncidentMinutes: fields.autoIncidentMinutes,
+      autoIncidentMode: fields.autoIncidentMode,
+      autoIncidentTemplateId: fields.autoIncidentTemplateId,
+      latencyAlertFactor: fields.latencyAlertFactor,
+      latencyAlertWindowMinutes: fields.latencyAlertWindowMinutes,
+      latencyAlertMinDeltaMs: fields.latencyAlertMinDeltaMs,
+      latencyAlertSustain: fields.latencyAlertSustain,
+      config: JSON.stringify(secrets.config),
+      tags: JSON.stringify(fields.tags),
+      group: fields.group,
+      currentStatus: 'pending',
+      alertConfirmedStatus: 'pending',
+      webhookToken: fields.type === 'webhook' ? generateWebhookToken() : null,
+      createdAt: now,
+      updatedAt: now,
+    }).returning()
+    const m = parseMonitor(results[0]!)
+    const actor = requestIdentity(req)
+    writeAudit(auditActor(actor), 'create', 'monitor', m.id, m.name,
+      snapshot({
+        name: m.name, type: m.type, intervalSecs: m.intervalSecs, timeoutMs: m.timeoutMs, retries: m.retries,
+        failureThreshold: m.failureThreshold, recoveryThreshold: m.recoveryThreshold,
+        latencyAlertFactor: m.latencyAlertFactor,
+      }))
+    return m
+  })
+
+  app.get<{ Params: { id: string } }>('/:id', async (req, reply) => {
+    const monitor = (await db.select().from(monitors).where(eq(monitors.id, Number(req.params.id))))[0]
+    if (!monitor) return reply.code(404).send({ error: 'Not found' })
+    return { ...readableBy(req, parseMonitor(monitor)), activity: (await activityFor(req))(monitor.id) }
+  })
+
+  app.patch<{ Params: { id: string }; Body: Partial<{
+    name: string; key: string; type: string
+    intervalSecs: number; timeoutMs: number; retries: number; config: unknown
+    failureThreshold: number; recoveryThreshold: number
+    autoIncidentMinutes: number | null; autoIncidentMode: string; autoIncidentTemplateId: number | null
+    latencyAlertFactor: number | null; latencyAlertWindowMinutes: number; latencyAlertMinDeltaMs: number; latencyAlertSustain: number
+    tags: Array<{ label: string; color: string }>; group: string | null
+  }> }>('/:id', async (req, reply) => {
+    const id = Number(req.params.id)
+    const existing = (await db.select().from(monitors).where(eq(monitors.id, id)))[0]
+    if (!existing) return reply.code(404).send({ error: 'Not found' })
+
+    if (req.body.key !== undefined) return reply.code(400).send({ error: 'The key is set when the object is created and cannot be changed' })
+    const parsed = parseMonitorPatch(req.body, existing)
+    if ('error' in parsed) return reply.code(400).send({ error: parsed.error })
+    const patch = parsed.value
+    const scopeProblem = autoIncidentScopeProblem(req, patch)
+    if (scopeProblem) return reply.code(403).send({ error: scopeProblem })
+
+    const updates: Partial<typeof monitors.$inferInsert> = { updatedAt: Date.now() }
+    if (patch.name !== undefined) updates.name = patch.name
+    if (patch.type !== undefined) updates.type = patch.type
+    if (patch.intervalSecs !== undefined) updates.intervalSecs = patch.intervalSecs
+    if (patch.timeoutMs !== undefined) updates.timeoutMs = patch.timeoutMs
+    if (patch.retries !== undefined) updates.retries = patch.retries
+    if (patch.failureThreshold !== undefined) updates.failureThreshold = patch.failureThreshold
+    if (patch.recoveryThreshold !== undefined) updates.recoveryThreshold = patch.recoveryThreshold
+    if (patch.autoIncidentMinutes !== undefined) updates.autoIncidentMinutes = patch.autoIncidentMinutes
+    if (patch.autoIncidentMode !== undefined) updates.autoIncidentMode = patch.autoIncidentMode
+    if (patch.autoIncidentTemplateId !== undefined) {
+      if (!await templateExists(patch.autoIncidentTemplateId)) return reply.code(400).send({ error: 'autoIncidentTemplateId does not match a template' })
+      updates.autoIncidentTemplateId = patch.autoIncidentTemplateId
+    }
+    if (patch.latencyAlertFactor !== undefined) updates.latencyAlertFactor = patch.latencyAlertFactor
+    if (patch.latencyAlertWindowMinutes !== undefined) updates.latencyAlertWindowMinutes = patch.latencyAlertWindowMinutes
+    if (patch.latencyAlertMinDeltaMs !== undefined) updates.latencyAlertMinDeltaMs = patch.latencyAlertMinDeltaMs
+    if (patch.latencyAlertSustain !== undefined) updates.latencyAlertSustain = patch.latencyAlertSustain
+    Object.assign(updates, latencyResetsFor(existing, patch))
+    if (patch.config !== undefined) {
+      // A masked secret means "keep the stored one", which only makes sense while the type stays the same.
+      const type = patch.type ?? existing.type
+      const secrets = restoreSecrets('monitor', patch.config, type === existing.type ? JSON.parse(existing.config) : undefined)
+      if ('error' in secrets) return reply.code(400).send({ error: secrets.error })
+      const vaultProblem = vaultUseProblem(requestIdentity(req).apiToken, secrets.config, type === existing.type ? JSON.parse(existing.config) : undefined)
+      if (vaultProblem) return reply.code(403).send({ error: vaultProblem })
+      updates.config = JSON.stringify(secrets.config)
+      Object.assign(updates, certResetsFor(JSON.parse(existing.config), secrets.config))
+    }
+    if (patch.tags !== undefined) updates.tags = JSON.stringify(patch.tags)
+    if (patch.group !== undefined) updates.group = patch.group
+
+    const results = await db.update(monitors).set(updates).where(eq(monitors.id, id)).returning()
+    const m = parseMonitor(results[0]!)
+    const actor = requestIdentity(req)
+    const before = { name: existing.name, type: existing.type, intervalSecs: existing.intervalSecs, timeoutMs: existing.timeoutMs, retries: existing.retries, failureThreshold: existing.failureThreshold, recoveryThreshold: existing.recoveryThreshold, latencyAlertFactor: existing.latencyAlertFactor, latencyAlertWindowMinutes: existing.latencyAlertWindowMinutes, latencyAlertMinDeltaMs: existing.latencyAlertMinDeltaMs, latencyAlertSustain: existing.latencyAlertSustain, tags: existing.tags, group: existing.group }
+    const after  = { name: m.name, type: m.type, intervalSecs: m.intervalSecs, timeoutMs: m.timeoutMs, retries: m.retries, failureThreshold: m.failureThreshold, recoveryThreshold: m.recoveryThreshold, latencyAlertFactor: m.latencyAlertFactor, latencyAlertWindowMinutes: m.latencyAlertWindowMinutes, latencyAlertMinDeltaMs: m.latencyAlertMinDeltaMs, latencyAlertSustain: m.latencyAlertSustain, tags: JSON.stringify(m.tags), group: m.group }
+    const diff = diffObjects(before as Record<string, unknown>, after as Record<string, unknown>)
+    if (patch.config !== undefined) diff['config'] = { from: '[previous config]', to: '[updated config]' }
+    if (Object.keys(diff).length) writeAudit(auditActor(actor), 'update', 'monitor', id, existing.name, diff)
+    return m
+  })
+
+  app.delete<{ Params: { id: string } }>('/:id', async (req, reply) => {
+    const id = Number(req.params.id)
+    const existing = (await db.select().from(monitors).where(eq(monitors.id, id)))[0]
+    await db.delete(monitors).where(eq(monitors.id, id))
+    if (existing) {
+      await cancelRunsOfMonitor(id)
+      await db.delete(monitorActions).where(eq(monitorActions.monitorId, id))
+      await refreshPublishedMonitorIds()
+      const actor = requestIdentity(req)
+      writeAudit(auditActor(actor), 'delete', 'monitor', id, existing.name,
+        snapshot({ name: existing.name, type: existing.type }))
+    }
+    return reply.code(204).send()
+  })
+
+  // `monitorId` names the saved monitor being edited, so a masked secret in `config` is tested as the stored one.
+  app.post<{ Body: { type: string; config: unknown; timeoutMs?: number; monitorId?: number } }>('/test', async (req, reply) => {
+    const { type, config: submitted, timeoutMs: requestedTimeout, monitorId } = req.body ?? {}
+    if (!submitted || typeof submitted !== 'object' || Array.isArray(submitted)) {
+      return reply.code(400).send({ error: 'config must be an object' })
+    }
+    const stored = monitorId === undefined ? undefined : (await db.select().from(monitors).where(eq(monitors.id, Number(monitorId))))[0]
+    const secrets = restoreSecrets('monitor', submitted, stored?.type === type ? JSON.parse(stored.config) : undefined)
+    if ('error' in secrets) return reply.code(400).send({ error: secrets.error })
+    const vaultProblem = vaultUseProblem(requestIdentity(req).apiToken, secrets.config, stored?.type === type ? JSON.parse(stored.config) : undefined)
+    if (vaultProblem) return reply.code(403).send({ error: vaultProblem })
+    const config = secrets.config
+    const invalid = MONITOR_TYPES.includes(type as MonitorType) ? validateMonitorConfig(type as MonitorType, config) : null
+    if (invalid) return reply.code(400).send({ error: invalid })
+    if (requestedTimeout !== undefined && !Number.isFinite(requestedTimeout)) {
+      return reply.code(400).send({ error: 'timeoutMs must be a number' })
+    }
+    const timeoutMs = Math.min(MAX_TEST_TIMEOUT_MS, Math.max(MIN_TEST_TIMEOUT_MS, requestedTimeout ?? 10000))
+    if (type === 'https') {
+      const identity = requestIdentity(req)
+      return testHttps(config as HttpsConfig, timeoutMs, { showActual: identity.role === 'admin' && !identity.apiToken })
+    }
+    if (type === 'sqlserver') return testSqlServer(config as DatabaseConfig, timeoutMs)
+    if (type === 'postgresql') return testPostgres(config as DatabaseConfig, timeoutMs)
+    if (type === 'mysql') return testMysql(config as DatabaseConfig, timeoutMs)
+    if (type === 'mongodb') return testMongo(config as DatabaseConfig, timeoutMs)
+    if (type === 'oracle') return testOracle(config as DatabaseConfig, timeoutMs)
+    if (type === 'docker') return testDocker(config as DockerConfig, timeoutMs)
+    if (type === 'ping') return testPing(config as PingConfig, timeoutMs)
+    if (type === 'dns') return testDns(config as DnsConfig, timeoutMs)
+    if (type === 'redis') return testRedis(config as RedisConfig, timeoutMs)
+    if (type === 'mail') return testMail(config as MailConfig, timeoutMs)
+    if (type === 'ssh') return testSsh(config as SshConfig, timeoutMs)
+    if (type === 'tls') return testTlsCert(config as TlsCertConfig, timeoutMs)
+    if (type === 'domain') return testDomain(config as DomainConfig, timeoutMs)
+    return reply.code(400).send({ error: `Test not supported for monitor type: ${type}` })
+  })
+
+  app.post<{ Params: { id: string } }>('/:id/check-now', async (req, reply) => {
+    const rows = await db.select().from(monitors).where(eq(monitors.id, Number(req.params.id)))
+    const monitor = rows[0]
+    if (!monitor) return reply.code(404).send({ error: 'Not found' })
+    await runCheck(monitor)
+    const updated = (await db.select().from(monitors).where(eq(monitors.id, monitor.id)))[0]!
+    return parseMonitor(updated)
+  })
+
+  app.post<{ Params: { id: string } }>('/:id/reset-token', async (req, reply) => {
+    const id = Number(req.params.id)
+    const existing = (await db.select().from(monitors).where(eq(monitors.id, id)))[0]
+    if (!existing) return reply.code(404).send({ error: 'Not found' })
+    if (existing.type !== 'webhook') return reply.code(400).send({ error: 'Only webhook monitors have tokens' })
+    const now = Date.now()
+    const results = await db.update(monitors)
+      .set({ webhookToken: generateWebhookToken(), updatedAt: now })
+      .where(eq(monitors.id, id))
+      .returning()
+    const result = results[0]!
+    await writeAudit(auditActor(requestIdentity(req)), 'update', 'monitor', id, existing.name, { action: 'heartbeat_token_reset' })
+    return parseMonitor(result)
+  })
+
+  app.get<{ Params: { id: string } }>('/:id/dependencies', async (req) => {
+    const id = Number(req.params.id)
+    const deps = await db.select().from(monitorDependencies).where(eq(monitorDependencies.dependentId, id))
+    return { dependsOnIds: deps.map((d) => d.dependsOnId) }
+  })
+
+  app.put<{ Params: { id: string }; Body: { dependsOnIds: number[] } }>('/:id/dependencies', async (req, reply) => {
+    const id = Number(req.params.id)
+    const existing = (await db.select().from(monitors).where(eq(monitors.id, id)))[0]
+    if (!existing) return reply.code(404).send({ error: 'Not found' })
+
+    const requested = req.body?.dependsOnIds ?? []
+    if (!Array.isArray(requested)) return reply.code(400).send({ error: 'dependsOnIds must be an array of monitor ids' })
+    const safeIds = [...new Set(requested.filter((depId) => Number.isInteger(depId) && depId !== id))]
+
+    // Only IDs that actually reference existing monitors are kept.
+    const validIds = safeIds.length > 0
+      ? (await db.select({ id: monitors.id }).from(monitors).where(inArray(monitors.id, safeIds))).map((m) => m.id)
+      : []
+    const cycleVia = findDependencyCycle(id, validIds, await db.select().from(monitorDependencies))
+    if (cycleVia !== null) {
+      const via = (await db.select({ name: monitors.name }).from(monitors).where(eq(monitors.id, cycleVia)))[0]
+      return reply.code(400).send({ error: `Dependency cycle: ${via?.name ?? `monitor ${cycleVia}`} already depends on this monitor` })
+    }
+
+    await withImmediateTransaction(async () => {
+      await db.delete(monitorDependencies).where(eq(monitorDependencies.dependentId, id))
+      if (validIds.length > 0) {
+        await db.insert(monitorDependencies).values(validIds.map((depId) => ({ dependentId: id, dependsOnId: depId })))
+      }
+    })
+    return { ok: true }
+  })
+
+  app.get<{ Params: { id: string }; Querystring: { hours?: string } }>('/:id/stats', async (req, reply) => {
+    const id = Number(req.params.id)
+    const hours = req.query.hours === undefined ? 168 : Number(req.query.hours)
+    if (!Number.isInteger(id) || id < 1 || !Number.isInteger(hours) || hours < 1) {
+      return reply.code(400).send({ error: 'Invalid monitor id or hours' })
+    }
+    const monitor = (await db.select().from(monitors).where(eq(monitors.id, id)))[0]
+    if (!monitor) return reply.code(404).send({ error: 'Not found' })
+    const { resultRetentionDays } = getSchedulerConfig()
+    reply.header('Cache-Control', 'no-store')
+    const [stats, baselineP95Ms] = await Promise.all([
+      loadMonitorStats(id, Math.min(hours, resultRetentionDays * 24), resultRetentionDays),
+      baselineOf(monitor),
+    ])
+    return { ...stats, baselineP95Ms }
+  })
+
+  app.get<{ Params: { id: string }; Querystring: { days?: string } }>('/:id/history', async (req) => {
+    const days = Number(req.query.days ?? 30)
+    const since = Date.now() - days * 24 * 60 * 60 * 1000
+    return db.select().from(monitorResults)
+      .where(and(
+        eq(monitorResults.monitorId, Number(req.params.id)),
+        gte(monitorResults.checkedAt, since),
+      ))
+      .orderBy(desc(monitorResults.checkedAt))
+      .limit(1000)
+  })
+}

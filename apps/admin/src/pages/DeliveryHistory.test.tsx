@@ -1,0 +1,191 @@
+import { render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { SubscriberDelivery, SubscriberDeliveryList } from '@bsp/shared'
+import { api, getCurrentUser } from '../api/client'
+import { ToastProvider } from '@better-forge/ui'
+import DeliveryHistoryPage, { DeliveryHistoryRedirect } from './DeliveryHistory'
+
+vi.mock('../api/client', () => ({ api: { get: vi.fn(), post: vi.fn() }, getCurrentUser: vi.fn() }))
+
+const delivery = (overrides: Partial<SubscriberDelivery> = {}): SubscriberDelivery => ({
+  id: 1, subscriberId: 7, subscriberType: 'email', destination: 'reader@example.test', eventType: 'incident.created',
+  subject: 'API errors', status: 'failed', attemptCount: 4, maxAttempts: 4, nextAttemptAt: null, lastError: 'mailbox full',
+  deliveredAt: null, createdAt: 1_700_000_000_000, updatedAt: 1_700_000_100_000, ...overrides,
+})
+
+const list = (deliveries: SubscriberDelivery[], pages = 1): SubscriberDeliveryList =>
+  ({ deliveries, total: deliveries.length, page: 1, limit: 20, pages })
+
+function renderPage(url = '/admin/delivery-history?tab=subscribers') {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[url]}><ToastProvider><DeliveryHistoryPage /></ToastProvider></MemoryRouter>
+    </QueryClientProvider>,
+  )
+}
+
+const deliveryCalls = () => vi.mocked(api.get).mock.calls.map(([path]) => String(path)).filter((path) => path.startsWith('/admin/subscribers/deliveries'))
+
+describe('DeliveryHistoryPage subscribers tab', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.get).mockResolvedValue(list([delivery()]) as never)
+    vi.mocked(api.post).mockResolvedValue(delivery({ status: 'pending' }) as never)
+  })
+
+  it('lists deliveries and filters by status and event', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    expect(await screen.findByText('reader@example.test')).toBeInTheDocument()
+    expect(screen.getByText('API errors')).toBeInTheDocument()
+    expect(screen.getByText('4 / 4')).toBeInTheDocument()
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Status' }), 'failed')
+    await waitFor(() => expect(deliveryCalls().at(-1)).toContain('status=failed'))
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Event' }), 'incident.resolved')
+    await waitFor(() => expect(deliveryCalls().at(-1)).toContain('eventType=incident.resolved'))
+  })
+
+  it('shows the error of a failed delivery and retries it', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Show details for reader@example.test' }))
+    expect(within(screen.getByRole('alert')).getByText('mailbox full')).toBeInTheDocument()
+    expect(screen.getByText('Email to reader@example.test')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Retry now' }))
+    await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/subscribers/deliveries/1/retry', {}))
+  })
+
+  it('offers no retry for a delivered message and describes webhook calls', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockResolvedValue(list([delivery({
+      status: 'delivered', lastError: null, subscriberType: 'webhook', destination: 'https://hooks.example.test/in', deliveredAt: 1_700_000_050_000, attemptCount: 1,
+    })]) as never)
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Show details for https://hooks.example.test/in' }))
+    expect(screen.getByText('Webhook to https://hooks.example.test/in with X-BSP-Event: incident.created')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry now' })).not.toBeInTheDocument()
+  })
+
+  it('narrows to one subscriber from the link and clears it from the chip', async () => {
+    const user = userEvent.setup()
+    renderPage('/admin/delivery-history?tab=subscribers&subscriberId=7')
+    expect(await screen.findByRole('button', { name: 'Show all subscribers' })).toBeInTheDocument()
+    expect(deliveryCalls().at(-1)).toContain('subscriberId=7')
+
+    await user.click(screen.getByRole('button', { name: 'Show all subscribers' }))
+    await waitFor(() => expect(deliveryCalls().at(-1)).not.toContain('subscriberId'))
+  })
+
+  it('explains an empty history and a filter with no matches', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockResolvedValue(list([]) as never)
+    renderPage()
+    expect(await screen.findByText('No deliveries yet')).toBeInTheDocument()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Status' }), 'pending')
+    expect(await screen.findByText('No deliveries match these filters.')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Clear the filters' }))
+    expect(await screen.findByText('No deliveries yet')).toBeInTheDocument()
+  })
+
+  it('shows a retryable error', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockRejectedValueOnce(new Error('down'))
+    renderPage()
+    expect(await screen.findByText('Could not load deliveries.')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Try again/ }))
+    expect(await screen.findByText('reader@example.test')).toBeInTheDocument()
+  })
+})
+
+describe('DeliveryHistoryPage tabs', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(getCurrentUser).mockReturnValue({ userId: 1, email: 'op@example.test', role: 'operator', mustChangePassword: false, twoFactorEnabled: false })
+    vi.mocked(api.get).mockImplementation(async (path: string) => path.startsWith('/admin/subscribers/deliveries') ? list([delivery()]) : path.startsWith('/admin/notifications/deliveries') ? { deliveries: [], total: 0, page: 1, pages: 1 } : [])
+  })
+
+  it('opens on the notifications tab and switches to the subscribers tab', async () => {
+    const user = userEvent.setup()
+    renderPage('/admin/delivery-history')
+    expect(screen.getByRole('tab', { name: 'Notifications' })).toHaveAttribute('aria-selected', 'true')
+    expect(deliveryCalls()).toHaveLength(0)
+
+    await user.click(screen.getByRole('tab', { name: 'Subscribers' }))
+    expect(screen.getByRole('tab', { name: 'Subscribers' })).toHaveAttribute('aria-selected', 'true')
+    expect(await screen.findByText('reader@example.test')).toBeInTheDocument()
+  })
+
+  it('offers the actions tab to administrators only', async () => {
+    renderPage('/admin/delivery-history?tab=actions')
+    expect(screen.queryByRole('tab', { name: 'Actions' })).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Notifications' })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('lists action runs for an administrator', async () => {
+    vi.mocked(getCurrentUser).mockReturnValue({ userId: 1, email: 'admin@example.test', role: 'admin', mustChangePassword: false, twoFactorEnabled: false })
+    vi.mocked(api.get).mockImplementation(async (path: string) => path.startsWith('/admin/actions/runs')
+      ? { runs: [{ id: 1, actionId: 1, actionName: 'Start VM2', monitorId: 5, monitorName: 'VM1 SQL', onStatus: 'down', status: 'failed', attemptCount: 3, maxAttempts: 3, nextAttemptAt: null, lastError: 'HTTP 500', createdAt: 1_700_000_000_000 }], total: 1, page: 1, pages: 1 }
+      : [])
+    renderPage('/admin/delivery-history?tab=actions')
+
+    expect(screen.getByRole('tab', { name: 'Actions' })).toHaveAttribute('aria-selected', 'true')
+    expect(await screen.findByText('VM1 SQL')).toBeInTheDocument()
+    expect(screen.getByText('HTTP 500')).toBeInTheDocument()
+    expect(screen.getByText('Failed', { selector: 'span' })).toBeInTheDocument()
+  })
+
+  it('retries a failed action run and reports a run that no longer applies', async () => {
+    const user = userEvent.setup()
+    vi.mocked(getCurrentUser).mockReturnValue({ userId: 1, email: 'admin@example.test', role: 'admin', mustChangePassword: false, twoFactorEnabled: false })
+    vi.mocked(api.get).mockImplementation(async (path: string) => path.startsWith('/admin/actions/runs')
+      ? { runs: [{ id: 5, actionId: 1, actionName: 'Start VM2', monitorId: 5, monitorName: 'VM1 SQL', onStatus: 'down', status: 'failed', attemptCount: 3, maxAttempts: 3, nextAttemptAt: null, lastError: 'HTTP 500', createdAt: 1_700_000_000_000 }], total: 1, page: 1, pages: 1 }
+      : [])
+    vi.mocked(api.post).mockResolvedValue({ id: 5, status: 'succeeded' })
+    renderPage('/admin/delivery-history?tab=actions')
+
+    await user.click(await screen.findByRole('button', { name: /Retry run of Start VM2/ }))
+
+    await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/actions/runs/5/retry', {}))
+  })
+
+  it('approves or rejects an action run that waits for approval', async () => {
+    const user = userEvent.setup()
+    vi.mocked(getCurrentUser).mockReturnValue({ userId: 1, email: 'admin@example.test', role: 'admin', mustChangePassword: false, twoFactorEnabled: false })
+    vi.mocked(api.get).mockImplementation(async (path: string) => path.startsWith('/admin/actions/runs')
+      ? { runs: [{ id: 7, actionId: 1, actionName: 'Fail over DB', monitorId: 5, monitorName: 'VM1 SQL', onStatus: 'down', status: 'awaiting_approval', attemptCount: 0, maxAttempts: 3, nextAttemptAt: 1_700_003_600_000, lastError: null, createdAt: 1_700_000_000_000 }], total: 1, page: 1, pages: 1 }
+      : [])
+    vi.mocked(api.post).mockResolvedValue({ id: 7, status: 'pending' })
+    renderPage('/admin/delivery-history?tab=actions')
+
+    expect(await screen.findByText('Awaiting approval', { selector: 'span' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Approve run of Fail over DB/ }))
+    await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/actions/runs/7/approve', {}))
+    await user.click(screen.getByRole('button', { name: /Reject run of Fail over DB/ }))
+    await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/actions/runs/7/reject', {}))
+  })
+
+  it('keeps the addresses of the former history pages working', async () => {
+    function Location() {
+      const { pathname, search } = useLocation()
+      return <p data-testid="location">{pathname + search}</p>
+    }
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/admin/subscribers/history?subscriberId=7']}>
+          <Routes>
+            <Route path="/admin/subscribers/history" element={<DeliveryHistoryRedirect tab="subscribers" />} />
+            <Route path="/admin/delivery-history" element={<Location />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+    expect(await screen.findByTestId('location')).toHaveTextContent('/admin/delivery-history?tab=subscribers&subscriberId=7')
+  })
+})

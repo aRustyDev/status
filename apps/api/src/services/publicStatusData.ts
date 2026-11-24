@@ -1,0 +1,266 @@
+import { db } from '../db/client.js'
+import {
+  monitors, incidents, incidentMonitors, monitorResults, monitorDailyResults, layout, branding, locales,
+  maintenanceWindows, maintenanceWindowMonitors, monitorDependencies,
+} from '../db/schema.js'
+import { eq, desc, gte, lt, ne, inArray, and } from 'drizzle-orm'
+import { nonEmptyDay } from './uptimeCounts.js'
+import { activeWindows, liveWindows } from './maintenanceSchedule.js'
+import { getPublishedMonitorIds } from './publishedMonitors.js'
+import type { LayoutTree, LayoutNode, GroupNode, MonitorNode, PublicMaintenanceWindow, PublicMaintenanceEntry, UptimeThresholds } from '@bsp/shared'
+import { classifyUptimeDay, DEFAULT_UPTIME_THRESHOLDS } from '@bsp/shared'
+import { publishedIncident, withIncidentDetails } from './incidentDetails.js'
+import { RESULT_IN_MAINTENANCE } from '../db/resultMarks.js'
+
+/**
+ * What visitors of the status page may see. The public routes and the static snapshot both read
+ * through here, so a monitor or incident hidden from one is hidden from the other.
+ */
+
+function publicIds(links: Array<{ monitorId: number }>, published: ReadonlySet<number>): number[] {
+  return links.map((link) => link.monitorId).filter((id) => published.has(id))
+}
+
+/** An incident loses its links to internal monitors, and the id of the one that opened it, before it reaches visitors. */
+export function publishIncident<T extends { monitorIds?: number[]; autoMonitorId?: number | null }>(row: T, published: ReadonlySet<number>): T {
+  return {
+    ...row,
+    ...(row.monitorIds ? { monitorIds: row.monitorIds.filter((id) => published.has(id)) } : {}),
+    ...(row.autoMonitorId != null && !published.has(row.autoMonitorId) ? { autoMonitorId: null } : {}),
+  }
+}
+
+export function publishIncidents<T extends { monitorIds: number[]; autoMonitorId?: number | null }>(rows: T[], published: ReadonlySet<number>): T[] {
+  return rows.map((row) => publishIncident(row, published))
+}
+
+/**
+ * Windows as visitors get them, with the monitors they cover reduced to published ones. An empty list means
+ * "every monitor", so a window that only covers internal monitors is left out entirely rather than published
+ * with its (hidden) links stripped.
+ */
+async function publishWindows(
+  rows: Array<{ id: number; name: string; description: string | null; startsAt: number; endsAt: number }>,
+  published: ReadonlySet<number>,
+): Promise<PublicMaintenanceWindow[]> {
+  const links = rows.length
+    ? await db.select().from(maintenanceWindowMonitors).where(inArray(maintenanceWindowMonitors.windowId, rows.map((win) => win.id)))
+    : []
+  return rows
+    .map((win) => ({ win, own: links.filter((link) => link.windowId === win.id) }))
+    .filter(({ own }) => own.length === 0 || own.some((link) => published.has(link.monitorId)))
+    .map(({ win, own }) => ({
+      id: win.id, name: win.name, description: win.description, startsAt: win.startsAt, endsAt: win.endsAt,
+      monitorIds: publicIds(own, published),
+    }))
+}
+
+/** How many one-off windows that are over the public list keeps; the Maintenance block of the builder shows at most this many. */
+export const PUBLIC_PAST_MAINTENANCES = 20
+
+/**
+ * Running and upcoming windows (each with the span of the occurrence it shows), then the newest one-off windows that
+ * are over. Occurrences of a repeating window that are over are not kept, so such a window is listed again only
+ * when its next occurrence comes.
+ */
+export async function loadPublicMaintenances(now = Date.now()): Promise<PublicMaintenanceEntry[]> {
+  const published = await getPublishedMonitorIds()
+  const live = (await liveWindows(now)).sort((a, b) => a.startsAt - b.startsAt)
+  // Windows that cover only internal monitors are dropped after the query, so read on until enough are left.
+  const past: Awaited<ReturnType<typeof publishWindows>> = []
+  for (let offset = 0; past.length < PUBLIC_PAST_MAINTENANCES; offset += PUBLIC_PAST_MAINTENANCES) {
+    const rows = await db.select().from(maintenanceWindows)
+      .where(and(eq(maintenanceWindows.recurrence, 'none'), lt(maintenanceWindows.endsAt, now)))
+      .orderBy(desc(maintenanceWindows.endsAt), desc(maintenanceWindows.id)).limit(PUBLIC_PAST_MAINTENANCES).offset(offset)
+    past.push(...await publishWindows(rows, published))
+    if (rows.length < PUBLIC_PAST_MAINTENANCES) break
+  }
+  past.length = Math.min(past.length, PUBLIC_PAST_MAINTENANCES)
+  const running = (await publishWindows(live, published)).map((win): PublicMaintenanceEntry => ({ ...win, state: win.startsAt <= now ? 'active' : 'upcoming' }))
+  return [...running, ...past.map((win): PublicMaintenanceEntry => ({ ...win, state: 'past' }))]
+}
+
+export async function loadPublicStatus() {
+  const published = await getPublishedMonitorIds()
+  const allMonitors = await db.select({
+    id: monitors.id,
+    name: monitors.name,
+    type: monitors.type,
+    currentStatus: monitors.currentStatus,
+    lastCheckedAt: monitors.lastCheckedAt,
+  }).from(monitors)
+  const publishedMonitors = allMonitors.filter((monitor) => published.has(monitor.id))
+  const rawActiveIncidents = await db.select().from(incidents).where(and(ne(incidents.status, 'resolved'), publishedIncident)).orderBy(desc(incidents.createdAt))
+  const activeIncidents = publishIncidents(await withIncidentDetails(rawActiveIncidents), published)
+  const brandingRow = (await db.select().from(branding))[0] ?? null
+
+  const now = Date.now()
+  const activeWindowRows = await activeWindows(now)
+  const activeMaintenanceWindows = await publishWindows(activeWindowRows, published)
+
+  const publishedDependencies = (await db.select().from(monitorDependencies))
+    .filter((dep) => published.has(dep.dependentId) && published.has(dep.dependsOnId))
+
+  return { branding: brandingRow, monitors: publishedMonitors, activeIncidents, activeMaintenanceWindows, monitorDependencies: publishedDependencies }
+}
+
+export async function loadPublicLayout() {
+  const layoutRow = (await db.select().from(layout))[0]
+  const brandingRow = (await db.select().from(branding))[0] ?? null
+  let tree: LayoutTree = { id: 'root', type: 'page', children: [] }
+
+  if (layoutRow) {
+    try {
+      const parsed = JSON.parse(layoutRow.tree) as LayoutTree
+      const existingIds = new Set((await db.select().from(monitors)).map((m) => m.id))
+      tree = sanitizeTree(parsed, existingIds)
+    } catch { /* keep default */ }
+  }
+  return { tree, branding: brandingRow }
+}
+
+export async function loadPublicIncidents(paging: { limit: number; offset: number }) {
+  const rows = await db.select().from(incidents).where(publishedIncident).orderBy(desc(incidents.createdAt), desc(incidents.id))
+    .limit(paging.limit).offset(paging.offset)
+  return publishIncidents(await withIncidentDetails(rows), await getPublishedMonitorIds())
+}
+
+export async function loadPublicIncident(incidentId: number) {
+  const incident = (await db.select().from(incidents).where(and(eq(incidents.id, incidentId), publishedIncident)))[0]
+  if (!incident) return null
+  return publishIncidents(await withIncidentDetails([incident]), await getPublishedMonitorIds())[0]!
+}
+
+export async function loadPublicLocales() {
+  return db.select({ code: locales.code, name: locales.name, isDefault: locales.isDefault }).from(locales).orderBy(locales.name)
+}
+
+export async function loadPublicLocale(code: string) {
+  const row = (await db.select().from(locales).where(eq(locales.code, code)))[0]
+  if (!row) return null
+  return { code: row.code, name: row.name, translations: JSON.parse(row.translations || '{}') as Record<string, string> }
+}
+
+export async function loadUptime(monitorId: number, days: number) {
+  const now = Date.now()
+  const brandingRow = (await db.select().from(branding))[0]
+  const thresholds: UptimeThresholds = brandingRow ?? DEFAULT_UPTIME_THRESHOLDS
+  // Read from the daily totals the database keeps (see db/dailyResults.ts), from the first day that is shown.
+  const firstDay = Math.floor((now - (days - 1) * 86_400_000) / 86_400_000)
+  const dayRows = await db.select({
+    date: monitorDailyResults.day,
+    checksTotal: monitorDailyResults.checksTotal,
+    checksUp: monitorDailyResults.checksUp,
+    maintenanceChecks: monitorDailyResults.maintenanceChecks,
+  }).from(monitorDailyResults)
+    .where(and(eq(monitorDailyResults.monitorId, monitorId), gte(monitorDailyResults.day, firstDay), nonEmptyDay))
+  const dayBuckets = new Map(dayRows.map((row) => [row.date, row]))
+
+  // Fetch incidents affecting this specific monitor
+  const incidentLinks = await db
+    .select({ incidentId: incidentMonitors.incidentId })
+    .from(incidentMonitors)
+    .where(eq(incidentMonitors.monitorId, monitorId))
+  const incidentIds = incidentLinks.map((l) => l.incidentId)
+  type IncidentRow = { id: number; title: string; startedAt: number; resolvedAt: number | null }
+  let relevantIncidents: IncidentRow[] = []
+  if (incidentIds.length > 0) {
+    relevantIncidents = await db
+      .select({ id: incidents.id, title: incidents.title, startedAt: incidents.startedAt, resolvedAt: incidents.resolvedAt })
+      .from(incidents)
+      .where(and(inArray(incidents.id, incidentIds), publishedIncident))
+  }
+
+  const summaryDays = []
+  for (let i = days - 1; i >= 0; i--) {
+    const date = new Date(now - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    const bucket = dayBuckets.get(new Date(date + 'T00:00:00.000Z').getTime() / 86_400_000)
+    const checksTotal = Number(bucket?.checksTotal ?? 0)
+    const checksUp = Number(bucket?.checksUp ?? 0)
+    const uptimePct = checksTotal > 0 ? (checksUp / checksTotal) * 100 : 100
+    const maintenance = Number(bucket?.maintenanceChecks ?? 0)
+    const status = classifyUptimeDay(checksTotal > 0 ? uptimePct : null, thresholds, maintenance > 0)
+
+    // Incidents active on this day (started before end of day, not resolved before start of day)
+    const dayStart = new Date(date + 'T00:00:00.000Z').getTime()
+    const dayEnd   = dayStart + 86_400_000 - 1
+    const dayIncidents = relevantIncidents
+      .filter((inc) => inc.startedAt <= dayEnd && (inc.resolvedAt === null || inc.resolvedAt >= dayStart))
+      .map((inc) => ({
+        id: inc.id,
+        title: inc.title,
+        durationMs: inc.resolvedAt !== null ? inc.resolvedAt - inc.startedAt : null,
+      }))
+
+    summaryDays.push({ date, status, uptimePct, checksTotal, checksUp, maintenanceChecks: maintenance, incidents: dayIncidents })
+  }
+
+  const totalChecks = summaryDays.reduce((a, d) => a + d.checksTotal, 0)
+  const totalUp = summaryDays.reduce((a, d) => a + d.checksUp, 0)
+  const overallUptimePct = totalChecks > 0 ? (totalUp / totalChecks) * 100 : null
+  return { monitorId, days: summaryDays, overallUptimePct }
+}
+
+/** Response times of one monitor over the last `hours`, in `nBuckets` slices. */
+export async function loadHistory(monitorId: number, hours: number, nBuckets: number) {
+  const now = Date.now()
+  const since = now - hours * 3_600_000
+
+  const results = await db
+    .select({ status: monitorResults.status, responseMs: monitorResults.responseMs, checkedAt: monitorResults.checkedAt, unconfirmed: monitorResults.unconfirmed })
+    .from(monitorResults)
+    .where(and(eq(monitorResults.monitorId, monitorId), gte(monitorResults.checkedAt, since)))
+    .orderBy(monitorResults.checkedAt)
+
+  type ResultRow = { status: string; responseMs: number | null; checkedAt: number; unconfirmed: number }
+  const bucketSize = (now - since) / nBuckets
+  const STATUS_PRIORITY: Record<string, number> = { down: 0, degraded: 1, affected: 2, up: 3, pending: 4 }
+
+  // One pass over the rows instead of filtering the full list once per bucket.
+  const grouped: ResultRow[][] = Array.from({ length: nBuckets }, () => [])
+  for (const r of results as ResultRow[]) {
+    const index = Math.floor((r.checkedAt - since) / bucketSize)
+    if (index >= 0 && index < nBuckets) grouped[index]!.push(r)
+  }
+
+  const output = grouped.map((bucket, i) => {
+    const bucketEnd = since + (i + 1) * bucketSize
+
+    if (bucket.length === 0) {
+      return { ts: Math.round(bucketEnd), avg: null, min: null, max: null, p95: null, count: 0, status: null as string | null }
+    }
+
+    const times = bucket
+      .map((r: ResultRow) => r.responseMs)
+      .filter((v): v is number => v !== null)
+      .sort((a: number, b: number) => a - b)
+
+    const avg = times.length ? Math.round(times.reduce((a: number, b: number) => a + b, 0) / times.length) : null
+    const min = times.length ? times[0]! : null
+    const max = times.length ? times[times.length - 1]! : null
+    const p95 = times.length ? times[Math.min(Math.floor(times.length * 0.95), times.length - 1)]! : null
+
+    // A failure inside a maintenance window is not an outage; a bucket with nothing else is maintenance.
+    const counted = bucket.filter((r) => r.unconfirmed !== RESULT_IN_MAINTENANCE)
+    const dominantStatus = counted.length === 0 ? 'maintenance' : counted.reduce((worst: string, r: ResultRow) => {
+      return (STATUS_PRIORITY[r.status] ?? 9) < (STATUS_PRIORITY[worst] ?? 9) ? r.status : worst
+    }, counted[0]!.status)
+
+    return { ts: Math.round(bucketEnd), avg, min, max, p95, count: bucket.length, status: dominantStatus }
+  })
+
+  return { monitorId, hours, buckets: output }
+}
+
+function sanitizeTree(node: LayoutTree, validIds: Set<number>): LayoutTree {
+  return { ...node, children: sanitizeChildren(node.children, validIds) }
+}
+
+function sanitizeChildren(children: LayoutNode[], validIds: Set<number>): LayoutNode[] {
+  return children
+    .filter((c) => c.type !== 'monitor' || validIds.has((c as MonitorNode).monitorId))
+    .map((c) => c.type === 'group'
+      ? { ...(c as GroupNode), children: sanitizeChildren((c as GroupNode).children, validIds) }
+      : c,
+    )
+}

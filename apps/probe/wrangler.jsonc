@@ -1,0 +1,55 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "status-probe",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-23",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "env": {
+    "staging": {
+      "name": "status-probe-staging",
+      "workers_dev": false,
+      "preview_urls": false,
+      "triggers": {
+        "crons": []
+      },
+      "vars": {
+        "ENDPOINTS": "[]"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "status-board-staging",
+          "database_id": "REPLACE_STAGING_D1_ID",
+          "migrations_dir": "../worker/migrations"
+        }
+      ],
+      "vpc_services": []
+    },
+    "production": {
+      "name": "status-probe-production",
+      "workers_dev": false,
+      "preview_urls": false,
+      "triggers": {
+        "crons": []
+      },
+      "vars": {
+        "ENDPOINTS": "[]"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "status-board-production",
+          "database_id": "REPLACE_PRODUCTION_D1_ID",
+          "migrations_dir": "../worker/migrations"
+        }
+      ]
+    }
+  }
+}

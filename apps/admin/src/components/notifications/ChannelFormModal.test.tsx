@@ -1,0 +1,513 @@
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { DEFAULT_ALERT_POLICY, type NotificationChannel } from '@bsp/shared'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { api } from '../../api/client'
+import ChannelFormModal from './ChannelFormModal'
+
+vi.mock('../YamlViewModal', () => ({
+  YamlViewModal: ({ kind, objectKey, onClose }: { kind: string; objectKey?: string; onClose: () => void }) => (
+    <div role="dialog" aria-label="YAML view">{kind} {objectKey ?? ''}<button type="button" onClick={onClose}>Close YAML</button></div>
+  ),
+}))
+
+vi.mock('../../api/client', () => ({
+  api: { get: vi.fn(), post: vi.fn(), patch: vi.fn() },
+}))
+
+type User = ReturnType<typeof userEvent.setup>
+
+/** Field labels are not linked to their inputs, so resolve the control next to the label text. */
+function field<T extends HTMLElement = HTMLInputElement>(label: string, index = 0): T {
+  const labelElement = screen.getAllByText(label, { selector: 'label' })[index]
+  const control = labelElement?.parentElement?.querySelector('input, select, textarea')
+  if (!control) throw new Error(`No control for label ${label}`)
+  return control as T
+}
+
+/** Toggles are role="switch" buttons named by their visible label. */
+function toggle(label: string): HTMLElement {
+  return screen.getByRole('switch', { name: label })
+}
+
+function renderModal(channel: NotificationChannel | null = null) {
+  const onClose = vi.fn()
+  const onSaved = vi.fn()
+  render(<ChannelFormModal channel={channel} onClose={onClose} onSaved={onSaved} />)
+  return { onClose, onSaved }
+}
+
+function submittedBody(): Record<string, unknown> {
+  return vi.mocked(api.post).mock.calls[0]?.[1] as Record<string, unknown>
+}
+
+async function create(user: User) {
+  await user.click(screen.getByRole('button', { name: 'Create Channel' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledOnce())
+  expect(vi.mocked(api.post).mock.calls[0]?.[0]).toBe('/admin/notifications/channels')
+}
+
+function channel(patch: Partial<NotificationChannel>): NotificationChannel {
+  return {
+    id: 5,
+    key: 'ops-mail',
+    name: 'Ops mail',
+    type: 'email',
+    config: { to: 'ops@example.test', subject: 'S', body: 'B' },
+    enabled: 1,
+    notifyOnRecovery: 0,
+    alertPolicy: DEFAULT_ALERT_POLICY,
+    createdAt: 1,
+    updatedAt: 1,
+    ...patch,
+  }
+}
+
+describe('ChannelFormModal', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.get).mockImplementation(async (path: string) => (path === '/admin/vaults' ? [{ id: 3, name: 'Alerts' }] : [{ id: 9, name: 'telegram-bot', type: 'value' }]) as never)
+    vi.mocked(api.post).mockResolvedValue({})
+    vi.mocked(api.patch).mockResolvedValue({})
+  })
+
+  it('starts a new channel on the preselected type', () => {
+    render(<ChannelFormModal channel={null} initialType="slack" onClose={vi.fn()} onSaved={vi.fn()} />)
+    expect(screen.getByRole('button', { name: /Type Slack/ })).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('https://hooks.slack.com/services/…')).toBeInTheDocument()
+  })
+
+  it('ignores the preselected type when editing', () => {
+    render(<ChannelFormModal channel={channel({})} initialType="slack" onClose={vi.fn()} onSaved={vi.fn()} />)
+    expect(screen.getByRole('button', { name: /Type Email/ })).toBeInTheDocument()
+  })
+
+  it('creates an email channel with the default template and policy', async () => {
+    const user = userEvent.setup()
+    const { onSaved } = renderModal()
+
+    await user.type(field('Name'), 'On-call')
+    await user.type(field('To'), 'oncall@example.test')
+    expect(field('Subject')).toHaveValue('Monitor {{monitor_name}} is {{status}}')
+    expect(screen.getByText('{{monitor_list}}')).toBeInTheDocument()
+    await create(user)
+
+    expect(onSaved).toHaveBeenCalledOnce()
+    const body = submittedBody()
+    expect(body).toMatchObject({
+      name: 'On-call',
+      type: 'email',
+      enabled: 1,
+      notifyOnRecovery: 0,
+      config: { to: 'oncall@example.test', subject: 'Monitor {{monitor_name}} is {{status}}' },
+    })
+    expect((body['config'] as { body: string }).body).toContain('Status:  {{status}}')
+    const policy = body['alertPolicy'] as typeof DEFAULT_ALERT_POLICY
+    expect(policy.throttle).toEqual(DEFAULT_ALERT_POLICY.throttle)
+    expect(policy.grouping).toEqual(DEFAULT_ALERT_POLICY.grouping)
+    expect(policy.quietHours).toMatchObject({ enabled: false, start: '22:00', end: '07:00', mode: 'defer' })
+  })
+
+  it('sends a Telegram bot token from the vault instead of a direct one', async () => {
+    const user = userEvent.setup()
+    renderModal()
+
+    await user.type(field('Name'), 'Bot')
+    await user.click(screen.getByRole('button', { name: /^Type/ }))
+    await user.click(screen.getByRole('option', { name: /^Telegram/ }))
+    await user.click(screen.getByRole('button', { name: 'From Vault' }))
+    // The first vault is preselected; its secrets load into the second dropdown.
+    await screen.findByRole('option', { name: 'telegram-bot (value)' })
+    await user.selectOptions(screen.getAllByRole('combobox')[1]!, '9')
+    await user.type(field('Chat ID'), '-100500')
+    await create(user)
+
+    expect(submittedBody()['config']).toEqual({ vault: { vaultId: 3, secretId: 9, fieldMapping: {} }, chatId: '-100500' })
+  })
+
+  it('shows a stored Telegram token masked and sends the masked value back untouched', async () => {
+    const user = userEvent.setup()
+    renderModal(channel({ type: 'telegram', config: { botToken: '••••••••MSGo', chatId: '-100500' } }))
+
+    expect(field('Bot Token')).toHaveValue('••••••••MSGo')
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() => expect(api.patch).toHaveBeenCalledOnce())
+    expect(vi.mocked(api.patch).mock.calls[0]?.[1]).toMatchObject({ config: { botToken: '••••••••MSGo', chatId: '-100500' } })
+  })
+
+  it('does not submit without a name', async () => {
+    const user = userEvent.setup()
+    renderModal()
+
+    await user.click(screen.getByRole('button', { name: 'Create Channel' }))
+
+    expect(field('Name')).toBeInvalid()
+    expect(api.post).not.toHaveBeenCalled()
+  })
+
+  it('builds a webhook config with headers and drops the body for GET', async () => {
+    const user = userEvent.setup()
+    renderModal()
+
+    await user.type(field('Name'), 'Hook')
+    await user.click(screen.getByRole('button', { name: /^Type/ }))
+    await user.click(screen.getByRole('option', { name: /Webhook/ }))
+    expect(screen.getByText('No custom headers.')).toBeInTheDocument()
+    await user.type(field('URL'), 'https://hooks.example.test/alert')
+    await user.click(screen.getByRole('button', { name: 'Add header' }))
+    await user.type(screen.getByPlaceholderText('Header'), 'Authorization')
+    await user.type(screen.getByPlaceholderText('Value'), 'Bearer x')
+    // A row without a name is ignored.
+    await user.click(screen.getByRole('button', { name: 'Add header' }))
+    expect(field<HTMLTextAreaElement>('Body (JSON)').value).toContain('"monitor": "{{monitor_name}}"')
+    await user.selectOptions(field<HTMLSelectElement>('Method'), 'GET')
+    expect(screen.queryByText('Body (JSON)', { selector: 'label' })).not.toBeInTheDocument()
+    await create(user)
+
+    expect(submittedBody()['config']).toEqual({
+      url: 'https://hooks.example.test/alert',
+      method: 'GET',
+      headers: { Authorization: 'Bearer x' },
+      body: undefined,
+    })
+  })
+
+  it('removes webhook headers and keeps the body for POST', async () => {
+    const user = userEvent.setup()
+    renderModal()
+
+    await user.type(field('Name'), 'Hook')
+    await user.click(screen.getByRole('button', { name: /^Type/ }))
+    await user.click(screen.getByRole('option', { name: /Webhook/ }))
+    await user.type(field('URL'), 'https://hooks.example.test/alert')
+    await user.click(screen.getByRole('button', { name: 'Add header' }))
+    await user.click(screen.getAllByRole('button', { name: /^Remove header/ }).at(-1)!)
+    await user.clear(field('Body (JSON)'))
+    await user.click(field('Body (JSON)'))
+    await user.paste('{"s":"{{status}}"}')
+    await create(user)
+
+    expect(submittedBody()['config']).toEqual({
+      url: 'https://hooks.example.test/alert',
+      method: 'POST',
+      headers: undefined,
+      body: '{"s":"{{status}}"}',
+    })
+  })
+
+  it.each([
+    {
+      type: 'Discord',
+      fill: async (user: User) => {
+        await user.type(field('Webhook URL'), 'https://discord.test/hook')
+        await user.type(field('Bot Username (optional)'), 'BSP')
+        await user.click(field('Message Content (optional)'))
+        await user.paste('@here {{status}}')
+      },
+      config: { webhookUrl: 'https://discord.test/hook', username: 'BSP', content: '@here {{status}}' },
+      bare: { webhookUrl: 'https://discord.test/hook' },
+    },
+    {
+      type: 'Teams',
+      fill: async (user: User) => {
+        await user.type(field('Webhook URL'), 'https://teams.test/hook')
+        await user.type(field('Summary (optional)'), 'Alert')
+      },
+      config: { webhookUrl: 'https://teams.test/hook', summary: 'Alert' },
+      bare: { webhookUrl: 'https://teams.test/hook' },
+    },
+    {
+      type: 'Slack',
+      fill: async (user: User) => {
+        await user.type(field('Webhook URL'), 'https://slack.test/hook')
+        await user.type(field('Message Text (optional)'), 'Heads up')
+      },
+      config: { webhookUrl: 'https://slack.test/hook', text: 'Heads up' },
+      bare: { webhookUrl: 'https://slack.test/hook' },
+    },
+    {
+      type: 'Telegram',
+      fill: async (user: User) => {
+        await user.type(field('Bot Token'), '123:abc')
+        await user.type(field('Chat ID'), '-100500')
+        await user.type(field('Message Text (optional)'), 'Heads up')
+      },
+      config: { botToken: '123:abc', chatId: '-100500', text: 'Heads up' },
+      bare: { botToken: '123:abc', chatId: '-100500' },
+    },
+  ])('builds the $type config and omits empty optional fields', async ({ type, fill, config, bare }) => {
+    const user = userEvent.setup()
+    renderModal()
+
+    await user.type(field('Name'), type)
+    await user.click(screen.getByRole('button', { name: /^Type/ }))
+    await user.click(screen.getByRole('option', { name: new RegExp(`^${type}`) }))
+    await fill(user)
+    await create(user)
+    expect(submittedBody()).toMatchObject({ type: type.toLowerCase(), config })
+
+    vi.mocked(api.post).mockClear()
+    for (const input of screen.getAllByRole('textbox').filter((el) => /optional/.test(el.parentElement?.textContent ?? ''))) {
+      await user.clear(input)
+    }
+    await create(user)
+    expect(submittedBody()['config']).toEqual(bare)
+  })
+
+  it('saves toggles and alert hygiene settings', async () => {
+    const user = userEvent.setup()
+    renderModal()
+
+    await user.type(field('Name'), 'Policy')
+    await user.type(field('To'), 'ops@example.test')
+    await user.click(toggle('Enabled'))
+    await user.click(toggle('Notify on recovery (when monitor comes back up)'))
+
+    expect(screen.queryByText('Quiet hours')).not.toBeInTheDocument()
+    await user.click(screen.getByTitle('Alert hygiene'))
+    expect(screen.queryByText('From', { selector: 'label' })).not.toBeInTheDocument()
+    await user.click(toggle('Quiet hours'))
+    fireEvent.change(field('From'), { target: { value: '23:00' } })
+    // The email recipient field is also labelled "To".
+    fireEvent.change(field('To', 1), { target: { value: '06:30' } })
+    await user.selectOptions(field<HTMLSelectElement>('Timezone'), 'Europe/Warsaw')
+    await user.selectOptions(field<HTMLSelectElement>('During the window'), 'suppress')
+
+    await user.click(toggle('Rate cap per monitor'))
+    fireEvent.change(field('Max alerts'), { target: { value: '0' } })
+    fireEvent.change(field('Per (minutes)'), { target: { value: '15' } })
+
+    await user.click(toggle('Group bursts into one message'))
+    fireEvent.change(field('From (monitors)'), { target: { value: '1' } })
+    fireEvent.change(field('Within (seconds)'), { target: { value: '5' } })
+    // The tab badge counts the active policies.
+    expect(screen.getByTitle('Alert hygiene')).toHaveTextContent('3')
+    await create(user)
+
+    expect(submittedBody()).toMatchObject({
+      enabled: 0,
+      notifyOnRecovery: 1,
+      alertPolicy: {
+        quietHours: { enabled: true, start: '23:00', end: '06:30', timezone: 'Europe/Warsaw', mode: 'suppress' },
+        // Values below the minimum are clamped rather than rejected.
+        throttle: { enabled: true, maxAlerts: 1, windowMinutes: 15 },
+        grouping: { enabled: true, minMonitors: 2, windowSeconds: 10 },
+      },
+    })
+  })
+
+  it('pre-fills an existing webhook channel and saves with PATCH', async () => {
+    const user = userEvent.setup()
+    const { onSaved } = renderModal(channel({
+      name: 'Pager hook',
+      type: 'webhook',
+      config: { url: 'https://pager.test', method: 'PUT', headers: { 'X-Key': 'k' }, body: '{}' },
+      notifyOnRecovery: 1,
+      alertPolicy: { ...DEFAULT_ALERT_POLICY, throttle: { enabled: true, maxAlerts: 5, windowMinutes: 30 } },
+    }))
+
+    expect(screen.getByRole('heading', { name: 'Edit Channel' })).toBeInTheDocument()
+    expect(field('URL')).toHaveValue('https://pager.test')
+    expect(field<HTMLSelectElement>('Method')).toHaveValue('PUT')
+    expect(screen.getByPlaceholderText('Header')).toHaveValue('X-Key')
+    expect(screen.getByTitle('Alert hygiene')).toHaveTextContent('1')
+    await user.click(screen.getByTitle('Alert hygiene'))
+    expect(field('Max alerts')).toHaveValue(5)
+
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalledOnce())
+    expect(api.patch).toHaveBeenCalledWith('/admin/notifications/channels/5', expect.objectContaining({
+      name: 'Pager hook',
+      config: { url: 'https://pager.test', method: 'PUT', headers: { 'X-Key': 'k' }, body: '{}' },
+      notifyOnRecovery: 1,
+    }))
+  })
+
+  it('fills policy sections missing from older channels with defaults', async () => {
+    const user = userEvent.setup()
+    renderModal(channel({ alertPolicy: {} as NotificationChannel['alertPolicy'] }))
+
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+
+    await waitFor(() => expect(api.patch).toHaveBeenCalledOnce())
+    const policy = (vi.mocked(api.patch).mock.calls[0]?.[1] as { alertPolicy: typeof DEFAULT_ALERT_POLICY }).alertPolicy
+    expect(policy.throttle).toEqual(DEFAULT_ALERT_POLICY.throttle)
+    expect(policy.grouping).toEqual(DEFAULT_ALERT_POLICY.grouping)
+    expect(policy.quietHours.enabled).toBe(false)
+  })
+
+  it('keeps an unknown stored timezone selectable', async () => {
+    const user = userEvent.setup()
+    renderModal(channel({
+      alertPolicy: { ...DEFAULT_ALERT_POLICY, quietHours: { ...DEFAULT_ALERT_POLICY.quietHours, enabled: true, timezone: 'Mars/Olympus' } },
+    }))
+
+    await user.click(screen.getByTitle('Alert hygiene'))
+    expect(field<HTMLSelectElement>('Timezone')).toHaveValue('Mars/Olympus')
+  })
+
+  it('sends a test notification for an existing channel', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.post).mockResolvedValueOnce({}).mockRejectedValueOnce(new Error('SMTP not configured'))
+    renderModal(channel({}))
+
+    await user.click(screen.getByRole('button', { name: 'Send test (saved settings)' }))
+    expect(await screen.findByText('Test sent successfully')).toBeInTheDocument()
+    expect(api.post).toHaveBeenCalledWith('/admin/notifications/channels/5/test', {})
+
+    await user.click(screen.getByRole('button', { name: 'Send test (saved settings)' }))
+    expect(await screen.findByText('SMTP not configured')).toBeInTheDocument()
+  })
+
+  it('disables the saved-settings test while the form has unsaved edits', async () => {
+    const user = userEvent.setup()
+    renderModal(channel({}))
+
+    const test = screen.getByRole('button', { name: 'Send test (saved settings)' })
+    expect(test).toBeEnabled()
+    await user.type(screen.getByLabelText('Name'), ' edited')
+    expect(test).toBeDisabled()
+    expect(test).toHaveAccessibleDescription(/Save your changes first/)
+  })
+
+  it('is a labelled dialog that closes on Escape', async () => {
+    const user = userEvent.setup()
+    const { onClose } = renderModal()
+
+    expect(screen.getByRole('dialog', { name: 'New Notification Channel' })).toBeInTheDocument()
+    await user.keyboard('{Escape}')
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('offers no test for a channel that is not saved yet', () => {
+    renderModal()
+    expect(screen.queryByRole('button', { name: 'Send test (saved settings)' })).not.toBeInTheDocument()
+  })
+
+  it('shows a save error and stays open', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.post).mockRejectedValueOnce(new Error('Invalid webhook URL'))
+    const { onSaved } = renderModal()
+
+    await user.type(field('Name'), 'Broken')
+    await user.type(field('To'), 'ops@example.test')
+    await user.click(screen.getByRole('button', { name: 'Create Channel' }))
+
+    expect(await screen.findByText('Invalid webhook URL')).toBeInTheDocument()
+    expect(onSaved).not.toHaveBeenCalled()
+  })
+
+  it('closes from the cancel button', async () => {
+    const user = userEvent.setup()
+    const { onClose } = renderModal()
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+})
+
+describe('ChannelFormModal YAML view', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.get).mockResolvedValue([] as never)
+  })
+
+  it('opens the saved channel as YAML, by its key', async () => {
+    const user = userEvent.setup()
+    renderModal(channel({}))
+    await user.click(screen.getByRole('button', { name: 'YAML' }))
+    expect(screen.getByRole('dialog', { name: 'YAML view' })).toHaveTextContent('NotificationChannel ops-mail')
+  })
+
+  it('has no YAML for a channel that does not exist yet', () => {
+    renderModal(null)
+    expect(screen.queryByRole('button', { name: 'YAML' })).not.toBeInTheDocument()
+  })
+})
+
+describe('ChannelFormModal message tabs', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.get).mockResolvedValue([] as never)
+    vi.mocked(api.post).mockResolvedValue({})
+    vi.mocked(api.patch).mockResolvedValue({})
+  })
+
+  it('words the messages about actions on their own tab, and leaves recovery to the Monitor tab', async () => {
+    const user = userEvent.setup()
+    renderModal()
+    await user.type(field('Name'), 'On-call')
+    await user.type(field('To'), 'oncall@example.test')
+    expect(toggle('Notify on recovery (when monitor comes back up)')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'Action' }))
+    expect(screen.queryByRole('switch', { name: 'Notify on recovery (when monitor comes back up)' })).not.toBeInTheDocument()
+    await user.type(field('Subject'), 'Action {{{{action_name}}')
+    await create(user)
+
+    expect(submittedBody()['config']).toMatchObject({
+      to: 'oncall@example.test',
+      subject: 'Monitor {{monitor_name}} is {{status}}',
+      eventOverrides: { action: { subject: 'Action {{action_name}}' } },
+    })
+  })
+
+  it('sets whether a successful run of an action is told, on the Action tab only', async () => {
+    const user = userEvent.setup()
+    renderModal()
+    await user.type(field('Name'), 'On-call')
+    await user.type(field('To'), 'oncall@example.test')
+    expect(screen.queryByRole('switch', { name: 'Notify when an action run succeeds' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'Action' }))
+    await user.click(toggle('Notify when an action run succeeds'))
+    await create(user)
+
+    expect(submittedBody()['config']).toMatchObject({ to: 'oncall@example.test', notifyOnActionSuccess: true })
+    expect(submittedBody()['config']).not.toHaveProperty('eventOverrides')
+  })
+
+  it('sends no override when the Action tab is left empty, and reads a stored one back', async () => {
+    const user = userEvent.setup()
+    renderModal()
+    await user.type(field('Name'), 'On-call')
+    await user.type(field('To'), 'oncall@example.test')
+    await create(user)
+    expect(submittedBody()['config']).not.toHaveProperty('eventOverrides')
+    cleanup()
+    vi.clearAllMocks()
+    vi.mocked(api.patch).mockResolvedValue({})
+
+    render(<ChannelFormModal channel={channel({ config: { to: 'a@b.test', subject: 'S', body: 'B', eventOverrides: { action: { subject: 'Ran {{action_name}}' } } } })} onClose={vi.fn()} onSaved={vi.fn()} />)
+    await user.click(screen.getByRole('tab', { name: 'Action' }))
+    expect(field('Subject')).toHaveValue('Ran {{action_name}}')
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() => expect(api.patch).toHaveBeenCalledOnce())
+    expect(vi.mocked(api.patch).mock.calls[0]?.[1]).toMatchObject({ config: { eventOverrides: { action: { subject: 'Ran {{action_name}}' } } } })
+  })
+})
+
+describe('ChannelFormModal wording the form does not edit', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.get).mockResolvedValue([] as never)
+    vi.mocked(api.patch).mockResolvedValue({})
+  })
+
+  it('keeps the wording a channel has for other kinds of event when it is saved', async () => {
+    const user = userEvent.setup()
+    render(<ChannelFormModal channel={channel({ config: { to: 'a@b.test', subject: 'S', body: 'B', eventOverrides: { alert: { subject: 'Alert {{monitor_name}}' }, action: { subject: 'Ran' } } } })} onClose={vi.fn()} onSaved={vi.fn()} />)
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() => expect(api.patch).toHaveBeenCalledOnce())
+    expect(vi.mocked(api.patch).mock.calls[0]?.[1]).toMatchObject({ config: { eventOverrides: { alert: { subject: 'Alert {{monitor_name}}' }, action: { subject: 'Ran' } } } })
+  })
+
+  it('drops the Action body of a webhook that cannot carry one', async () => {
+    const user = userEvent.setup()
+    render(<ChannelFormModal channel={channel({ type: 'webhook', config: { url: 'https://x.test/h', method: 'GET', eventOverrides: { action: { body: '{"a":1}' } } } })} onClose={vi.fn()} onSaved={vi.fn()} />)
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() => expect(api.patch).toHaveBeenCalledOnce())
+    expect((vi.mocked(api.patch).mock.calls[0]?.[1] as { config: Record<string, unknown> }).config).not.toHaveProperty('eventOverrides')
+  })
+})

@@ -1,0 +1,1988 @@
+openapi: 3.1.0
+info:
+  title: BetterStatusPage admin API
+  version: 1.0.0
+  description: |
+    The part of the admin API meant for scripts, CI/CD pipelines and infrastructure tooling. It is the same API the
+    admin panel uses, limited to what an API token may call; see https://docs.betterstatuspage.dev/api/.
+
+    **Authentication.** Send an API token (Administration → API tokens) as `Authorization: Bearer bsp_...`. A token
+    carries permissions per part of the application: `monitors`, `channels`, `incidents`, `maintenance`,
+    `subscribers`, `appearance` (layout and branding) and `reports`, `audit`, `system` (read only), each `read` or
+    `write` (write includes read). The separate `vault:use` permission lets a token attach vault secrets to monitors
+    and channels; without it a token cannot add, change or move a vault reference. Each operation below names the
+    permission it needs in `x-scope`. A token expires after 90 days unless it was created without an expiry.
+
+    **Secrets.** Passwords, client secrets, credential headers, Slack, Discord and Teams webhook URLs and bot, access and application tokens in a `config` are never
+    returned: they read back as `••••••••`. Send that value back unchanged to keep the stored secret, or send a new
+    value (text) to replace it. A masked value that does not match the stored secret, or one that looks like a
+    half-edited mask, is refused with `400`. A kept secret must stay where it is sent: if the `url` (or the OAuth2
+    `tokenUrl`, the CAS server, a database `host` or `port`, or a webhook channel's `url` or an ntfy channel's `serverUrl`) changes in the same
+    request, enter the secret again. Changing a `type`
+    needs a new `config` in the same request. Credentials written into a URL (`https://user:pass@host`), a query
+    string or a request body are not recognised as secrets and are returned as stored: put them in the
+    authentication fields or headers, or read them from a vault.
+
+    **Keys.** Monitors and notification channels have a unique `key` next to their numeric `id`. The key is generated
+    from the name when omitted, or given when the object is created, and never changes: an update that sends a `key`
+    is refused with `400`.
+
+    **Errors.** `{ "error": "message" }` with `400`, `401`, `403`, `404`, `409`, `413` (a body over 2 MB), `415` (a
+    content type the endpoint does not read), `422`, `429` (`Retry-After` is set; a token is limited to 300 requests
+    per minute) or `500`. A request made with a token is audited when it changes something.
+servers:
+  - url: '{baseUrl}/api/v1/admin'
+    description: Your installation
+    variables:
+      baseUrl:
+        default: https://status.example.com
+        description: Where BetterStatusPage is served, without a trailing slash.
+security:
+  - bearerAuth: []
+tags:
+  - name: Monitors
+  - name: Incidents
+  - name: Maintenance
+  - name: Notification channels
+  - name: Actions
+  - name: Layout
+  - name: Configuration
+
+paths:
+  /monitors:
+    get:
+      tags: [Monitors]
+      summary: List monitors
+      x-scope: monitors:read
+      responses:
+        '200':
+          description: Every monitor, with secrets masked.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Monitor' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Monitors]
+      summary: Create a monitor
+      x-scope: monitors:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MonitorCreate' }
+      responses:
+        '200':
+          description: The created monitor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Monitor' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /monitors/test:
+    post:
+      tags: [Monitors]
+      summary: Test a monitor configuration without saving it
+      description: Runs the check once and reports each step. Supported for `https`, `ping`, `dns`, database and `docker` monitors.
+      x-scope: monitors:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, config]
+              properties:
+                type: { $ref: '#/components/schemas/MonitorType' }
+                config: { type: object }
+                timeoutMs: { type: integer, default: 10000, description: 'Milliseconds, used from 500 to 60000: a value outside that is clamped.' }
+                monitorId:
+                  type: integer
+                  description: The saved monitor being edited, so a masked secret in `config` is tested as the stored one.
+      responses:
+        '200':
+          description: The result of the test.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  overall: { type: string, enum: [ok, error] }
+                  totalMs: { type: integer }
+                  steps:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        label: { type: string }
+                        status: { type: string, enum: [ok, error, info] }
+                        detail: { type: string }
+                        durationMs: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /monitors/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [Monitors]
+      summary: Get a monitor
+      x-scope: monitors:read
+      responses:
+        '200':
+          description: The monitor, with secrets masked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Monitor' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Monitors]
+      summary: Update a monitor
+      description: Only the fields you send change. `config` replaces the whole configuration, and a change of `type` needs it.
+      x-scope: monitors:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MonitorUpdate' }
+      responses:
+        '200':
+          description: The updated monitor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Monitor' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Monitors]
+      summary: Delete a monitor
+      x-scope: monitors:write
+      responses:
+        '204': { description: Deleted (also when it did not exist). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /monitors/{id}/check-now:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Monitors]
+      summary: Run a check immediately
+      x-scope: monitors:write
+      responses:
+        '200':
+          description: The monitor after the check.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Monitor' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /monitors/{id}/dependencies:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [Monitors]
+      summary: List the monitors this monitor depends on
+      x-scope: monitors:read
+      responses:
+        '200':
+          description: Ids of the monitors it depends on.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dependencies' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Monitors]
+      summary: Replace the monitors this monitor depends on
+      description: Unknown ids are ignored. A dependency cycle is refused.
+      x-scope: monitors:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Dependencies' }
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /incidents:
+    get:
+      tags: [Incidents]
+      summary: List incidents
+      description: Newest first. Without `page` and `limit` the whole list is returned.
+      x-scope: incidents:read
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1 } }
+      responses:
+        '200':
+          description: Incidents with their updates and affected monitors.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Incident' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Incidents]
+      summary: Open an incident
+      description: Subscribers are notified unless `notifySubscribers` is false.
+      x-scope: incidents:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IncidentCreate' }
+      responses:
+        '200':
+          description: The created incident.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Incident' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /incidents/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    patch:
+      tags: [Incidents]
+      summary: Change an incident
+      description: Moving the status to `resolved` stamps `resolvedAt`; any other status clears it.
+      x-scope: incidents:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IncidentPatch' }
+      responses:
+        '200':
+          description: The updated incident.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Incident' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Incidents]
+      summary: Delete an incident
+      x-scope: incidents:write
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /incident-templates:
+    get:
+      tags: [Incidents]
+      summary: List incident templates
+      description: The templates automatic incidents are written from, by name.
+      x-scope: incidents:read
+      responses:
+        '200':
+          description: The templates.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/IncidentTemplate' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Incidents]
+      summary: Create an incident template
+      description: All of `name`, `title`, `body`, `resolvedBody` and `impact` are required.
+      x-scope: incidents:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IncidentTemplateInput' }
+      responses:
+        '200':
+          description: The created template.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IncidentTemplate' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /incident-templates/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    patch:
+      tags: [Incidents]
+      summary: Change an incident template
+      x-scope: incidents:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IncidentTemplateInput' }
+      responses:
+        '200':
+          description: The updated template.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IncidentTemplate' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Incidents]
+      summary: Delete an incident template
+      description: Refused with `409` for the default template. Monitors that used the template fall back to the default one.
+      x-scope: incidents:write
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /incidents/{id}/updates:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Incidents]
+      summary: Post an update to an incident
+      description: The update's status becomes the incident's status.
+      x-scope: incidents:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IncidentUpdateCreate' }
+      responses:
+        '200':
+          description: The created update.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /incidents/{id}/updates/{updateId}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+      - { name: updateId, in: path, required: true, schema: { type: integer } }
+    patch:
+      tags: [Incidents]
+      summary: Edit the text of an incident update
+      description: Only the text changes, not the incident's status. Subscribers are not notified again, and the translations of the old text are dropped.
+      x-scope: incidents:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string }
+      responses:
+        '200':
+          description: The updated entry.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Incidents]
+      summary: Delete an incident update
+      description: The incident's status stays as it is.
+      x-scope: incidents:write
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /incidents/{id}/monitors:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Incidents]
+      summary: Set the monitors an incident affects
+      x-scope: incidents:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [monitorIds]
+              properties:
+                monitorIds:
+                  type: array
+                  items: { type: integer }
+      responses:
+        '200':
+          description: The incident with its monitors.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Incident' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /maintenance:
+    get:
+      tags: [Maintenance]
+      summary: List maintenance windows
+      x-scope: maintenance:read
+      responses:
+        '200':
+          description: Every window.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Maintenance]
+      summary: Schedule a maintenance window
+      description: Subscribers are told about a window that has not ended yet, unless `notifySubscribers` is false.
+      x-scope: maintenance:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MaintenanceCreate' }
+      responses:
+        '200':
+          description: The created window.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /maintenance/active:
+    get:
+      tags: [Maintenance]
+      summary: List the windows that are in progress now
+      x-scope: maintenance:read
+      responses:
+        '200':
+          description: Windows whose start has passed and whose end has not.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /maintenance/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [Maintenance]
+      summary: Get a maintenance window
+      x-scope: maintenance:read
+      responses:
+        '200':
+          description: The window.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Maintenance]
+      summary: Change a maintenance window
+      description: Only the fields you send change. `monitorIds` replaces the whole list.
+      x-scope: maintenance:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MaintenancePatch' }
+      responses:
+        '200':
+          description: The updated window.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Maintenance]
+      summary: Delete a maintenance window
+      x-scope: maintenance:write
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /maintenance/{id}/end:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Maintenance]
+      summary: End the running occurrence now
+      description: A one-off window gets its end set to now. A repeating window stops only the occurrence that is running; the later ones are unchanged. Checks of the covered monitors count towards uptime again from this moment.
+      x-scope: maintenance:write
+      responses:
+        '200':
+          description: The updated window.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: The window is not running. }
+
+  /notifications/channels:
+    get:
+      tags: [Notification channels]
+      summary: List notification channels
+      x-scope: channels:read
+      responses:
+        '200':
+          description: Every channel, with secrets masked.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/NotificationChannel' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Notification channels]
+      summary: Create a notification channel
+      x-scope: channels:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationChannelCreate' }
+      responses:
+        '200':
+          description: The created channel.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationChannel' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /notifications/channels/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [Notification channels]
+      summary: Get a notification channel
+      x-scope: channels:read
+      responses:
+        '200':
+          description: The channel, with secrets masked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationChannel' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Notification channels]
+      summary: Update a notification channel
+      description: Only the fields you send change. `config` replaces the whole configuration, and a change of `type` needs it.
+      x-scope: channels:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationChannelUpdate' }
+      responses:
+        '200':
+          description: The updated channel.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationChannel' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Notification channels]
+      summary: Delete a notification channel
+      x-scope: channels:write
+      responses:
+        '204': { description: Deleted, and removed from every monitor. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /notifications/channels/{id}/test:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Notification channels]
+      summary: Send a test notification through a saved channel
+      x-scope: channels:write
+      responses:
+        '200':
+          description: Delivered.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: The channel could not deliver the test.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /notifications/monitor/{monitorId}/channels:
+    parameters:
+      - name: monitorId
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Notification channels]
+      summary: List the channels a monitor alerts through
+      x-scope: channels:read
+      responses:
+        '200':
+          description: Channel ids.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Notification channels]
+      summary: Replace the channels a monitor alerts through
+      x-scope: channels:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channelIds]
+              properties:
+                channelIds:
+                  type: array
+                  items: { type: integer }
+      responses:
+        '200':
+          description: Saved.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /config/export:
+    get:
+      tags: [Configuration]
+      summary: Export monitors, notification channels and actions as documents
+      description: |
+        Every object is a document with a `kind` (`Monitor`, `NotificationChannel` or `Action`). Objects
+        are identified by `key`, a monitor lists the keys of its channels, dependencies and actions. Known secret fields are written as `••••••••` and vault secrets by the
+        names of the vault and the secret. Runtime state (status, last check) is not included. A `webhook` monitor has `heartbeatToken: ••••••••`; an import accepts a real token (48 lowercase hex characters) to keep the heartbeat URL stable, and keeps the stored one when it is absent or masked. The
+        output is the same for the same data, so it diffs well in version control.
+
+        Without `kind` the response holds every document: a YAML stream separated by `---`. With
+        `kind` and `key` it is that one document. The export is always YAML, written so that
+        YAML 1.1 and 1.2 parsers read the same values (`"22:00"` and `"yes"` are quoted).
+
+        Needs the read permission for every kind it returns: `monitors` and `channels`, or the one of
+        the requested kind. Actions are in a full export, and in the `actions` list of each monitor, only for
+        a caller who may read them (`actions:read`, or an administrator); for anyone else they are left out.
+      x-scope: per document kind
+      parameters:
+        - name: kind
+          in: query
+          description: Export one document of this kind.
+          schema: { $ref: '#/components/schemas/ConfigKind' }
+        - name: key
+          in: query
+          description: The key of the monitor, channel or action. Required with `kind`.
+          schema: { $ref: '#/components/schemas/Key' }
+      responses:
+        '200':
+          description: The documents.
+          content:
+            application/yaml:
+              schema: { type: string, description: 'One document, or all of them as a stream separated by `---`. Each is a ConfigDocument.' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: A vault reference could not be written unambiguously, because more than one vault has that name.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /config/validate:
+    post:
+      tags: [Configuration]
+      summary: Check documents and show what applying them would change
+      description: |
+        Runs every check of an import and reports the changes it would make, without making any. Use it to review a
+        file in a pull request or a pipeline before `apply`.
+      x-scope: per document kind
+      parameters:
+        - name: prune
+          in: query
+          required: false
+          description: 'With `true`, also delete the objects of the kinds in the file that the documents do not mention (changes with `action: delete`). Any value but `true` or `false` is refused with `400`.'
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: true
+        description: 'One or more documents, as written by the export, separated by `---`. Only YAML is read: send it with `Content-Type: application/yaml` (`text/yaml` and `application/x-yaml` also work). Any other type is refused with `415`.'
+        content:
+          application/yaml:
+            schema: { $ref: '#/components/schemas/ConfigDocuments' }
+          text/yaml:
+            schema: { $ref: '#/components/schemas/ConfigDocuments' }
+      responses:
+        '200':
+          description: What would be changed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigImportResult' }
+        '400':
+          description: The file is not valid. Nothing was changed; `problems` lists everything wrong with it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigImportError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '415':
+          description: The body is not sent as YAML.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /config/apply:
+    post:
+      tags: [Configuration]
+      summary: Create or update the objects the documents describe
+      description: |
+        Creates and updates the monitors and notification channels the documents describe, with their
+        links. Monitors and channels are matched by `key`; a key that is not in the installation creates a new
+        object. Nothing is deleted unless `prune=true`: what the documents do not mention stays as it is.
+
+        The documents are checked completely before anything is written and applied in one transaction, so they take
+        effect entirely or not at all. Applying them again changes nothing.
+
+        A secret written as `••••••••` keeps the stored one (the export writes secrets that way); a new value replaces
+        it; leaving a secret out clears it. A kept secret has to stay where it is sent: changing a URL, token URL, CAS
+        server, database host or port while keeping a stored secret is refused. A new object cannot have a masked
+        secret, since there is nothing to keep.
+
+        A token needs the write permission of every kind in the file (`monitors`, `channels`), and
+        `vault:use` to add a vault reference or change a monitor or channel that has one (and `channels:write` to change which channels a monitor alerts through). A user needs the role that may edit that kind in the panel:
+        the Operator role (or Admin) for both.
+      x-scope: per document kind
+      parameters:
+        - name: prune
+          in: query
+          required: false
+          description: 'With `true`, also delete the objects of the kinds in the file that the documents do not mention (changes with `action: delete`). Any value but `true` or `false` is refused with `400`.'
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: true
+        description: 'One or more documents, as written by the export, separated by `---`. Only YAML is read: send it with `Content-Type: application/yaml` (`text/yaml` and `application/x-yaml` also work). Any other type is refused with `415`.'
+        content:
+          application/yaml:
+            schema: { $ref: '#/components/schemas/ConfigDocuments' }
+          text/yaml:
+            schema: { $ref: '#/components/schemas/ConfigDocuments' }
+      responses:
+        '200':
+          description: What was changed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigImportResult' }
+        '400':
+          description: The file is not valid. Nothing was changed; `problems` lists everything wrong with it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigImportError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '415':
+          description: The body is not sent as YAML.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /actions:
+    get:
+      tags: [Actions]
+      summary: List actions
+      x-scope: actions:read
+      responses:
+        '200':
+          description: Every action, with credential headers masked.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Action' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Actions]
+      summary: Create an action
+      x-scope: actions:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActionCreate' }
+      responses:
+        '200':
+          description: The created action.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Action' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /actions/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [Actions]
+      summary: Get an action
+      x-scope: actions:read
+      responses:
+        '200':
+          description: The action, with credential headers masked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Action' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Actions]
+      summary: Update an action
+      description: Only the fields you send change. `config` replaces the whole configuration; a masked header value keeps the stored one unless the URL changes.
+      x-scope: actions:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActionUpdate' }
+      responses:
+        '200':
+          description: The updated action.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Action' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Actions]
+      summary: Delete an action
+      x-scope: actions:write
+      responses:
+        '204': { description: Deleted, unlinked from every monitor, and its waiting runs cancelled. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /actions/{id}/test:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Actions]
+      summary: Send a saved action once, with sample values
+      description: This is the real request, so whatever it triggers starts. The answer says what the target replied, with any vault secret removed.
+      x-scope: actions:write
+      responses:
+        '200':
+          description: The request was answered with a success status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  status: { type: integer, description: The HTTP status of the answer. }
+                  snippet: { type: string, description: The start of the answer on one line, at most 500 characters. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: The request failed. `status` and `snippet` are there when the target answered.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  status: { type: integer }
+                  snippet: { type: string }
+  /actions/runs/{id}/retry:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Actions]
+      summary: Retry a failed action run
+      description: Gives the run another round of attempts and tries it at once. The usual checks apply, so a run whose monitor has recovered, that lies in a maintenance window or whose link is gone comes back `cancelled` with the reason in `lastError`.
+      x-scope: actions:write
+      responses:
+        '200':
+          description: The run after the attempt.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionRun' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The run did not fail, so there is nothing to retry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /actions/runs/{id}/approve:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Actions]
+      summary: Approve an action run
+      description: Queues a run that waits for approval; its delay counts from now. The usual checks still apply before it is sent. Only a signed-in admin can decide, in the admin panel; an API token is always refused.
+      x-scope: actions:write
+      responses:
+        '200':
+          description: The run after the decision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionRun' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The run is not waiting for approval any more.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /actions/runs/{id}/reject:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Actions]
+      summary: Reject an action run
+      description: Cancels a run that waits for approval. Only a signed-in admin can decide, in the admin panel; an API token is always refused.
+      x-scope: actions:write
+      responses:
+        '200':
+          description: The run after the decision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionRun' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The run is not waiting for approval any more.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /actions/runs:
+    get:
+      tags: [Actions]
+      summary: List action runs
+      x-scope: actions:read
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100 } }
+        - { name: status, in: query, schema: { type: string, enum: [pending, awaiting_approval, succeeded, failed, cancelled] } }
+        - { name: actionId, in: query, schema: { type: integer } }
+        - { name: monitorId, in: query, schema: { type: integer } }
+        - { name: from, in: query, description: Earliest creation time in milliseconds since the epoch., schema: { type: integer } }
+        - { name: to, in: query, description: Latest creation time in milliseconds since the epoch., schema: { type: integer } }
+      responses:
+        '200':
+          description: One page of runs, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs:
+                    type: array
+                    items: { $ref: '#/components/schemas/ActionRun' }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+                  pages: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /actions/monitor/{monitorId}:
+    parameters:
+      - { name: monitorId, in: path, required: true, schema: { type: integer } }
+    get:
+      tags: [Actions]
+      summary: List the actions linked to a monitor
+      x-scope: actions:read
+      responses:
+        '200':
+          description: The links of the monitor.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MonitorAction' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Actions]
+      summary: Replace the actions linked to a monitor
+      description: The list replaces every existing link. An action can be linked once per status. Runs that wait for a link that is gone are cancelled.
+      x-scope: actions:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [actions]
+              properties:
+                actions:
+                  type: array
+                  items: { $ref: '#/components/schemas/MonitorAction' }
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /layout:
+    get:
+      tags: [Layout]
+      summary: Get the status page layout
+      x-scope: appearance:read
+      responses:
+        '200':
+          description: The layout tree, starting at the page node.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LayoutNode' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Layout]
+      summary: Replace the status page layout
+      x-scope: appearance:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tree]
+              properties:
+                tree: { $ref: '#/components/schemas/LayoutNode' }
+      responses:
+        '200':
+          description: The saved tree.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LayoutNode' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /layout/monitors:
+    get:
+      tags: [Layout]
+      summary: List monitors by name and type, for placing them in the layout
+      x-scope: appearance:read
+      responses:
+        '200':
+          description: Id, name and type of every monitor; no configuration.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer }
+                    name: { type: string }
+                    type: { $ref: '#/components/schemas/MonitorType' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: An API token created in Administration → API tokens.
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+  responses:
+    BadRequest:
+      description: The request is not valid.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing, unknown, expired or revoked token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: The token does not have the permission this operation needs (the message names it), or the user's role may not do it.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No such object.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: The key is already used by another object.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+    Key:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9_-]{0,63}$'
+      description: 'Unique, lowercase letters, digits, `-` and `_`. A technical value: it can be given when an object is created, and never changes after that.'
+    Dependencies:
+      type: object
+      required: [dependsOnIds]
+      properties:
+        dependsOnIds:
+          type: array
+          items: { type: integer }
+
+    MonitorType:
+      type: string
+      enum: [https, ping, dns, sqlserver, postgresql, mysql, mongodb, oracle, redis, mail, ssh, tls, domain, docker, webhook]
+    MonitorTag:
+      type: object
+      required: [label, color]
+      properties:
+        label: { type: string }
+        color: { type: string }
+    VaultRef:
+      type: object
+      description: A secret read from a vault instead of being stored in the configuration.
+      required: [vaultId, secretId]
+      properties:
+        vaultId: { type: integer }
+        secretId: { type: integer }
+        fieldMapping:
+          type: object
+          additionalProperties: { type: string }
+    MonitorConfig:
+      description: |
+        The configuration for the monitor's `type`. A `webhook` monitor takes an empty object. Secrets are masked in
+        responses (see the API description).
+      oneOf:
+        - $ref: '#/components/schemas/HttpsConfig'
+        - $ref: '#/components/schemas/PingConfig'
+        - $ref: '#/components/schemas/DnsConfig'
+        - $ref: '#/components/schemas/DatabaseConfig'
+        - $ref: '#/components/schemas/RedisConfig'
+        - $ref: '#/components/schemas/MailConfig'
+        - $ref: '#/components/schemas/SshConfig'
+        - $ref: '#/components/schemas/TlsCertConfig'
+        - $ref: '#/components/schemas/DomainConfig'
+        - $ref: '#/components/schemas/DockerConfig'
+        - type: object
+          maxProperties: 0
+    HttpsConfig:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, format: uri, maxLength: 2048, pattern: '^[Hh][Tt][Tt][Pp][Ss]?://', description: 'A full address starting with http:// or https://, without spaces and without a user name or password.' }
+        method: { type: string, enum: [GET, POST, HEAD], default: GET, description: 'Any case is accepted. Nothing else is: the monitor sends it to its address at every check.' }
+        expectedStatus: { type: integer, minimum: 200, maximum: 599, default: 200, description: 'The final status, after redirects are followed.' }
+        keyword: { type: string }
+        degradedAboveMs:
+          type: integer
+          minimum: 1
+          maximum: 300000
+          description: A response slower than this many milliseconds makes the check Degraded.
+        assertions:
+          type: array
+          maxItems: 20
+          description: Checks on the final response. Each failing one makes the check Degraded (default) or Down; the worst wins.
+          items:
+            oneOf:
+              - type: object
+                required: [type, name, op]
+                properties:
+                  type: { type: string, enum: [header] }
+                  name: { type: string, description: Header name, matched without regard to case. }
+                  op: { type: string, enum: [exists, not-exists, equals, not-equals, contains] }
+                  value: { type: string, description: Required unless op is exists or not-exists. }
+                  onFail: { type: string, enum: [degraded, down], default: degraded }
+              - type: object
+                required: [type, path, op]
+                properties:
+                  type: { type: string, enum: [json] }
+                  path: { type: string, description: 'A path such as $.queue.length, $.items[0].id or $[''key'']. Wildcards and filters are not supported.' }
+                  op: { type: string, enum: [exists, equals, not-equals, contains, lt, gt] }
+                  value: { oneOf: [{ type: string }, { type: number }], description: Required unless op is exists; a number for lt and gt. }
+                  onFail: { type: string, enum: [degraded, down], default: degraded }
+        headers:
+          type: object
+          description: Values of credential headers are masked. A header is one when its name contains auth, token, secret, key, pass, pwd, credential, cookie, session or signature.
+          additionalProperties: { type: string }
+        body: { type: string }
+        auth:
+          type: object
+          properties:
+            type: { type: string, enum: [none, basic, oauth2, cas] }
+            basic:
+              type: object
+              properties:
+                username: { type: string }
+                password: { type: string }
+                vault: { $ref: '#/components/schemas/VaultRef' }
+            oauth2:
+              type: object
+              properties:
+                tokenUrl: { type: string }
+                clientId: { type: string }
+                clientSecret: { type: string }
+                scope: { type: string }
+                vault: { $ref: '#/components/schemas/VaultRef' }
+            cas:
+              type: object
+              properties:
+                casServerUrl: { type: string }
+                username: { type: string }
+                password: { type: string }
+                vault: { $ref: '#/components/schemas/VaultRef' }
+        cacheBuster: { type: boolean, description: 'Adds a random bsp_cachebuster query parameter to the request of every check (GET and HEAD, first request only, not with CAS), so a CDN or proxy cache cannot answer it.' }
+        ignoreTls:
+          type: boolean
+          default: false
+          description: Accepts any server certificate (self-signed, expired, wrong host). Certificate expiry warnings do not apply while it is on.
+        certExpiry:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            warnDays: { type: integer, minimum: 1, maximum: 365 }
+    PingConfig:
+      type: object
+      required: [host]
+      properties:
+        host: { type: string, minLength: 1, maxLength: 253, pattern: '^\S+$' }
+        mode: { type: string, enum: [tcp, icmp], default: tcp }
+        port: { type: integer, minimum: 1, maximum: 65535, default: 80, description: 'Used by tcp; not looked at for icmp.' }
+    DnsConfig:
+      type: object
+      required: [hostname]
+      properties:
+        hostname: { type: string, minLength: 1, maxLength: 253, pattern: '^\S+$' }
+        recordType: { type: string, enum: [A, AAAA, MX, CNAME, TXT], default: A }
+        expectedValue: { type: string }
+        resolver: { type: string }
+    DatabaseConfig:
+      type: object
+      description: Used by the `sqlserver`, `postgresql`, `mysql`, `mongodb` and `oracle` monitor types. For `oracle`, `database` is the service name. `host` is required unless `mode` is `connectionString`, where the connection string comes from a vault secret.
+      properties:
+        host: { type: string, minLength: 1, maxLength: 253, pattern: '^\S+$' }
+        port: { type: integer, minimum: 1, maximum: 65535, description: 'The usual port of the engine when absent.' }
+        database: { type: string }
+        user: { type: string }
+        password: { type: string }
+        query: { type: string, description: A SQL statement, or a JSON command for MongoDB. }
+        expectedResult: { type: string }
+        mode: { type: string, enum: [fields, connectionString], default: fields }
+        tls: { type: string, enum: [prefer, require, verify], default: prefer, description: 'Fields mode only. verify checks the certificate and host name, require encrypts without a plain fallback, prefer is the earlier behaviour. The admin form starts new monitors at verify.' }
+        tlsCa: { type: string, description: 'Fields mode, tls verify: PEM of the authority that signed the server certificate. Empty = the public CAs bundled with Node.js plus NODE_EXTRA_CA_CERTS.' }
+        vault: { $ref: '#/components/schemas/VaultRef' }
+    RedisConfig:
+      type: object
+      description: Used by the `redis` monitor type. Sends PING, after AUTH when a password is set.
+      required: [host, port]
+      properties:
+        host: { type: string }
+        port: { type: integer, minimum: 1, maximum: 65535 }
+        tls: { type: boolean, description: Connect over TLS from the first byte. }
+        verifyTls: { type: boolean, default: true, description: Check the certificate chain and host name. }
+        tlsCa: { type: string, description: 'PEM of the authority that signed the server certificate. Empty = the public CAs bundled with Node.js plus NODE_EXTRA_CA_CERTS.' }
+        username: { type: string, description: For Redis ACL users. }
+        password: { type: string }
+        vault: { $ref: '#/components/schemas/VaultRef' }
+    MailConfig:
+      type: object
+      description: Used by the `mail` monitor type. Reads the greeting, upgrades to TLS when asked and signs in when a user name is set.
+      required: [protocol, host, port, security]
+      properties:
+        protocol: { type: string, enum: [smtp, imap, pop3] }
+        host: { type: string }
+        port: { type: integer, minimum: 1, maximum: 65535 }
+        security: { type: string, enum: [none, starttls, tls], description: 'starttls upgrades after the greeting, tls is encrypted from the first byte.' }
+        verifyTls: { type: boolean, default: true }
+        tlsCa: { type: string }
+        username: { type: string }
+        password: { type: string }
+        vault: { $ref: '#/components/schemas/VaultRef' }
+    SshConfig:
+      type: object
+      description: Used by the `ssh` monitor type. Reads the server's identification string; no login.
+      required: [host, port]
+      properties:
+        host: { type: string }
+        port: { type: integer, minimum: 1, maximum: 65535 }
+        expectedBanner: { type: string, maxLength: 255, description: Text the identification string must contain. }
+    TlsCertConfig:
+      type: object
+      description: Used by the `tls` monitor type. Down when the handshake fails, the certificate is untrusted or expired; Degraded inside the warning window.
+      required: [host, port, warnDays]
+      properties:
+        host: { type: string }
+        port: { type: integer, minimum: 1, maximum: 65535 }
+        servername: { type: string, description: Host name for SNI and the host name check; defaults to host. }
+        warnDays: { type: integer, minimum: 1, maximum: 365 }
+        verifyTls: { type: boolean, default: true }
+        tlsCa: { type: string }
+    DomainConfig:
+      type: object
+      description: Used by the `domain` monitor type. The end of the registration comes from RDAP, or WHOIS where the registry has no RDAP.
+      required: [domain, warnDays]
+      properties:
+        domain: { type: string, description: 'The registered domain, for example example.com.' }
+        warnDays: { type: integer, minimum: 1, maximum: 365 }
+    DockerConfig:
+      type: object
+      required: [endpoint, container]
+      properties:
+        endpoint: { type: string, description: 'unix:///var/run/docker.sock, npipe:////./pipe/docker_engine or http(s)://host:port' }
+        container: { type: string, description: Container name or id. }
+
+    Monitor:
+      type: object
+      properties:
+        id: { type: integer }
+        key: { $ref: '#/components/schemas/Key' }
+        name: { type: string }
+        type: { $ref: '#/components/schemas/MonitorType' }
+        intervalSecs: { type: integer }
+        timeoutMs: { type: integer }
+        retries: { type: integer }
+        failureThreshold: { type: integer }
+        recoveryThreshold: { type: integer }
+        autoIncidentMinutes: { type: [integer, 'null'], description: 'Minutes a confirmed outage must last before an incident is opened automatically, 1 to 10080; null = off.' }
+        autoIncidentMode: { type: string, enum: [draft, published], description: 'Whether the automatic incident is a draft (default) or published at once.' }
+        autoIncidentTemplateId: { type: [integer, 'null'], description: 'Incident template for the automatic incident; null = the default template.' }
+        latencyAlertFactor: { type: [number, 'null'], description: 'Times the p95 response time must exceed the monitor''s usual p95 (previous 7 days) to alert as slower than usual, 1.5 to 10; null = off.' }
+        latencyAlertWindowMinutes: { type: integer, description: 'Minutes of recent checks the p95 is taken over, 10 to 240.' }
+        latencyAlertMinDeltaMs: { type: integer, description: 'The p95 must also be at least this many ms above the usual, 0 to 60000.' }
+        latencyAlertSustain: { type: integer, description: 'Consecutive checks that must agree before the alert or its recovery is sent, 1 to 20.' }
+        latencyBaselineP95: { type: [integer, 'null'], description: 'The usual p95 in ms as last measured for the alert; null until it has run once.' }
+        latencyAlertSince: { type: [integer, 'null'], description: 'When the open slower-than-usual alert was confirmed (ms since epoch); null while there is none.' }
+        config: { $ref: '#/components/schemas/MonitorConfig' }
+        tags:
+          type: array
+          items: { $ref: '#/components/schemas/MonitorTag' }
+        group: { type: [string, 'null'], description: 'The group the monitor is listed under in the admin; null = ungrouped.' }
+        currentStatus: { type: string, enum: [up, down, degraded, pending, affected] }
+        lastCheckedAt: { type: [integer, 'null'] }
+        failingSince: { type: [integer, 'null'], description: 'When the current confirmed outage began (ms since epoch); null while the monitor is up or the failure is not confirmed yet. Only set for a down outage.' }
+        activity:
+          type: object
+          description: Only in the list and in the single-monitor response. What is going on around the monitor now.
+          properties:
+            maintenance: { type: boolean, description: A running maintenance window covers the monitor. }
+            windows:
+              type: array
+              description: Running and upcoming maintenance windows that cover the monitor, running ones first; each shows the running or next occurrence.
+              items:
+                type: object
+                properties:
+                  id: { type: integer }
+                  name: { type: string }
+                  description: { type: [string, 'null'] }
+                  startsAt: { type: integer }
+                  endsAt: { type: integer }
+                  recurrence: { $ref: '#/components/schemas/MaintenanceRecurrence' }
+                  recurrenceDays: { type: array, items: { type: integer } }
+                  timezone: { type: string }
+                  recurrenceUntil: { type: [integer, 'null'] }
+            incident: { type: [string, 'null'], enum: [minor, major, critical, null], description: Impact of the worst open, published incident that names the monitor. }
+        health:
+          type: object
+          description: Only in the list. How the monitor did over the last 24 hours.
+          properties:
+            uptime24h: { type: [number, 'null'], description: 'Share of counted checks that passed, in percent (failures inside a maintenance window are left out); null when no check counted.' }
+            avgResponseMs: { type: [number, 'null'], description: Average response time of the timed checks; null when there were none. }
+            responseTrend:
+              type: array
+              description: Average response time per hour, oldest first, 24 entries; null for an hour without a timed check.
+              items: { type: [number, 'null'] }
+            failureRunSince: { type: [integer, 'null'], description: 'When the run of failed checks behind a down or degraded status began (ms since epoch): the first check after the last one that passed, even if the failure was only confirmed later. Not the same as the monitor''s own failingSince.' }
+            latencyRatio: { type: [number, 'null'], description: 'While the slower-than-usual alert is open, the p95 of the latest window over the usual p95; null otherwise.' }
+        webhookToken: { type: [string, 'null'], description: The heartbeat token of a `webhook` monitor. }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+    MonitorCreate:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        key: { $ref: '#/components/schemas/Key' }
+        type: { $ref: '#/components/schemas/MonitorType' }
+        intervalSecs: { type: integer, minimum: 10, maximum: 86400, default: 60 }
+        timeoutMs: { type: integer, minimum: 1000, maximum: 300000, default: 10000 }
+        retries: { type: integer, minimum: 1, maximum: 10, default: 1 }
+        failureThreshold:
+          type: integer
+          default: 1
+          description: Consecutive failed checks before an alert, 1 to 20. A value outside that is clamped, not refused.
+        recoveryThreshold:
+          type: integer
+          default: 1
+          description: Consecutive successful checks before a recovery, 1 to 20. A value outside that is clamped, not refused.
+        autoIncidentMinutes: { type: [integer, 'null'], description: 'Minutes a confirmed outage must last before an incident is opened automatically, 1 to 10080; null = off.' }
+        autoIncidentMode: { type: string, enum: [draft, published], description: 'Whether the automatic incident is a draft (default) or published at once.' }
+        autoIncidentTemplateId: { type: [integer, 'null'], description: 'Incident template for the automatic incident; null = the default template.' }
+        latencyAlertFactor: { type: [number, 'null'], description: 'Times the p95 response time must exceed the monitor''s usual p95 (previous 7 days) to alert as slower than usual, 1.5 to 10; null (default) = off. Refused for the types domain, tls, docker and webhook.' }
+        latencyAlertWindowMinutes: { type: integer, default: 30, description: 'Minutes of recent checks the p95 is taken over, 10 to 240.' }
+        latencyAlertMinDeltaMs: { type: integer, default: 200, description: 'The p95 must also be at least this many ms above the usual, 0 to 60000.' }
+        latencyAlertSustain: { type: integer, default: 3, description: 'Consecutive checks that must agree before the alert or its recovery is sent, 1 to 20.' }
+        config: { $ref: '#/components/schemas/MonitorConfig' }
+        tags:
+          type: array
+          maxItems: 20
+          items: { $ref: '#/components/schemas/MonitorTag' }
+        group: { type: [string, 'null'], maxLength: 60, description: 'The group the monitor is listed under; blank or null = ungrouped.' }
+    MonitorUpdate:
+      type: object
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        type: { $ref: '#/components/schemas/MonitorType' }
+        intervalSecs: { type: integer, minimum: 10, maximum: 86400 }
+        timeoutMs: { type: integer, minimum: 1000, maximum: 300000 }
+        retries: { type: integer, minimum: 1, maximum: 10 }
+        failureThreshold: { type: integer, description: '1 to 20; a value outside that is clamped.' }
+        recoveryThreshold: { type: integer, description: '1 to 20; a value outside that is clamped.' }
+        autoIncidentMinutes: { type: [integer, 'null'], description: 'Minutes a confirmed outage must last before an incident is opened automatically, 1 to 10080; null = off.' }
+        autoIncidentMode: { type: string, enum: [draft, published], description: 'Whether the automatic incident is a draft (default) or published at once.' }
+        autoIncidentTemplateId: { type: [integer, 'null'], description: 'Incident template for the automatic incident; null = the default template.' }
+        latencyAlertFactor: { type: [number, 'null'], description: 'Times the p95 response time must exceed the monitor''s usual p95 to alert as slower than usual, 1.5 to 10; null = off. Changing any latencyAlert field closes an open alert without a notification.' }
+        latencyAlertWindowMinutes: { type: integer, description: '10 to 240.' }
+        latencyAlertMinDeltaMs: { type: integer, description: '0 to 60000.' }
+        latencyAlertSustain: { type: integer, description: '1 to 20.' }
+        config: { $ref: '#/components/schemas/MonitorConfig' }
+        tags:
+          type: array
+          maxItems: 20
+          items: { $ref: '#/components/schemas/MonitorTag' }
+        group: { type: [string, 'null'], maxLength: 60, description: 'The group the monitor is listed under; blank or null = ungrouped.' }
+
+    IncidentStatus:
+      type: string
+      enum: [investigating, identified, monitoring, resolved]
+    IncidentImpact:
+      type: string
+      enum: [minor, major, critical]
+    Incident:
+      type: object
+      additionalProperties: true
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        status: { $ref: '#/components/schemas/IncidentStatus' }
+        impact: { $ref: '#/components/schemas/IncidentImpact' }
+        startedAt: { type: integer }
+        resolvedAt: { type: [integer, 'null'] }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+        draft: { type: boolean, description: A draft is visible to operators only until it is published. }
+        titleTranslations: { type: object, additionalProperties: { type: string }, description: 'The title in other languages, by language code; empty for incidents without translations.' }
+        autoMonitorId: { type: [integer, 'null'], description: The monitor whose outage opened this incident automatically; null for a manual one. }
+    IncidentCreate:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string }
+        status: { $ref: '#/components/schemas/IncidentStatus' }
+        impact: { $ref: '#/components/schemas/IncidentImpact' }
+        startedAt: { type: integer, description: Milliseconds since the epoch; defaults to now. }
+        monitorIds:
+          type: array
+          items: { type: integer }
+        notifySubscribers: { type: boolean, default: true, description: Ignored for a draft; subscribers are told when it is published. }
+        draft: { type: boolean, default: false, description: Create the incident as a draft. }
+    IncidentPatch:
+      type: object
+      properties:
+        title: { type: string }
+        status: { $ref: '#/components/schemas/IncidentStatus' }
+        impact: { $ref: '#/components/schemas/IncidentImpact' }
+        resolvedAt: { type: [integer, 'null'] }
+        notifySubscribers: { type: boolean, default: true }
+        draft: { type: boolean, description: '`false` publishes a draft and notifies subscribers; a published incident cannot go back to a draft.' }
+    IncidentTemplate:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        title: { type: string, description: 'Incident title in the default language; placeholders {{monitor}}, {{duration}}, {{status}}, {{error}}.' }
+        body: { type: string, description: Opening message posted when an automatic incident opens. }
+        resolvedBody: { type: string, description: Message posted when it is resolved automatically. }
+        impact: { $ref: '#/components/schemas/IncidentImpact' }
+        translations: { $ref: '#/components/schemas/IncidentTemplateTranslations' }
+        isDefault: { type: boolean }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+    IncidentTemplateInput:
+      type: object
+      properties:
+        name: { type: string, maxLength: 100 }
+        title: { type: string, maxLength: 200 }
+        body: { type: string, maxLength: 5000 }
+        resolvedBody: { type: string, maxLength: 5000 }
+        impact: { $ref: '#/components/schemas/IncidentImpact' }
+        translations: { $ref: '#/components/schemas/IncidentTemplateTranslations' }
+    IncidentTemplateTranslations:
+      type: object
+      description: 'Wording per language, keyed by language code. Only the status page''s other languages are allowed, not the default one. On a patch it replaces all translations; leave it out to keep them.'
+      additionalProperties:
+        type: object
+        properties:
+          title: { type: string, maxLength: 200 }
+          body: { type: string, maxLength: 5000 }
+          resolvedBody: { type: string, maxLength: 5000 }
+    IncidentUpdateCreate:
+      type: object
+      required: [body, status]
+      properties:
+        body: { type: string }
+        status: { $ref: '#/components/schemas/IncidentStatus' }
+        notifySubscribers: { type: boolean, default: true }
+
+    MaintenanceWindow:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        startsAt: { type: integer }
+        endsAt: { type: integer }
+        description: { type: [string, 'null'] }
+        recurrence: { $ref: '#/components/schemas/MaintenanceRecurrence' }
+        recurrenceDays:
+          type: array
+          items: { type: integer, minimum: 0, maximum: 6 }
+        timezone: { type: string }
+        recurrenceUntil: { type: [integer, 'null'] }
+        occurrence:
+          type: object
+          description: The running occurrence, else the next, else the window's own span.
+          properties:
+            startsAt: { type: integer }
+            endsAt: { type: integer }
+        monitorIds:
+          type: array
+          items: { type: integer }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+    MaintenanceRecurrence:
+      type: string
+      enum: [none, daily, weekly]
+    MaintenanceCreate:
+      type: object
+      required: [name, startsAt, endsAt]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        startsAt: { type: integer, description: Milliseconds since the epoch. }
+        endsAt: { type: integer, description: Milliseconds since the epoch; must be after `startsAt`. }
+        description: { type: [string, 'null'] }
+        recurrence: { $ref: '#/components/schemas/MaintenanceRecurrence' }
+        recurrenceDays: { type: array, items: { type: integer, minimum: 0, maximum: 6 }, description: Required for `weekly`; 0 is Sunday. }
+        timezone: { type: string, default: UTC, description: IANA timezone the time of day of `startsAt` is read in. }
+        recurrenceUntil: { type: [integer, 'null'], description: Last instant an occurrence may start. }
+        monitorIds:
+          type: array
+          items: { type: integer }
+        notifySubscribers: { type: boolean, default: true }
+    MaintenancePatch:
+      type: object
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        startsAt: { type: integer }
+        endsAt: { type: integer }
+        description: { type: [string, 'null'] }
+        recurrence: { $ref: '#/components/schemas/MaintenanceRecurrence' }
+        recurrenceDays: { type: array, items: { type: integer, minimum: 0, maximum: 6 } }
+        timezone: { type: string }
+        recurrenceUntil: { type: [integer, 'null'] }
+        monitorIds:
+          type: array
+          items: { type: integer }
+
+    NotificationChannelType:
+      type: string
+      enum: [email, webhook, discord, teams, slack, telegram, ntfy, pushover, twilio]
+    ChannelAlertPolicy:
+      type: object
+      description: Quiet hours, throttling and grouping. Through the API, missing parts take their defaults (all off) and values out of range are clamped; a configuration file must be in range and may not contain settings other than these.
+      properties:
+        quietHours:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            start: { type: string, description: 'HH:MM' }
+            end: { type: string, description: 'HH:MM' }
+            timezone: { type: string, description: IANA timezone }
+            mode: { type: string, enum: [defer, suppress] }
+        throttle:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            maxAlerts: { type: integer, minimum: 1, maximum: 100 }
+            windowMinutes: { type: integer, minimum: 1, maximum: 1440 }
+        grouping:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            minMonitors: { type: integer, minimum: 2, maximum: 100 }
+            windowSeconds: { type: integer, minimum: 10, maximum: 900 }
+    NotificationChannelConfig:
+      description: |
+        The configuration for the channel's `type`. Webhook URLs of `slack`, `discord` and `teams`, credential headers
+        of `webhook`, the `telegram` bot token, the `ntfy` access token the `pushover` application token and the `twilio` auth token are masked in responses.
+      type: object
+      additionalProperties: true
+      properties:
+        to: { type: string, description: '`email`: the recipient address; `twilio`: the recipient number in international format.' }
+        subject: { type: string }
+        body: { type: string }
+        url: { type: string, description: '`webhook`: the target URL.' }
+        method: { type: string, enum: [GET, POST, PUT, PATCH] }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+        webhookUrl: { type: string, description: '`slack`, `discord` and `teams`: the incoming-webhook URL.' }
+        text: { type: string }
+        botToken: { type: string, description: '`telegram`: the bot token (or use `vault`).' }
+        chatId: { type: string, description: '`telegram`: the chat that receives the messages.' }
+        serverUrl: { type: string, description: '`ntfy`: the server root; `https://ntfy.sh` when omitted.' }
+        topic: { type: string, description: '`ntfy`: the topic to publish to (1 to 64 letters, digits, `-` or `_`).' }
+        accessToken: { type: string, description: '`ntfy`: the access token of a protected topic (or use `vault`).' }
+        appToken: { type: string, description: '`pushover`: the application token (or use `vault`).' }
+        userKey: { type: string, description: '`pushover`: the user or group key that receives the messages.' }
+        accountSid: { type: string, description: '`twilio`: the Account SID (`AC` and 32 hex digits).' }
+        authToken: { type: string, description: '`twilio`: the auth token (or use `vault`).' }
+        from: { type: string, description: '`twilio`: the Twilio number the messages come from, in international format (`+15551234567`).' }
+        mode: { type: string, enum: [sms, call], description: '`twilio`: a text message (default) or a voice call.' }
+        vault: { $ref: '#/components/schemas/VaultRef' }
+    ActionHttpConfig:
+      type: object
+      required: [url, method]
+      properties:
+        url: { type: string, description: 'Starts with http:// or https://. May contain {{variables}}.' }
+        method: { type: string, enum: [GET, POST, PUT, PATCH] }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: Values of headers that look like credentials are masked on read.
+        body: { type: string, description: 'JSON, with {{variables}} inside string values. Not allowed with GET.' }
+        secrets:
+          type: array
+          maxItems: 10
+          description: |
+            Vault secrets the request reads, each under a `name` of letters and digits, used through placeholders in the
+            URL, a header value or the body: `{{secret_<name>}}` for a Secure Value, `{{secret_<name>_username}}`,
+            `{{secret_<name>_password}}` and `{{secret_<name>_basic}}` (Base64 of `user:password`) for a User / Password
+            secret, `{{secret_<name>_<key>}}` for each key of a JSON secret. Every secret needs a placeholder and every
+            placeholder a secret. A placeholder cannot be part of the host of the URL.
+          items:
+            type: object
+            required: [name, vault]
+            properties:
+              name: { type: string, pattern: '^[A-Za-z][A-Za-z0-9]{0,23}$' }
+              vault:
+                type: object
+                required: [vaultId, secretId]
+                properties:
+                  vaultId: { type: integer }
+                  secretId: { type: integer }
+    Action:
+      type: object
+      properties:
+        id: { type: integer }
+        key: { $ref: '#/components/schemas/Key' }
+        name: { type: string }
+        config: { $ref: '#/components/schemas/ActionHttpConfig' }
+        requiresApproval: { type: integer, enum: [0, 1], description: '1: a run of this action waits for an admin to approve it in the admin panel before it is sent.' }
+        approvalTimeoutMinutes: { type: integer, minimum: 1, maximum: 10080, default: 60, description: How long a run waits for approval before it is cancelled. }
+        enabled: { type: integer, enum: [0, 1] }
+        notificationChannelIds: { type: array, items: { type: integer }, description: The notification channels told once a run has failed after its last attempt, and, for a channel that asks for it (`notifyOnActionSuccess` in its config), about a run that succeeded. }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+    ActionCreate:
+      type: object
+      required: [name, config]
+      properties:
+        name: { type: string }
+        key: { $ref: '#/components/schemas/Key' }
+        notificationChannelIds: { type: array, items: { type: integer }, description: Needs the "channels:write" permission for a token. }
+        config: { $ref: '#/components/schemas/ActionHttpConfig' }
+        enabled: { type: integer, enum: [0, 1] }
+        requiresApproval: { type: integer, enum: [0, 1], description: '1: a run of this action waits for an admin to approve it in the admin panel before it is sent.' }
+        approvalTimeoutMinutes: { type: integer, minimum: 1, maximum: 10080, default: 60, description: How long a run waits for approval before it is cancelled. }
+    ActionUpdate:
+      type: object
+      properties:
+        name: { type: string }
+        notificationChannelIds: { type: array, items: { type: integer }, description: Replaces the list. Called failureChannelIds up to 0.6, which is still accepted. Needs the "channels:write" permission for a token. }
+        config: { $ref: '#/components/schemas/ActionHttpConfig' }
+        enabled: { type: integer, enum: [0, 1] }
+        requiresApproval: { type: integer, enum: [0, 1], description: '1: a run of this action waits for an admin to approve it in the admin panel before it is sent.' }
+        approvalTimeoutMinutes: { type: integer, minimum: 1, maximum: 10080, default: 60, description: How long a run waits for approval before it is cancelled. }
+    MonitorAction:
+      type: object
+      required: [actionId, onStatus]
+      properties:
+        actionId: { type: integer }
+        onStatus: { type: string, enum: [down, up] }
+        delayMinutes: { type: integer, minimum: 0, maximum: 10080, default: 0, description: How long the monitor must stay in the status before the action runs. }
+        cooldownMinutes: { type: integer, minimum: 0, maximum: 10080, default: 0, description: The action does not run again for this monitor and status within this many minutes. }
+    ActionRun:
+      type: object
+      properties:
+        id: { type: integer }
+        actionId: { type: integer }
+        actionName: { type: string }
+        monitorId: { type: [integer, 'null'] }
+        monitorName: { type: string }
+        onStatus: { type: string, enum: [down, up] }
+        status: { type: string, enum: [pending, awaiting_approval, succeeded, failed, cancelled] }
+        attemptCount: { type: integer }
+        maxAttempts: { type: integer }
+        nextAttemptAt: { type: [integer, 'null'] }
+        lastAttemptAt: { type: [integer, 'null'] }
+        completedAt: { type: [integer, 'null'] }
+        lastError: { type: [string, 'null'] }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+    NotificationChannel:
+      type: object
+      properties:
+        id: { type: integer }
+        key: { $ref: '#/components/schemas/Key' }
+        name: { type: string }
+        type: { $ref: '#/components/schemas/NotificationChannelType' }
+        config: { $ref: '#/components/schemas/NotificationChannelConfig' }
+        enabled: { type: integer, enum: [0, 1] }
+        notifyOnRecovery: { type: integer, enum: [0, 1] }
+        alertPolicy: { $ref: '#/components/schemas/ChannelAlertPolicy' }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+    NotificationChannelCreate:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string }
+        key: { $ref: '#/components/schemas/Key' }
+        type: { $ref: '#/components/schemas/NotificationChannelType' }
+        config: { $ref: '#/components/schemas/NotificationChannelConfig' }
+        enabled: { type: integer, enum: [0, 1], default: 1 }
+        notifyOnRecovery: { type: integer, enum: [0, 1], default: 0 }
+        alertPolicy: { $ref: '#/components/schemas/ChannelAlertPolicy' }
+    NotificationChannelUpdate:
+      type: object
+      properties:
+        name: { type: string }
+        type: { $ref: '#/components/schemas/NotificationChannelType' }
+        config: { $ref: '#/components/schemas/NotificationChannelConfig' }
+        enabled: { type: integer, enum: [0, 1] }
+        notifyOnRecovery: { type: integer, enum: [0, 1] }
+        alertPolicy: { $ref: '#/components/schemas/ChannelAlertPolicy' }
+
+    LayoutNode:
+      type: object
+      description: |
+        A node of the status page tree. The root is a `page` node; `group` nodes hold `children`. `monitor` and
+        `chart` nodes show the monitor with id `monitorId`.
+      additionalProperties: true
+      required: [id, type]
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [page, group, monitor, text, divider, incidents, chart] }
+        monitorId: { type: integer }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/LayoutNode' }
+
+    ConfigVaultRef:
+      type: object
+      description: A vault secret named instead of numbered. A reference to something that no longer exists reads `(deleted vault 3)`.
+      required: [vault, secret]
+      properties:
+        vault: { type: string }
+        secret: { type: string }
+        fieldMapping:
+          type: object
+          additionalProperties: { type: string }
+    ConfigKind:
+      type: string
+      enum: [Monitor, NotificationChannel, Action]
+    ConfigChannel:
+      type: object
+      description: The export writes every field. A document that is imported needs only `kind`, `key`, `name` and `type`; the rest take their defaults.
+      required: [kind, key, name, type]
+      properties:
+        kind: { type: string, const: NotificationChannel }
+        key: { $ref: '#/components/schemas/Key' }
+        name: { type: string }
+        type: { $ref: '#/components/schemas/NotificationChannelType' }
+        enabled: { type: boolean }
+        notifyOnRecovery: { type: boolean }
+        config:
+          type: object
+          additionalProperties: true
+          description: |
+            The channel's configuration, as in `NotificationChannelConfig`, with secrets masked. A vault reference
+            (`vault`, for example a Telegram bot token) names the vault and the secret instead of numbering them.
+          properties:
+            vault: { $ref: '#/components/schemas/ConfigVaultRef' }
+        alertPolicy: { $ref: '#/components/schemas/ChannelAlertPolicy' }
+    ConfigMonitor:
+      type: object
+      description: The export writes every field. A document that is imported needs only `kind`, `key`, `name` and `type`; the rest take their defaults, and the thresholds must be whole numbers from 1 to 20.
+      required: [kind, key, name, type]
+      properties:
+        kind: { type: string, const: Monitor }
+        key: { $ref: '#/components/schemas/Key' }
+        name: { type: string }
+        type: { $ref: '#/components/schemas/MonitorType' }
+        intervalSecs: { type: integer }
+        timeoutMs: { type: integer }
+        retries: { type: integer }
+        failureThreshold: { type: integer }
+        recoveryThreshold: { type: integer }
+        config:
+          type: object
+          additionalProperties: true
+          description: |
+            The monitor's configuration, as in `MonitorConfig`, with secrets masked. A vault reference (`vault`, also inside `auth.basic`,
+            `auth.oauth2` and `auth.cas`) names the vault and the secret instead of numbering them.
+          properties:
+            vault: { $ref: '#/components/schemas/ConfigVaultRef' }
+        tags:
+          type: array
+          items: { $ref: '#/components/schemas/MonitorTag' }
+        group: { type: string, description: 'Group the monitor is listed under in the admin; absent = ungrouped.' }
+        notifications:
+          type: array
+          description: Keys of the notification channels this monitor alerts through.
+          items: { $ref: '#/components/schemas/Key' }
+        dependsOn:
+          type: array
+          description: Keys of the monitors this monitor depends on.
+          items: { $ref: '#/components/schemas/Key' }
+    ConfigDocument:
+      description: One monitor or notification channel, told apart by `kind`.
+      oneOf:
+        - $ref: '#/components/schemas/ConfigMonitor'
+        - $ref: '#/components/schemas/ConfigChannel'
+      discriminator:
+        propertyName: kind
+    ConfigDocuments:
+      type: string
+      description: One or more YAML documents separated by `---`. Each is a ConfigDocument. A top-level YAML list is refused.
+
+    ConfigImportChange:
+      type: object
+      required: [kind, action]
+      properties:
+        kind: { $ref: '#/components/schemas/ConfigKind' }
+        key: { $ref: '#/components/schemas/Key' }
+        action: { type: string, enum: [create, update, delete, unchanged] }
+        fields:
+          type: array
+          description: For an update, the names of the settings that differ. Never their values, which may be secrets.
+          items: { type: string }
+    ConfigImportResult:
+      type: object
+      required: [dryRun, summary, changes]
+      properties:
+        dryRun: { type: boolean }
+        summary:
+          type: object
+          required: [create, update, unchanged]
+          properties:
+            create: { type: integer }
+            update: { type: integer }
+            unchanged: { type: integer }
+            delete: { type: integer, description: Present only when the request has `prune=true`. }
+        changes:
+          type: array
+          items: { $ref: '#/components/schemas/ConfigImportChange' }
+    ConfigImportError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, description: The first problem. }
+        problems:
+          type: array
+          description: Everything wrong with the file, up to 100 problems.
+          items:
+            type: object
+            required: [path, message]
+            properties:
+              path: { type: string, description: 'Where, for example `Monitor[public-site].dependsOn`.' }
+              message: { type: string }

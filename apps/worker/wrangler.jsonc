@@ -1,0 +1,58 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "status-board",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-22",
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    "directory": "../board/dist",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "env": {
+    "staging": {
+      "name": "status-board-staging",
+      "workers_dev": false,
+      "preview_urls": false,
+      "vars": {
+        "ACCESS_TEAM_DOMAIN": "REPLACE_ACCESS_TEAM_DOMAIN",
+        "ACCESS_AUD": "REPLACE_ACCESS_AUDIENCE",
+        "ENDPOINTS": "[]"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "status-board-staging",
+          "database_id": "REPLACE_STAGING_D1_ID",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "routes": []
+    },
+    "production": {
+      "name": "status-board-production",
+      "workers_dev": false,
+      "preview_urls": false,
+      "vars": {
+        "ACCESS_TEAM_DOMAIN": "",
+        "ACCESS_AUD": "",
+        "ENDPOINTS": "[]"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "status-board-production",
+          "database_id": "REPLACE_PRODUCTION_D1_ID",
+          "migrations_dir": "migrations"
+        }
+      ]
+    }
+  }
+}

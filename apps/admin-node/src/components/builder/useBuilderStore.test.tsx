@@ -1,0 +1,120 @@
+import { beforeEach, describe, expect, it } from 'vitest'
+import { createChartNode, createGroupNode, createIncidentsNode, createMaintenanceNode, createMonitorNode, createTextNode, defaultGrid, findNode, useBuilderStore } from './useBuilderStore'
+
+describe('builder store', () => {
+  beforeEach(() => {
+    useBuilderStore.getState().setTree({ id: 'root', type: 'page', children: [] })
+  })
+
+  it('creates a maintenance block that lists everything, five at most, one row high', () => {
+    expect(createMaintenanceNode()).toEqual({ type: 'maintenance', limit: 5, filter: 'all' })
+    expect(defaultGrid('maintenance')).toEqual({ x: 0, y: 0, w: 3, h: 1 })
+  })
+
+  it('adds, updates, selects, and deletes nodes', () => {
+    const store = useBuilderStore.getState()
+    store.addNode('root', { ...createGroupNode('Services'), grid: defaultGrid('group') })
+    const group = useBuilderStore.getState().tree.children[0]!
+    if (group.type !== 'group') throw new Error('Group missing')
+    useBuilderStore.getState().addNode(group.id, createMonitorNode(7))
+    const updatedGroup = useBuilderStore.getState().tree.children[0]!
+    if (updatedGroup.type !== 'group') throw new Error('Group missing')
+    const monitor = findNode(useBuilderStore.getState().tree.children, updatedGroup.children[0]!.id)
+    expect(monitor?.type).toBe('monitor')
+
+    useBuilderStore.getState().updateNode(group.id, { label: 'Core services' })
+    expect(findNode(useBuilderStore.getState().tree.children, group.id)?.label).toBe('Core services')
+    useBuilderStore.getState().selectNode(group.id)
+    useBuilderStore.getState().deleteNode(group.id)
+    expect(useBuilderStore.getState().selectedId).toBeNull()
+    expect(useBuilderStore.getState().tree.children).toEqual([])
+  })
+
+  it('moves monitors into groups and reorders children', () => {
+    const store = useBuilderStore.getState()
+    store.addNode('root', { ...createGroupNode('Group'), grid: defaultGrid('group') })
+    store.addNode('root', { ...createMonitorNode(1), grid: { x: 0, y: 1, w: 1, h: 1 } })
+    store.addNode('root', { ...createMonitorNode(2), grid: { x: 1, y: 1, w: 1, h: 1 } })
+    const [group, first, second] = useBuilderStore.getState().tree.children
+    useBuilderStore.getState().moveToGroup(first!.id, group!.id)
+    useBuilderStore.getState().moveToGroup(second!.id, group!.id)
+    const grouped = findNode(useBuilderStore.getState().tree.children, group!.id)
+    if (!grouped || grouped.type !== 'group') throw new Error('Group missing')
+    expect(grouped.children.map((node) => node.type === 'monitor' && node.monitorId)).toEqual([1, 2])
+    useBuilderStore.getState().reorderGroupChildren(group!.id, grouped.children[0]!.id, grouped.children[1]!.id)
+    const reordered = findNode(useBuilderStore.getState().tree.children, group!.id)
+    if (!reordered || reordered.type !== 'group') throw new Error('Group missing')
+    expect(reordered.children.map((node) => node.type === 'monitor' && node.monitorId)).toEqual([2, 1])
+  })
+
+  it('moves text blocks into groups but not blocks a group cannot show', () => {
+    const store = useBuilderStore.getState()
+    store.addNode('root', { ...createGroupNode('Group'), grid: defaultGrid('group') })
+    store.addNode('root', { ...createTextNode(), grid: { x: 0, y: 1, w: 3, h: 2 } })
+    store.addNode('root', { ...createIncidentsNode(), grid: { x: 0, y: 3, w: 3, h: 1 } })
+    const [group, text, incidents] = useBuilderStore.getState().tree.children
+    useBuilderStore.getState().moveToGroup(text!.id, group!.id)
+    useBuilderStore.getState().moveToGroup(incidents!.id, group!.id)
+
+    const { children } = useBuilderStore.getState().tree
+    expect(children.map((n) => n.id)).toEqual([group!.id, incidents!.id])
+    const grouped = children[0]!
+    if (grouped.type !== 'group') throw new Error('Group missing')
+    expect(grouped.children.map((n) => n.type)).toEqual(['text'])
+    expect(grouped.children[0]!.grid).toBeUndefined()
+  })
+
+  it('moves a chart into a group', () => {
+    const store = useBuilderStore.getState()
+    store.addNode('root', { ...createGroupNode('Group'), grid: defaultGrid('group') })
+    store.addNode('root', { ...createChartNode(1), grid: { x: 0, y: 1, w: 3, h: 1 } })
+    const [group, chart] = useBuilderStore.getState().tree.children
+    useBuilderStore.getState().moveToGroup(chart!.id, group!.id)
+
+    const { children } = useBuilderStore.getState().tree
+    expect(children.map((n) => n.id)).toEqual([group!.id])
+    const grouped = children[0]!
+    if (grouped.type !== 'group') throw new Error('Group missing')
+    expect(grouped.children).toMatchObject([{ type: 'chart', monitorId: 1, chartH: 5 }])
+    expect(grouped.children[0]!.grid).toBeUndefined()
+  })
+
+  it('moves a group child back onto the canvas, shifting the rows below', () => {
+    const store = useBuilderStore.getState()
+    store.addNode('root', { ...createGroupNode('Group'), grid: { x: 0, y: 0, w: 1, h: 3 } })
+    store.addNode('root', { ...createMonitorNode(2), grid: { x: 0, y: 3, w: 1, h: 1 } })
+    const [group, below] = useBuilderStore.getState().tree.children
+    useBuilderStore.getState().addNode(group!.id, createMonitorNode(1))
+    const childId = (findNode(useBuilderStore.getState().tree.children, group!.id) as { children: { id: string }[] }).children[0]!.id
+
+    useBuilderStore.getState().moveOutOfGroup(childId, { x: 1, y: 3, w: 1, h: 1 })
+    const { tree, isDirty } = useBuilderStore.getState()
+    const emptied = findNode(tree.children, group!.id)
+    if (!emptied || emptied.type !== 'group') throw new Error('Group missing')
+    expect(emptied.children).toEqual([])
+    expect(tree.children.find((n) => n.id === childId)?.grid).toEqual({ x: 1, y: 3, w: 1, h: 1 })
+    expect(tree.children.find((n) => n.id === below!.id)?.grid?.y).toBe(4)
+    expect(isDirty).toBe(true)
+  })
+
+  it('applies grid layouts and shifts rows when inserting', () => {
+    useBuilderStore.getState().addNode('root', { ...createMonitorNode(1), grid: { x: 0, y: 1, w: 1, h: 1 } })
+    const node = useBuilderStore.getState().tree.children[0]!
+    useBuilderStore.getState().applyGridLayout([{ i: node.id, x: 2, y: 3, w: 1, h: 2 }])
+    expect(useBuilderStore.getState().tree.children[0]!.grid).toEqual({ x: 2, y: 3, w: 1, h: 2 })
+    useBuilderStore.getState().insertRootNode({ ...createMonitorNode(2), grid: { x: 0, y: 3, w: 1, h: 1 } }, 3)
+    expect(useBuilderStore.getState().tree.children[0]!.grid?.y).toBe(4)
+    expect(useBuilderStore.getState().isDirty).toBe(true)
+  })
+
+  it('ignores a grid layout from before a block was dropped in, so it does not undo the shift', () => {
+    useBuilderStore.getState().addNode('root', { ...createMonitorNode(1), grid: { x: 0, y: 3, w: 1, h: 1 } })
+    const first = useBuilderStore.getState().tree.children[0]!
+    useBuilderStore.getState().insertRootNode({ ...createMonitorNode(2), grid: { x: 0, y: 3, w: 1, h: 1 } }, 3)
+    expect(useBuilderStore.getState().tree.children[0]!.grid?.y).toBe(4)
+
+    // The grid still reports the layout without the new block.
+    useBuilderStore.getState().applyGridLayout([{ i: first.id, x: 0, y: 3, w: 1, h: 1 }])
+    expect(useBuilderStore.getState().tree.children[0]!.grid?.y).toBe(4)
+  })
+})

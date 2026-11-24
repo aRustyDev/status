@@ -1,0 +1,319 @@
+name: CI
+
+# Documentation-only changes skip CI. docs/changelog.md is baked into the image and parsed by the
+# app, and docs/public/openapi.yaml is checked by an API test, so both still trigger it.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**/*.md'
+      - 'docs/src/**'
+      - 'README*.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '!docs/changelog.md'
+  pull_request:
+    paths-ignore:
+      - 'docs/**/*.md'
+      - 'docs/src/**'
+      - 'README*.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '!docs/changelog.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast checks that need no browser: they fail first.
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Shared modules come from npm, at one version
+        run: npm run check:kit
+
+      - name: Test temporary attestation recovery
+        run: node --test scripts/attestation-recovery/*.test.cjs
+
+      - name: Signatures of the installed packages
+        run: NODE_OPTIONS="--require ./scripts/attestation-recovery/preload.cjs" npm audit signatures
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Icon fonts hold the icons in use
+        run: npm run check:icons
+
+      - name: Import cycles through kit/
+        run: npm run check:cycles
+
+      # The build compiles the sources only; this also checks the tests and the end-to-end scenarios.
+      - name: Type-check tests
+        run: npm run typecheck
+
+  # Both suites fail the job when coverage drops below the thresholds (API: package.json
+  # test:api:coverage, frontend: vitest.config.ts).
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: API tests with coverage
+        run: npm run test:api:coverage
+
+      - name: Frontend tests with coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The scenarios start the sources with tsx and Vite, which read the built shared package.
+      - name: Build shared package
+        run: npm run build -w @bsp/shared
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end tests
+        run: npm run test:e2e
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-reports
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+
+  cloudflare-board:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check Workers
+        run: |
+          npm run typecheck -w @status/worker
+          npm run typecheck -w @status/probe
+
+      - name: Worker API and signing-key tests using local D1 and workerd
+        env:
+          USE_WORKERS_D1: '1'
+        run: npm run test -w @status/worker
+
+      - name: Scheduled probe tests
+        run: npm run test -w @status/probe
+
+      - name: Gateway routing tests
+        run: node --import tsx --test apps/gateway/test/*.test.mts
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Status page layout comparison regression
+        run: |
+          npm run build -w @bsp/shared
+          npm run test:e2e -w @bsp/status
+
+      - name: Board browser and Worker integration tests
+        run: npm run test:e2e -w @bsp/board
+
+      - name: Upload board test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cloudflare-board-test-reports
+          path: |
+            apps/board/playwright-report/
+            apps/board/test-results/
+          if-no-files-found: ignore
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+  # The image is published for amd64 and arm64, so the smoke test runs natively on both.
+  docker-smoke:
+    name: docker-smoke (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: better-status-page:test
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Set up Node.js for browser smoke test
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install test dependencies and Chromium
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Start container
+        run: >-
+          docker run -d --name bsp-smoke -p 3000:3000
+          -v bsp-smoke-data:/app/data
+          -e JWT_SECRET=smoke-jwt-secret-with-sufficient-entropy
+          -e COOKIE_SECURE=false
+          -e VAULT_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          better-status-page:test
+
+      - name: Verify health and setup endpoints
+        run: |
+          for i in {1..30}; do
+            if curl --fail http://127.0.0.1:3000/health && curl --fail http://127.0.0.1:3000/api/v1/setup/status; then
+              curl --fail --silent --show-error --head http://127.0.0.1:3000/ \
+                | grep --ignore-case --quiet '^content-security-policy:'
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs bsp-smoke
+          exit 1
+
+      - name: Verify the apps and the unprivileged user
+        run: |
+          curl --fail --silent --show-error --output /dev/null http://127.0.0.1:3000/
+          curl --fail --silent --show-error --output /dev/null http://127.0.0.1:3000/admin/
+          test "$(docker exec bsp-smoke id -u)" != 0
+          docker exec bsp-smoke sh -c 'touch /app/data/.write-check && rm /app/data/.write-check'
+
+      - name: Exercise Node setup, login, and reader in a browser
+        run: node scripts/test-node-docker.mjs
+
+      # A restart on the same volume has to come up healthy. The database file is not checked: it is opened on
+      # first use, so before the setup it does not exist yet.
+      - name: Restart on the same volume
+        run: |
+          docker restart bsp-smoke
+          for i in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:3000/health && curl --fail --silent http://127.0.0.1:3000/api/v1/setup/status; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs bsp-smoke
+          exit 1
+
+  # One check to require in the branch protection rules: it passes only when every job above did.
+  quality:
+    if: always()
+    needs: [static, unit, e2e, cloudflare-board, build, docker-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+
+    steps:
+      - name: Check the results
+        run: |
+          echo '${{ toJSON(needs) }}'
+          test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = false

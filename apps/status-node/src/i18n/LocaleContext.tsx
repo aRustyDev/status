@@ -1,0 +1,96 @@
+import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react'
+import { resolveTranslation, type TranslationKey } from '@bsp/shared'
+import { safeLocalStorage, type LocaleSummary } from '@better-forge/contracts'
+import { getJSON } from '../api'
+
+const LS_KEY = 'bsp-locale'
+
+type TFn = (key: TranslationKey, params?: Record<string, string | number>) => string
+
+interface LocaleCtx {
+  locale: string
+  availableLocales: LocaleSummary[]
+  t: TFn
+  setLocale: (code: string) => void
+}
+
+function translate(
+  code: string,
+  translations: Partial<Record<TranslationKey, string>>,
+  key: TranslationKey,
+  params?: Record<string, string | number>,
+): string {
+  let value = resolveTranslation(code, translations, key)
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      value = value.replace(`{${k}}`, String(v))
+    }
+  }
+  return value
+}
+
+const Context = createContext<LocaleCtx>({
+  locale: 'en',
+  availableLocales: [],
+  t: (key, params) => translate('en', {}, key, params),
+  setLocale: () => {},
+})
+
+export function useLocale() {
+  return useContext(Context)
+}
+
+export function LocaleProvider({ children }: { children: ReactNode }) {
+  const [availableLocales, setAvailableLocales] = useState<LocaleSummary[]>([])
+  const [locale, setLocaleState] = useState<string>(() => safeLocalStorage.get(LS_KEY) ?? 'en')
+  const [translations, setTranslations] = useState<Partial<Record<TranslationKey, string>>>({})
+
+  // Fetch list of available locales; determine active locale if not yet set
+  useEffect(() => {
+    getJSON<LocaleSummary[]>('/api/v1/public/locales')
+      .then((data) => {
+        if (!Array.isArray(data) || data.length === 0) return
+        setAvailableLocales(data)
+
+        const saved = safeLocalStorage.get(LS_KEY)
+        if (saved && data.find((l) => l.code === saved)) {
+          // User previously chose a language — keep it
+          return
+        }
+        // No saved preference: use the locale marked as default, fallback to 'en'
+        const defaultLocale = data.find((l) => l.isDefault === 1) ?? data.find((l) => l.code === 'en') ?? data[0]!
+        setLocaleState(defaultLocale.code)
+      })
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    document.documentElement.lang = locale
+  }, [locale])
+
+  // Fetch translations whenever active locale changes
+  useEffect(() => {
+    if (!locale) {
+      setTranslations({})
+      return
+    }
+    getJSON<{ translations?: Partial<Record<TranslationKey, string>> }>(`/api/v1/public/locales/${locale}`)
+      .then((data) => {
+        setTranslations(data.translations ?? {})
+      })
+      .catch(() => setTranslations({}))
+  }, [locale])
+
+  const setLocale = useCallback((code: string) => {
+    safeLocalStorage.set(LS_KEY, code)
+    setLocaleState(code)
+  }, [])
+
+  const t: TFn = useCallback((key, params) => translate(locale, translations, key, params), [locale, translations])
+
+  return (
+    <Context.Provider value={{ locale, availableLocales, t, setLocale }}>
+      {children}
+    </Context.Provider>
+  )
+}
