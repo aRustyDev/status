@@ -119,4 +119,8 @@ test('fails closed on an unavailable export and malformed backup identifiers', a
   globalThis.fetch = async () => Response.json({ success: false, errors: [{ message: 'private-token' }] }, { status: 403 })
   await assert.rejects(beginExport(env), error => error instanceof Error && !error.message.includes('private-token'))
   assert.equal((await backupService(request('/backups/../../download'),env)).status, 404)
+  globalThis.fetch = async () => { throw new Error('private-token in network exception') }
+  await assert.rejects(beginExport(env), error => error instanceof Error && error.message === 'D1 export could not be started')
+  globalThis.fetch = async () => new Response('private-token in malformed JSON')
+  await assert.rejects(finishExport(env,id,'checkpoint'), error => error instanceof Error && error.message === 'D1 export is unavailable')
 })

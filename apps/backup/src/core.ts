@@ -80,21 +80,29 @@ export async function backupService(request: Request, env: BackupEnv): Promise<R
 }
 
 export async function beginExport(env: BackupEnv): Promise<string> {
-  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/d1/database/${env.DATABASE_ID}/export`, {
-    method: 'POST', headers: { Authorization: `Bearer ${env.D1_EXPORT_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ output_format: 'polling' }),
-  })
+  let response: Response
+  try {
+    response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/d1/database/${env.DATABASE_ID}/export`, {
+      method: 'POST', headers: { Authorization: `Bearer ${env.D1_EXPORT_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ output_format: 'polling' }),
+    })
+  } catch { throw new Error('D1 export could not be started') }
   if (!response.ok) throw new Error('D1 export could not be started')
-  const body = await response.json() as { success?: boolean; result?: { at_bookmark?: unknown } }
+  let body: { success?: boolean; result?: { at_bookmark?: unknown } }
+  try { body = await response.json() as typeof body } catch { throw new Error('D1 export could not be started') }
   if (!body.success || typeof body.result?.at_bookmark !== 'string' || !body.result.at_bookmark) throw new Error('D1 export could not be started')
   return body.result.at_bookmark
 }
 export async function finishExport(env: BackupEnv, id: string, bookmark: string): Promise<void> {
   if (!KEY.test(id)) throw new Error('Invalid backup identifier')
-  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/d1/database/${env.DATABASE_ID}/export`, {
-    method: 'POST', headers: { Authorization: `Bearer ${env.D1_EXPORT_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ output_format: 'polling', current_bookmark: bookmark }),
-  })
+  let response: Response
+  try {
+    response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/d1/database/${env.DATABASE_ID}/export`, {
+      method: 'POST', headers: { Authorization: `Bearer ${env.D1_EXPORT_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ output_format: 'polling', current_bookmark: bookmark }),
+    })
+  } catch { throw new Error('D1 export is unavailable') }
   if (!response.ok) throw new Error('D1 export is unavailable')
-  const result = await response.json() as { success?: boolean; result?: { signed_url?: unknown } }
+  let result: { success?: boolean; result?: { signed_url?: unknown } }
+  try { result = await response.json() as typeof result } catch { throw new Error('D1 export is unavailable') }
   if (!result.success || typeof result.result?.signed_url !== 'string') throw new Error('D1 export is not ready')
   let signed: URL
   try { signed = new URL(result.result.signed_url) }
