@@ -8,7 +8,7 @@ trap 'rm -f "$log"' EXIT
 
 for attempt in 1 2 3; do
   NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require ./scripts/attestation-recovery/preload.cjs" \
-    npm audit signatures --maxsockets=1000 >"$log" 2>&1
+    npm audit signatures --maxsockets=1000 --loglevel=verbose >"$log" 2>&1
   status=$?
   cat "$log"
   if [ "$status" -eq 0 ]; then

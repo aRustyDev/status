@@ -15,7 +15,7 @@ const fs = require('node:fs');
 const file = process.env.FAKE_AUDIT_COUNT;
 const n = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) : 0;
 fs.writeFileSync(file, String(n + 1));
-if (process.argv.slice(2).join(' ') !== 'audit signatures --maxsockets=1000' || !process.env.NODE_OPTIONS.includes('--require ./scripts/attestation-recovery/preload.cjs')) process.exit(99);
+if (process.argv.slice(2).join(' ') !== 'audit signatures --maxsockets=1000 --loglevel=verbose' || !process.env.NODE_OPTIONS.includes('--require ./scripts/attestation-recovery/preload.cjs')) process.exit(99);
 const outcome = JSON.parse(process.env.FAKE_AUDIT_OUTCOMES)[n] || JSON.parse(process.env.FAKE_AUDIT_OUTCOMES).at(-1);
 console.error(outcome.message);
 process.exit(outcome.status);
