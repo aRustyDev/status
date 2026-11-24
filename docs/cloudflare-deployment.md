@@ -72,7 +72,7 @@ After the board is deployed and protected by Access, the intended administrator 
 
 ## Audit history
 
-The administrator-only Audit Log lists application mutations, including monitor, check, incident, maintenance, and role changes. It does not record Cloudflare Access sign-ins or denied requests; use Access logs for those events. Filters and pagination use the operations API, and details are restricted to an allowlist of non-sensitive values. Names, incident text, endpoint identifiers, check configuration and credentials are not included in new audit details. Existing records are filtered on read, but their stored values are not rewritten; treat database access and backups accordingly. Deploy both operations and monitoring Workers to apply the new recording rules to both mutation paths.
+The administrator-only Audit Log lists application mutations, including monitor, check, incident, maintenance, and role changes. It does not record Cloudflare Access sign-ins or denied requests; use Access logs for those events. Filters and pagination use the operations API, and details are restricted to an allowlist of non-sensitive values. Check events retain the associated monitor UUID and basic scheduling and status settings. Names, incident text, endpoint identifiers, advanced check configuration and credentials are not included in new audit details. Existing records are filtered on read, but their stored values are not rewritten; treat database access and backups accordingly. Deploy both operations and monitoring Workers to apply the new recording rules to both mutation paths.
 
 ## Staging verification
 

@@ -114,6 +114,8 @@ function safeAuditDetails(input: unknown): Json {
   for (const key of ['position', 'version', 'startsAt', 'endsAt', 'intervalMinutes', 'expectedStatus']) {
     if (Number.isSafeInteger(value[key]) && Number(value[key]) >= 0) result[key] = value[key]
   }
+  // Only retain a validated monitor UUID, never an arbitrary user-supplied string.
+  if (typeof value.componentId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.componentId)) result.componentId = value.componentId
   if (typeof value.enabled === 'boolean') result.enabled = value.enabled
   return result
 }
@@ -143,7 +145,7 @@ async function auditPage(db: D1Database, request: Request): Promise<Response> {
   }
   const where = clauses.join(' AND ')
   const count = await stmt(db, `SELECT COUNT(*) AS count FROM audit_events WHERE ${where}`, ...values).first<{count:number}>()
-  const rows = await stmt(db, `SELECT id, actor_email AS userEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS timestamp, details FROM audit_events WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`, ...values, limit, (page - 1) * limit).all<{id:string; userEmail:string; action:string; entityType:string; entityId:string; timestamp:number; details:string}>()
+  const rows = await stmt(db, `SELECT id, actor_email AS userEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS timestamp, details FROM audit_events WHERE ${where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`, ...values, limit, (page - 1) * limit).all<{id:string; userEmail:string; action:string; entityType:string; entityId:string; timestamp:number; details:string}>()
   const total = count?.count ?? 0
   return json({ entries: rows.results.map(({ details, ...row }) => ({ ...row, entityName: row.entityId, diff: parsedAuditDetails(details) })), total, page, limit, pages: Math.max(1, Math.ceil(total / limit)) })
 }
@@ -501,12 +503,12 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (!Number.isInteger(body.expectedStatus) || Number(body.expectedStatus) < 100 || Number(body.expectedStatus) > 599) bad('Invalid expectedStatus')
     if (method === 'POST') {
       const checkId = id()
-      const replay = await commitMutation(db,[stmt(db, 'INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,config_version) VALUES (?,?,?,?,?,?,1)',checkId,componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus),audit(db,user,'create','check',checkId,{componentId,endpointId})],receipt,checkId,1,201,'SELECT 1 FROM http_checks WHERE id=?',[checkId])
+      const replay = await commitMutation(db,[stmt(db, 'INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,config_version) VALUES (?,?,?,?,?,?,1)',checkId,componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus),audit(db,user,'create','check',checkId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus})],receipt,checkId,1,201,'SELECT 1 FROM http_checks WHERE id=?',[checkId])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:checkId,version:1},201)
     }
     const token = id()
-    const replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=?',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,version(body)),[audit(db,user,'update','check',recordId,{componentId,endpointId},{table:'http_checks',token})],receipt,recordId,Number(body.version)+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
+    const replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=?',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,version(body)),[audit(db,user,'update','check',recordId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus},{table:'http_checks',token})],receipt,recordId,Number(body.version)+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
     if (replay) return replayReceipt(db, receipt!, replay)
     return json({id:recordId,version:Number(body.version)+1})
   }
@@ -703,7 +705,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     if (checkData && checkData.changed) {
       if (!current) operations.push(stmt(db, `INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,advanced_config) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.id, componentId, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, componentId, token))
       else operations.push(stmt(db, `UPDATE http_checks SET endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,advanced_config=?, config_version=config_version + CASE WHEN advanced_config IS ? THEN 1 ELSE 0 END,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, checkData.advancedConfig, token, current.id, current.config_version, componentId, token))
-      operations.push(audit(db, user, current ? 'update' : 'create', 'check', checkData.id, { enabled: checkData.enabled, intervalMinutes: checkData.intervalMinutes, expectedStatus: checkData.expectedStatus }, { table: 'components', id: componentId, token }))
+      operations.push(audit(db, user, current ? 'update' : 'create', 'check', checkData.id, { componentId, enabled: checkData.enabled, intervalMinutes: checkData.intervalMinutes, expectedStatus: checkData.expectedStatus }, { table: 'components', id: componentId, token }))
     }
     operations.push(audit(db, user, creating ? 'create' : 'update', 'component', componentId, { name, status: manualStatus, position }, { table: 'components', token }))
     operations.push(receiptFinish(db, receipt, token, creating ? 201 : 200, componentId, componentVersion + 1, 'SELECT 1 FROM components WHERE id=? AND mutation_key=?', [componentId, token], 'component'))
