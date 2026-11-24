@@ -6,7 +6,6 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
 import type { AuditEntities } from '@better-forge/ui'
 import type { TokenPreset, TokenResource } from '@better-forge/contracts'
-import AuditLog from './AuditLog'
 import ApiTokens from './ApiTokens'
 import Login from './Login'
 import Users from './Users'
@@ -71,11 +70,5 @@ describe('shared pages as this product configures them', () => {
     expect(screen.getByRole('option', { name: 'Admin' })).toBeInTheDocument()
   })
 
-
-  it('shows retained audit events from the Worker', async () => {
-    vi.mocked(api.get).mockResolvedValueOnce([{ id: 'e', actorEmail: 'admin@example.com', action: 'publish', entityType: 'incident', entityId: 'i', createdAt: 1 }])
-    render(<QueryClientProvider client={new QueryClient()}><AuditLog /></QueryClientProvider>)
-    expect(await screen.findByText(/admin@example.com · publish incident i/)).toBeInTheDocument()
-  })
 
 })

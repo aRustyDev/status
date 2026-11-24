@@ -103,10 +103,54 @@ function requireRole(user: User, role: Role) {
   if (roles[user.role] < roles[role]) throw new HttpError(403, 'Insufficient role')
 }
 function stmt(db: D1Database, sql: string, ...params: unknown[]): D1PreparedStatement { return db.prepare(sql).bind(...params) }
-function audit(db: D1Database, user: User, action: string, entityType: string, entityId: string, details: Json, guard?: { table: string; token: string }): D1PreparedStatement {
-  const values = [id(), user.email, action, entityType, entityId, Date.now(), JSON.stringify(details)]
+// Audit output is deliberately an allowlist: older records may contain arbitrary
+// user-supplied text or credentials, and new records must not persist them.
+function safeAuditDetails(input: unknown): Json {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
+  const value = input as Json
+  const result: Json = {}
+  const enums: Record<string, string[]> = { status: [...healthStatuses, ...incidentStatuses], impact: impacts, role: ['viewer', 'operator', 'admin'] }
+  for (const [key, choices] of Object.entries(enums)) if (typeof value[key] === 'string' && choices.includes(value[key] as string)) result[key] = value[key]
+  for (const key of ['position', 'version', 'startsAt', 'endsAt', 'intervalMinutes', 'expectedStatus']) {
+    if (Number.isSafeInteger(value[key]) && Number(value[key]) >= 0) result[key] = value[key]
+  }
+  if (typeof value.enabled === 'boolean') result.enabled = value.enabled
+  return result
+}
+function parsedAuditDetails(value: unknown): Json {
+  try { return safeAuditDetails(JSON.parse(String(value))) } catch { return {} }
+}
+async function auditPage(db: D1Database, request: Request): Promise<Response> {
+  const params = new URL(request.url).searchParams
+  const number = (key: string, fallback: number, min: number, max: number) => {
+    const raw = params.get(key)
+    if (raw === null) return fallback
+    if (!/^\d+$/.test(raw)) return bad(`Invalid ${key}`)
+    const result = Number(raw)
+    if (!Number.isSafeInteger(result) || result < min || result > max) return bad(`Invalid ${key}`)
+    return result
+  }
+  const page = number('page', 1, 1, 1000000), limit = number('limit', 50, 1, 100)
+  const from = number('from', 0, 0, Number.MAX_SAFE_INTEGER), to = number('to', Number.MAX_SAFE_INTEGER, 0, Number.MAX_SAFE_INTEGER)
+  if (from > to) return bad('Invalid date range')
+  const clauses = ['created_at>=?', 'created_at<=?'], values: unknown[] = [from, to]
+  for (const [key, column] of [['userEmail', 'actor_email'], ['entityType', 'entity_type'], ['action', 'action']] as const) {
+    const value = params.get(key)
+    if (value === null || value === '') continue
+    if (value.length > 200) return bad(`Invalid ${key}`)
+    if (key === 'userEmail') { clauses.push(`${column} LIKE ? ESCAPE '\\'`); values.push(`%${value.replace(/[\\%_]/g, '\\$&')}%`) }
+    else { clauses.push(`${column}=?`); values.push(value) }
+  }
+  const where = clauses.join(' AND ')
+  const count = await stmt(db, `SELECT COUNT(*) AS count FROM audit_events WHERE ${where}`, ...values).first<{count:number}>()
+  const rows = await stmt(db, `SELECT id, actor_email AS userEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS timestamp, details FROM audit_events WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`, ...values, limit, (page - 1) * limit).all<{id:string; userEmail:string; action:string; entityType:string; entityId:string; timestamp:number; details:string}>()
+  const total = count?.count ?? 0
+  return json({ entries: rows.results.map(({ details, ...row }) => ({ ...row, entityName: row.entityId, diff: parsedAuditDetails(details) })), total, page, limit, pages: Math.max(1, Math.ceil(total / limit)) })
+}
+function audit(db: D1Database, user: User, action: string, entityType: string, entityId: string, details: Json, guard?: { table: string; token: string; id?: string }): D1PreparedStatement {
+  const values = [id(), user.email, action, entityType, entityId, Date.now(), JSON.stringify(safeAuditDetails(details))]
   if (!guard) return stmt(db, 'INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) VALUES (?, ?, ?, ?, ?, ?, ?)', ...values)
-  return stmt(db, `INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ${guard.table} WHERE id=? AND mutation_key=?)`, ...values, entityId, guard.token)
+  return stmt(db, `INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ${guard.table} WHERE id=? AND mutation_key=?)`, ...values, guard.id ?? entityId, guard.token)
 }
 async function replayReceipt(db: D1Database, ctx: ReceiptContext, row: Receipt): Promise<Response> {
   const body = ctx.body, id = row.result_id, version = row.result_version
@@ -270,7 +314,10 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (resource === 'maintenance' && !recordId) return json(await listMaintenance(db, true))
     if (resource === 'components' && !recordId) return json(await listComponents(db, await listIncidents(db, false), await listMaintenance(db, false), env))
     if (resource === 'users' && !recordId) return json((await db.prepare('SELECT id, email, role, version FROM users ORDER BY email').all()).results)
-    if (resource === 'audit' && !recordId) return json((await db.prepare('SELECT id, actor_email AS actorEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS createdAt, details FROM audit_events ORDER BY created_at DESC LIMIT 200').all()).results)
+    if (resource === 'audit' && !recordId) {
+      const rows = await db.prepare('SELECT id, actor_email AS actorEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS createdAt, details FROM audit_events ORDER BY created_at DESC LIMIT 200').all<Row>()
+      return json(rows.results.map(row => ({ ...row, details: JSON.stringify(parsedAuditDetails(row.details)) })))
+    }
     if (resource === 'checks' && !recordId) {
       const checks = (await db.prepare('SELECT id, component_id AS componentId, endpoint_id AS endpointId, enabled, interval_minutes AS intervalMinutes, expected_status AS expectedStatus, config_version AS version, advanced_config AS advancedConfig FROM http_checks').all<Row>()).results
       return json(checks.map(check => {
@@ -486,6 +533,10 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   const db = env.DB
   const method = request.method
   const route = path.slice('/api/v1/bsp'.length)
+  if (route === '/admin/audit-log' && method === 'GET') {
+    requireRole(user, 'admin')
+    return auditPage(db, request)
+  }
   const aliasRows = await db.prepare('SELECT alias, entity_type, entity_id FROM entity_aliases').all<{alias:number;entity_type:string;entity_id:string}>()
   const aliases = aliasRows.results
   const refreshAliases = async () => {
@@ -652,6 +703,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     if (checkData && checkData.changed) {
       if (!current) operations.push(stmt(db, `INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,advanced_config) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.id, componentId, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, componentId, token))
       else operations.push(stmt(db, `UPDATE http_checks SET endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,advanced_config=?, config_version=config_version + CASE WHEN advanced_config IS ? THEN 1 ELSE 0 END,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, checkData.advancedConfig, token, current.id, current.config_version, componentId, token))
+      operations.push(audit(db, user, current ? 'update' : 'create', 'check', checkData.id, { enabled: checkData.enabled, intervalMinutes: checkData.intervalMinutes, expectedStatus: checkData.expectedStatus }, { table: 'components', id: componentId, token }))
     }
     operations.push(audit(db, user, creating ? 'create' : 'update', 'component', componentId, { name, status: manualStatus, position }, { table: 'components', token }))
     operations.push(receiptFinish(db, receipt, token, creating ? 201 : 200, componentId, componentVersion + 1, 'SELECT 1 FROM components WHERE id=? AND mutation_key=?', [componentId, token], 'component'))
