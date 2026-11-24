@@ -153,6 +153,21 @@ it('rejects invalid ranges before Test or Save without losing the draft', async 
   expect(api.patch).not.toHaveBeenCalled()
 })
 
+it('preserves configured checks when a new monitor has no approved destination', async () => {
+  const user = userEvent.setup()
+  renderModal(null)
+  await user.type(await screen.findByLabelText('Name'), 'Unsaved check')
+  await user.click(screen.getByRole('button', { name: 'Checks' }))
+  await user.click(screen.getByRole('button', { name: 'Add status range' }))
+  await user.click(screen.getByRole('button', { name: 'Create Monitor' }))
+  expect(screen.getByText('Select an approved destination to save check settings.')).toBeInTheDocument()
+  expect(screen.getByLabelText('Status range 1 from')).toHaveValue(200)
+  expect(api.post).not.toHaveBeenCalled()
+  await user.selectOptions(screen.getByLabelText('Approved destination'), 'api')
+  await user.click(screen.getByRole('button', { name: 'Create Monitor' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors', expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.objectContaining({ acceptedStatusRanges: [{ min: 200, max: 299 }] }) }) })))
+})
+
 it('creates a service and disabled check using the upstream Checks panel', async () => {
   const user = userEvent.setup()
   renderModal(null)

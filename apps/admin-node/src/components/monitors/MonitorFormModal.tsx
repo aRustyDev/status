@@ -285,6 +285,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         const advanced = cloudflareConfig()
         const rangeProblem = statusRangesProblem((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? [])
         if (rangeProblem) { setSidePanel('checks'); throw new Error(rangeProblem) }
+        if (cloudflare.isAdmin && !endpointId && (((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []).length || config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).length || config['degradedAboveMs'] !== undefined)) {
+          throw new Error('Select an approved destination to save check settings.')
+        }
         if (timeoutMs * retries > 10000) throw new Error('Timeout multiplied by attempts must not exceed 10,000 ms.')
         if (config['method'] === 'HEAD' && (config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).some(assertion => assertion.type === 'json'))) throw new Error('HEAD responses have no body. Remove the keyword and JSON checks or use GET.')
         const previous = initialCloudflareCheck
