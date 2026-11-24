@@ -5,6 +5,7 @@ import { MONITOR_TYPES, type MonitorTypeOption } from './monitorTypes'
 interface Props {
   value: MonitorType
   onChange: (type: MonitorType) => void
+  allowedTypes?: MonitorType[] | undefined
 }
 
 function TypeIcon({ icon }: { icon: string }) {
@@ -16,7 +17,7 @@ function TypeIcon({ icon }: { icon: string }) {
 }
 
 /** Searchable, grouped monitor type list: stays one control tall however many types exist. */
-export function MonitorTypePicker({ value, onChange }: Props) {
+export function MonitorTypePicker({ value, onChange, allowedTypes }: Props) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
@@ -45,7 +46,7 @@ export function MonitorTypePicker({ value, onChange }: Props) {
   }, [open])
 
   const needle = query.trim().toLowerCase()
-  const matches = MONITOR_TYPES.filter((t) => !needle || `${t.label} ${t.hint} ${t.group}`.toLowerCase().includes(needle))
+  const matches = MONITOR_TYPES.filter((t) => (!allowedTypes || allowedTypes.includes(t.value)) && (!needle || `${t.label} ${t.hint} ${t.group}`.toLowerCase().includes(needle)))
   const groups = matches.reduce<{ name: string; items: MonitorTypeOption[] }[]>((acc, t) => {
     const group = acc.find((g) => g.name === t.group)
     if (group) group.items.push(t)

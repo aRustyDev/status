@@ -29,6 +29,33 @@ const monitors: PublicMonitor[] = [
 ]
 
 describe('PageRenderer', () => {
+  it('renders Gatus groups with unknown and advisory states without HTTP labels or invented uptime', () => {
+    const tree: LayoutTree = { id: 'root', type: 'page', children: [
+      { id: 'gatus-group-3', type: 'group', label: 'Private services', collapsible: false, children: [
+        { id: 'component-3', type: 'monitor', monitorId: 3, showUptimeBar: false },
+        { id: 'component-4', type: 'monitor', monitorId: 4, showUptimeBar: false },
+      ] },
+      { id: 'gatus-group-5', type: 'group', label: 'Advisories', collapsible: false, children: [
+        { id: 'component-5', type: 'monitor', monitorId: 5, showUptimeBar: false },
+      ] },
+    ] }
+    const records: PublicMonitor[] = [
+      { id: 3, name: 'Unknown private service', type: 'gatus', source: 'gatus', currentStatus: 'pending', lastCheckedAt: null },
+      { id: 4, name: 'Healthy private service', type: 'gatus', source: 'gatus', currentStatus: 'up', lastCheckedAt: null },
+      { id: 5, name: 'Certificate advisory', type: 'gatus', source: 'gatus', currentStatus: 'degraded', lastCheckedAt: null },
+    ]
+    const { container } = render(<PageRenderer tree={tree} monitors={records} statusMap={{}} />)
+    expect(screen.getByText('Private services')).toBeInTheDocument()
+    expect(screen.getByText('Unknown private service')).toBeInTheDocument()
+    expect(screen.getByText('Healthy private service')).toBeInTheDocument()
+    expect(screen.getByText('Advisories')).toBeInTheDocument()
+    expect(screen.getByText('Certificate advisory')).toBeInTheDocument()
+    expect(screen.getAllByText('Unknown').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('status.degraded').length).toBeGreaterThan(0)
+    expect(container.querySelector('button.bsp-uptime-bar')).toBeNull()
+    expect(screen.queryByText('HTTPS')).not.toBeInTheDocument()
+  })
+
   it('places unpositioned status blocks in separate full-width auto rows', () => {
     const tree: LayoutTree = { id: 'root', type: 'page', children: [
       { id: 'first', type: 'monitor', monitorId: 1, showUptimeBar: false },
@@ -71,6 +98,14 @@ describe('PageRenderer', () => {
     rerender(<PageRenderer tree={tree('past')} monitors={monitors} statusMap={{}} maintenances={windows} />)
     expect(screen.getByText('Window 4')).toBeTruthy()
     expect(screen.getByText('maintenance.past')).toBeTruthy()
+  })
+
+  it('shows retired monitor names in maintenance without adding them to the health grid', () => {
+    const tree: LayoutTree = { id: 'root', type: 'page', children: [{ id: 'm', type: 'maintenance', filter: 'all' }] }
+    const windows = [{ id: 1, name: 'Past work', description: null, startsAt: 1000, endsAt: 2000, monitorIds: [99], monitorNames: { 99: 'Retired service' }, state: 'past' as const }]
+    const { container } = render(<PageRenderer tree={tree} monitors={[]} statusMap={{}} maintenances={windows} />)
+    expect(screen.getByText(/Retired service/)).toBeInTheDocument()
+    expect(container.querySelectorAll('.bsp-group-card')).toHaveLength(0)
   })
 
   it('renders text, monitor, divider, and chart nodes', async () => {

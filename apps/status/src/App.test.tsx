@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { LayoutTree } from '@bsp/shared'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -102,8 +102,7 @@ function mockApi() {
   })
 }
 
-function renderApp() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+function renderApp(queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   return render(<QueryClientProvider client={queryClient}><App /></QueryClientProvider>)
 }
 
@@ -127,7 +126,53 @@ describe('status App', () => {
     expect(screen.getByText('Checkout API: up')).toBeInTheDocument()
     expect(document.title).toBe('Status Page')
     expect(screen.getAllByAltText('Status Page')[0]).toHaveAttribute('src', '/logo_light.png')
-    expect(getJSON).toHaveBeenCalledWith('/api/v1/public/status', { cache: 'no-cache' })
+    expect(getJSON).toHaveBeenCalledWith('/api/v1/public/status', { cache: 'no-cache' }, 15_000)
+  })
+
+  it('hides cached healthy status after returning to a stale tab and restores fresh data', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    renderApp(client)
+    expect(await screen.findByRole('heading', { name: 'All systems operational.' })).toBeVisible()
+    const prior = vi.mocked(getJSON).getMockImplementation()!
+    let resolveStatus!: (value: unknown) => void
+    vi.mocked(getJSON).mockImplementation(((path: string, ...rest: unknown[]) => path === '/api/v1/public/status'
+      ? new Promise<unknown>(resolve => { resolveStatus = resolve })
+      : prior(path, ...rest as [RequestInit?, number?])) as typeof getJSON)
+    const time = vi.spyOn(Date, 'now')
+    const visibility = Object.getOwnPropertyDescriptor(document, 'visibilityState')
+    try {
+      const updatedAt = client.getQueryState(['public-status'])!.dataUpdatedAt
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+      fireEvent(document, new Event('visibilitychange', { bubbles: true }))
+      time.mockReturnValue(updatedAt + 61_000)
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+      fireEvent(document, new Event('visibilitychange', { bubbles: true }))
+      await waitFor(() => expect(resolveStatus).toBeTypeOf('function'))
+      expect(await screen.findByRole('alert')).toHaveTextContent('Service status is unavailable or out of date')
+      expect(screen.queryByRole('heading', { name: 'All systems operational.' })).not.toBeInTheDocument()
+      expect(screen.queryByText('Checkout API: up')).not.toBeInTheDocument()
+      await act(async () => { resolveStatus(baseStatus({ monitors: monitors.map(m => ({ ...m, currentStatus: 'pending' })) })) })
+      expect(await screen.findByText('Checkout API: pending')).toBeVisible()
+      expect(screen.queryByText(/Service status is unavailable or out of date/)).not.toBeInTheDocument()
+    } finally {
+      time.mockRestore()
+      if (visibility) Object.defineProperty(document, 'visibilityState', visibility)
+      else delete (document as unknown as { visibilityState?: string }).visibilityState
+    }
+  })
+
+  it('hides cached health after a failed status refetch', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    renderApp(client)
+    expect(await screen.findByText('Checkout API: up')).toBeVisible()
+    const prior = vi.mocked(getJSON).getMockImplementation()!
+    vi.mocked(getJSON).mockImplementation(((path: string, ...rest: unknown[]) => path === '/api/v1/public/status'
+      ? Promise.reject(new Error('source unavailable'))
+      : prior(path, ...rest as [RequestInit?, number?])) as typeof getJSON)
+    await act(async () => { await client.invalidateQueries({ queryKey: ['public-status'] }) })
+    expect(await screen.findByRole('alert')).toHaveTextContent('Service status is unavailable or out of date')
+    expect(screen.queryByText('Checkout API: up')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'All systems operational.' })).not.toBeInTheDocument()
   })
 
   it('applies live SSE status and derives partial and major outages', async () => {

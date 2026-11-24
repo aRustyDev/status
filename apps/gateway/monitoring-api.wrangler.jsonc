@@ -26,6 +26,9 @@
         "ENDPOINTS": "[]",
         "API_SCOPE": "monitoring"
       },
+      "services": [
+        { "binding": "PROBE", "service": "status-probe-staging" }
+      ],
       "d1_databases": [
         {
           "binding": "DB",

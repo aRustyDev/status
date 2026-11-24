@@ -27,7 +27,7 @@ const surfaces = [
   { file: 'apps/status-node/src/fonts/material-symbols-outlined.woff2', dirs: ['apps/status-node'], fill: 0 },
   { file: 'apps/admin-node/src/fonts/material-symbols-outlined-fill.woff2', dirs: ['apps/admin-node'], fill: undefined, withUiIcons: true },
   { file: 'apps/status/src/fonts/material-symbols-outlined.woff2', dirs: ['apps/status'], fill: 0 },
-  { file: 'apps/admin/src/fonts/material-symbols-outlined-fill.woff2', dirs: ['apps/admin'], fill: undefined, withUiIcons: true },
+  { file: 'apps/admin/src/fonts/material-symbols-outlined-fill.woff2', dirs: ['apps/admin', 'apps/admin-node/src/components/monitors'], fill: undefined, withUiIcons: true },
 ]
 const uiIconList = 'node_modules/@better-forge/ui/icons.json'
 

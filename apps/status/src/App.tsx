@@ -122,6 +122,14 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
   retentionDays: number
 }) {
   const qc = useQueryClient()
+  const [freshnessNow, setFreshnessNow] = useState(() => Date.now())
+  useEffect(() => {
+    const refresh = () => { if (document.visibilityState === 'visible') setFreshnessNow(Date.now()) }
+    const timer = setInterval(refresh, 5_000)
+    document.addEventListener('visibilitychange', refresh)
+    window.addEventListener('focus', refresh)
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', refresh); window.removeEventListener('focus', refresh) }
+  }, [])
   const [savedDarkMode, toggleDark] = useDarkMode()
   const previewMode = new URLSearchParams(window.location.search).get('branding-preview') === '1'
   const [brandingPreview, setBrandingPreview] = useState<Branding | null>(null)
@@ -175,7 +183,7 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
     queryKey: ['public-status'],
     // Revalidate instead of reusing the browser's short-lived copy, so an SSE-triggered refetch
     // really picks up the change it was notified about.
-    queryFn: () => getJSON<PublicStatus>('/api/v1/public/status', { cache: 'no-cache' }),
+    queryFn: () => getJSON<PublicStatus>('/api/v1/public/status', { cache: 'no-cache' }, 15_000),
     refetchInterval: SNAPSHOT_URL ? 60_000 : 30_000,
   })
   const status = statusQuery.data
@@ -266,7 +274,8 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
   }, [isDark])
 
   // Until both the status and the layout are in, nothing is known, so never claim "all operational" early.
-  const loadFailed = (statusQuery.isError && !status) || (layoutQuery.isError && !layoutData)
+  const statusUnavailable = statusQuery.isError || (statusQuery.dataUpdatedAt > 0 && freshnessNow - statusQuery.dataUpdatedAt >= (SNAPSHOT_URL ? 90_000 : 60_000))
+  const loadFailed = statusUnavailable || (layoutQuery.isError && !layoutData)
   const loading = !loadFailed && (!status || !layoutData)
   const allUp = visibleMonitors.every((m) => m.currentStatus === 'up')
   const allDown = visibleMonitors.length > 0 && visibleMonitors.every((m) => m.currentStatus === 'down' || m.currentStatus === 'affected')
@@ -456,7 +465,8 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
         </section>}
 
         {/* ── Main content — always from PageRenderer when tree exists ── */}
-        {tree && tree.children.length > 0 && (
+        {statusUnavailable && <div role="alert" className="mb-8 text-center">Service status is unavailable or out of date. <button type="button" onClick={() => void statusQuery.refetch()} className="underline">Try again</button></div>}
+        {!statusUnavailable && tree && tree.children.length > 0 && (
           <div className="mb-5 flex flex-wrap items-center gap-3 text-sm" style={{ color: 'var(--m3-secondary)' }}>
             <label htmlFor="history-range">History range</label>
             <select id="history-range" defaultValue="14" aria-describedby="history-range-availability">
@@ -467,7 +477,7 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
             <span id="history-range-availability">History beyond {retentionDays} days is unavailable.</span>
           </div>
         )}
-        {tree && tree.children.length > 0 ? (
+        {!statusUnavailable && (tree && tree.children.length > 0 ? (
           <section className={`mb-32 fade-up${showHero ? '' : ' pt-8 md:pt-12'}`} style={{ animationDelay: '80ms' }}>
             <PageRenderer
               tree={tree}
@@ -487,10 +497,10 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
             <p className="text-lg font-semibold mb-2" style={{ color: 'var(--m3-on-surface)' }}>{t('page.notConfigured')}</p>
             <p className="text-sm" style={{ color: 'var(--m3-secondary)' }}>{t('page.notConfiguredHint')}</p>
           </section>
-        ) : null}
+        ) : null)}
 
         {/* ── Events Section (shown only when layout is not yet configured) ── */}
-        {tree === undefined && (activeIncidents.length > 0 || resolvedIncidents.length > 0) && (
+        {!statusUnavailable && tree === undefined && (activeIncidents.length > 0 || resolvedIncidents.length > 0) && (
           <section className="bsp-incidents-section mb-32 fade-up" id="events" style={{ animationDelay: '160ms' }}>
             {/* Section header + tabs */}
             <div className="flex items-center justify-between mb-12">

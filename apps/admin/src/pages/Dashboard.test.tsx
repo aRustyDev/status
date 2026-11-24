@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, within } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api, getCurrentUser } from '../api/client'
@@ -36,8 +36,7 @@ function mockData(monitorList: unknown[], incidentList: unknown[] = [], maintena
   })
 }
 
-function renderPage() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+function renderPage(queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   return render(<QueryClientProvider client={queryClient}><MemoryRouter><DashboardPage /></MemoryRouter></QueryClientProvider>)
 }
 
@@ -45,6 +44,22 @@ describe('DashboardPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(getCurrentUser).mockReturnValue({ userId: 1, email: 'op@example.test', role: 'operator', mustChangePassword: false, twoFactorEnabled: false })
+  })
+
+  it('hides outdated monitor health until a fresh response arrives', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['monitors'], monitors, { updatedAt: Date.now() - 61_000 })
+    let resolve!: (value: unknown) => void
+    vi.mocked(api.get).mockImplementation((path: string) => {
+      if (path === '/admin/monitors') return new Promise(r => { resolve = r })
+      return Promise.resolve([])
+    })
+    renderPage(client)
+    expect(await screen.findByText(/Monitor status is out of date/)).toBeVisible()
+    expect(screen.queryByText('Checkout API')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Partial Outage' })).not.toBeInTheDocument()
+    await act(async () => resolve(monitors))
+    expect(await screen.findByRole('heading', { name: 'Partial Outage' })).toBeVisible()
   })
 
   it('summarises monitor health, endpoints and active incidents', async () => {

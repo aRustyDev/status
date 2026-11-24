@@ -9,6 +9,8 @@ export interface PublicMaintenanceWindow {
   endsAt: number
   /** Published monitors the window covers. Empty = every monitor. */
   monitorIds: number[]
+  /** Names for linked monitors, including retired sources no longer in the live list. */
+  monitorNames?: Record<number, string>
 }
 
 /** A window of the Maintenance block: running, still to come, or a one-off that is over. */
@@ -39,6 +41,7 @@ export interface MaintenanceWindow {
   occurrence: { startsAt: number; endsAt: number }
   /** Monitor IDs in maintenance. Empty array = all monitors. */
   monitorIds: number[]
+  monitorNames?: Record<number, string>
   createdAt: number
   updatedAt: number
 }

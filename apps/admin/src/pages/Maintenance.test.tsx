@@ -242,6 +242,19 @@ describe('MaintenancePage', () => {
   })
 
 
+  it('shows a retired association and lets an operator remove it', async () => {
+    const user = userEvent.setup()
+    mockGets([{ ...windows()[0]!, monitorNames: { 99: 'Retired service' } }])
+    renderPage()
+    expect(await screen.findByText('Retired service')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Edit DB upgrade' }))
+    const retired = screen.getByRole('checkbox', { name: 'Retired service (retired)' })
+    expect(retired).toBeChecked()
+    await user.click(retired)
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/maintenance/1', expect.objectContaining({ monitorIds: [10] })))
+  })
+
   it('ends an active window and prevents cancellation of an active window', async () => {
     const user = userEvent.setup()
     renderPage()

@@ -63,6 +63,11 @@ describe('IncidentCard', () => {
     expect(screen.getByText('Engineers are investigating.')).toBeInTheDocument()
   })
 
+  it('shows a retired linked monitor by its recorded name', () => {
+    render(<IncidentCard incident={incident({ monitorIds: [99], monitorNames: { 99: 'Retired service' } })} monitors={[]} />)
+    expect(screen.getByText('Retired service')).toBeInTheDocument()
+  })
+
   it('shows the title and updates in the visitor language when they are translated', () => {
     const base = incident()
     render(<IncidentCard

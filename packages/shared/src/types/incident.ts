@@ -28,6 +28,8 @@ export interface Incident {
   autoMonitorId: number | null
   updates?: IncidentUpdate[]
   monitorIds?: number[]
+  /** Names for linked monitors, including retired sources no longer in the live list. */
+  monitorNames?: Record<number, string>
 }
 
 /** One language's wording of a template; a missing field falls back to the template's own text. */

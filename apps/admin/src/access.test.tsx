@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
 import { api } from './api/client'
@@ -81,4 +81,29 @@ it('drops previous identity notifications and drafts after a different identity 
   await user.click(screen.getByRole('button', { name: 'Continue' }))
   await waitFor(() => expect(screen.getByLabelText('Draft incident')).toHaveValue(''))
   expect(screen.queryByText('Published protected incident')).not.toBeInTheDocument()
+})
+
+it('ignores a stale reconnect response after a newer account has signed in', async () => {
+  const first = { id: 'first-operator', email: 'first@example.com', role: 'operator' }
+  const second = { id: 'second-operator', email: 'second@example.com', role: 'operator' }
+  let resolveOld!: (value: typeof first) => void
+  const old = new Promise<typeof first>(resolve => { resolveOld = resolve })
+  let calls = 0
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path === '/auth/me') { calls++; return calls === 1 ? first : calls === 2 ? old : second }
+    if (path === '/capabilities') return { supportedRoutes: ['/admin/'] }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  window.history.replaceState({}, '', '/admin/')
+  const user = userEvent.setup()
+  render(<App />)
+  await user.type(await screen.findByLabelText('Draft incident'), 'Private draft')
+  window.dispatchEvent(new Event('access-expired'))
+  const button = await screen.findByRole('button', { name: 'Continue' })
+  await user.click(button)
+  await user.click(button)
+  await waitFor(() => expect(screen.getByText('second@example.com')).toBeVisible())
+  await act(async () => { resolveOld(first); await old })
+  expect(screen.getByText('second@example.com')).toBeVisible()
+  expect(screen.getByLabelText('Draft incident')).toHaveValue('')
 })

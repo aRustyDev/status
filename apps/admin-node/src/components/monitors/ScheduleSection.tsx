@@ -10,6 +10,7 @@ export interface ScheduleValues {
 }
 
 interface Props {
+  cloudflare?: boolean | undefined
   values: ScheduleValues
   onChange: (patch: Partial<ScheduleValues>) => void
 }
@@ -19,7 +20,7 @@ function plural(n: number, one: string, many: string) {
 }
 
 /** Check timing and alert thresholds, collapsed to a one-line summary; fields stay mounted so they keep their values. */
-export function ScheduleSection({ values, onChange }: Props) {
+export function ScheduleSection({ values, onChange, cloudflare }: Props) {
   const [open, setOpen] = useState(false)
   const bodyId = useId()
   const { intervalSecs, timeoutMs, retries, failureThreshold, recoveryThreshold } = values
@@ -27,8 +28,7 @@ export function ScheduleSection({ values, onChange }: Props) {
     `Every ${intervalSecs} s`,
     `Timeout ${timeoutMs / 1000} s`,
     plural(retries, 'attempt', 'attempts'),
-    `Alert after ${failureThreshold}`,
-    `Recover after ${recoveryThreshold}`,
+    ...(!cloudflare ? [`Alert after ${failureThreshold}`, `Recover after ${recoveryThreshold}`] : []),
   ]
 
   return (
@@ -58,7 +58,7 @@ export function ScheduleSection({ values, onChange }: Props) {
       <div id={bodyId} hidden={!open} className="p-3 pt-4 space-y-4" style={{ borderTop: '1px solid var(--m3-outline-variant)' }}>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <Field label="Interval (s)">
-            <input type="number" value={intervalSecs} onChange={(e) => onChange({ intervalSecs: Number(e.target.value) })} min={10} max={86400} className="input-sig" />
+            {cloudflare ? <select value={intervalSecs} onChange={e => onChange({ intervalSecs: Number(e.target.value) })} className="input-sig"><option value={60}>60</option><option value={300}>300</option></select> : <input type="number" value={intervalSecs} onChange={(e) => onChange({ intervalSecs: Number(e.target.value) })} min={10} max={86400} className="input-sig" />}
           </Field>
           <Field label="Timeout (ms)">
             <input type="number" value={timeoutMs} onChange={(e) => onChange({ timeoutMs: Number(e.target.value) })} min={1000} max={300000} className="input-sig" />
@@ -70,17 +70,17 @@ export function ScheduleSection({ values, onChange }: Props) {
             <input type="number" value={retries} onChange={(e) => onChange({ retries: Math.max(1, Number(e.target.value)) })} min={1} max={10} className="input-sig" />
           </Field>
           <span className="hidden sm:block" />
-          <Field label="Alert after (checks)">
+          {!cloudflare && <Field label="Alert after (checks)">
             <input type="number" value={failureThreshold} onChange={(e) => onChange({ failureThreshold: Math.max(1, Number(e.target.value)) })} min={1} max={20} className="input-sig" />
-          </Field>
-          <Field label="Recover after (checks)">
+          </Field>}
+          {!cloudflare && <Field label="Recover after (checks)">
             <input type="number" value={recoveryThreshold} onChange={(e) => onChange({ recoveryThreshold: Math.max(1, Number(e.target.value)) })} min={1} max={20} className="input-sig" />
-          </Field>
+          </Field>}
         </div>
-        <p className="text-xs -mt-1" style={{ color: 'var(--m3-secondary)' }}>
+        {!cloudflare && <p className="text-xs -mt-1" style={{ color: 'var(--m3-secondary)' }}>
           Consecutive checks required before a notification is sent. Raise the first value to stop a flapping
           endpoint from paging on every blip — the status page still updates immediately. 1 = notify on every change.
-        </p>
+        </p>}
       </div>
     </div>
   )

@@ -82,6 +82,8 @@ A successful dry run validates packaging; it does not validate Access, D1, Tunne
 
 The staging rehearsal covered role enforcement, incidents, maintenance transitions, probe recovery, Access session expiry, and rollback. See the cutover plan for the recorded outcomes. Environment-specific identifiers and internal endpoints are maintained outside this public repository.
 
+On November 23, 2026 at 11:58 p.m. Eastern, the shared monitor editor was verified in staging. Draft tests returned HTTP 200 for both approved public and private destinations. An unexpected-status test failed as expected. A disabled verification monitor was created, edited, and reopened with its destination and response check intact. Existing scheduled public and private checks also returned HTTP 200 after the probe deployment. The verification monitor remains in staging with its check disabled. Staging had no Gatus-backed monitors, so Gatus read-only behavior was verified by the local integration suite. Later local draft-preservation and timeout fixes have not yet been verified on staging.
+
 ## Upstream UI staging gateway
 
 The cutover gateway is configured in `apps/gateway/wrangler.jsonc`. Its staging `UI_MODE` selects `legacy` or `upstream` HTML while both `/api/v1/` and `/api/v1/bsp/` remain routed to the internal Workers. The gateway serves the legacy board from the operations Worker and forwards upstream assets to the status and admin UI Workers. Keep both UI Workers deployed during a rollback so existing tabs can load their assets.
@@ -93,9 +95,10 @@ npm run build -w @bsp/shared
 npm run build -w @bsp/board
 npm run build -w @bsp/status
 npm run build -w @bsp/admin
-npx wrangler deploy --config apps/gateway/api.wrangler.jsonc --env staging
+npx wrangler deploy --config apps/probe/wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/status-api.wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/monitoring-api.wrangler.jsonc --env staging
+npx wrangler deploy --config apps/gateway/api.wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/status.wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/admin.wrangler.jsonc --env staging
 npx wrangler deploy --config apps/gateway/wrangler.jsonc --env staging
@@ -106,6 +109,8 @@ Run the checks and rollback rehearsal in `.agents/plans/2026-11-23-better-status
 These gateway configurations currently define staging only. Production needs separately reviewed environment-specific gateway, internal Worker, Access, D1, endpoint, and route settings; substituting `production` in the staging commands is not sufficient.
 
 The three API Worker configurations carry the same `ENDPOINTS` and D1 settings as the board and probe. Update all of them together when an approved target changes. The endpoint synchronization generator validates each configured gateway API environment against the probe before emitting SQL. Continue to use the probe drain, registry synchronization, and VPC revision procedures above.
+
+Apply migrations 0005 through 0007 before deploying the updated Workers. The monitoring API needs a `PROBE` service binding to the staging probe for draft tests. Set `MONITOR_MODAL` to `upstream` in the operations API environment to enable the shared monitor editor. Remove that setting and redeploy the operations API to restore the previous editor. Deploy the probe and monitoring API before enabling the editor, and deploy the gateway so monitor test requests reach the monitoring API.
 
 ## Production deployment and rollback
 

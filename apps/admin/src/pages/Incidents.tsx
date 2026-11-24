@@ -242,8 +242,8 @@ export default function IncidentsPage() {
                     </p>
                     <div className="flex flex-wrap gap-2">
                       {(incident.monitorIds ?? []).map((mid) => {
-                        const m = monitors.find((mon) => mon.id === mid)
-                        return m ? (
+                        const name = monitors.find((mon) => mon.id === mid)?.name ?? incident.monitorNames?.[mid]
+                        return name ? (
                           <span
                             key={mid}
                             className="text-xs px-2 py-0.5 rounded-full font-mono"
@@ -253,7 +253,7 @@ export default function IncidentsPage() {
                               border: '1px solid var(--m3-outline-variant)',
                             }}
                           >
-                            {m.name}
+                            {name}
                           </span>
                         ) : null
                       })}
@@ -459,7 +459,7 @@ export default function IncidentsPage() {
   )
 }
 
-function MonitorPicker({ monitors, selected, onChange }: { monitors: Monitor[]; selected: number[]; onChange: (ids: number[]) => void }) {
+function MonitorPicker({ monitors, selected, onChange }: { monitors: Array<Pick<Monitor, 'id' | 'name'>>; selected: number[]; onChange: (ids: number[]) => void }) {
   return (
     <fieldset>
       <legend className="block font-mono text-xs uppercase tracking-wider mb-2" style={{ color: 'var(--m3-secondary)' }}>
@@ -527,7 +527,7 @@ function EditIncidentModal({ incident, monitors, onClose, onSaved }: { incident:
               <option value="critical">Critical</option>
             </select>
           </Field>
-          <MonitorPicker monitors={monitors} selected={selectedMonitors} onChange={setSelectedMonitors} />
+          <MonitorPicker monitors={[...monitors, ...initialMonitors.filter(id => !monitors.some(m => m.id === id)).map(id => ({ id, name: `${incident.monitorNames?.[id] ?? `#${id}`} (retired)` }))]} selected={selectedMonitors} onChange={setSelectedMonitors} />
           {error && <Alert tone="error">{error}</Alert>}
         </div>
         <ModalFooter>
