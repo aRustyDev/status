@@ -78,8 +78,20 @@ const ACCESS_QUERY_KEY = ['access-identity']
  * nothing else is requested before that. Should the check itself fail, the page loads and reports its own errors.
  */
 export default function App() {
-  if (SNAPSHOT_URL) return <StatusPage account={null} subscriptionsEnabled={false} retentionDays={14} />
+  if (SNAPSHOT_URL) return <SnapshotApp />
   return <LiveApp />
+}
+
+function SnapshotApp() {
+  const qc = useQueryClient()
+  const [expired, setExpired] = useState(false)
+  useEffect(() => {
+    const onExpiry = () => { setExpired(true); qc.clear() }
+    window.addEventListener('access-session-expired', onExpiry)
+    return () => window.removeEventListener('access-session-expired', onExpiry)
+  }, [qc])
+  if (expired) return <main><p>Your Access session has expired.</p><a href="/">Sign in</a></main>
+  return <StatusPage account={null} subscriptionsEnabled={false} retentionDays={14} />
 }
 
 function LiveApp() {

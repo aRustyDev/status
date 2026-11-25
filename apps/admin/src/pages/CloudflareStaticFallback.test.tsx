@@ -1,16 +1,18 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { ApiError } from '@better-forge/ui'
 import { api } from '../api/client'
 import CloudflareStaticFallbackPage from './CloudflareStaticFallback'
 
 vi.mock('../api/client', () => ({ api: { get: vi.fn(), put: vi.fn(), post: vi.fn() } }))
-const off = { settings: { enabled: false, intervalSeconds: 60 }, status: { lastRunAt: null, lastSuccessAt: null, lastError: null }, health: 'disabled', runs: [] }
-const on = { ...off, settings: { enabled: true, intervalSeconds: 300 }, status: { lastRunAt: 1000, lastSuccessAt: 1000, lastError: null }, health: 'ok', runs: [{ at: 1000, ok: true, error: null }] }
+const off = { settingsRevision: 'off-revision', settings: { enabled: false, intervalSeconds: 60 }, status: { lastRunAt: null, lastSuccessAt: null, lastError: null }, health: 'disabled', runs: [] }
+const on = { ...off, settingsRevision: 'on-revision', settings: { enabled: true, intervalSeconds: 300 }, status: { lastRunAt: 1000, lastSuccessAt: 1000, lastError: null }, health: 'ok', runs: [{ at: 1000, ok: true, error: null }] }
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   render(<QueryClientProvider client={client}><CloudflareStaticFallbackPage /></QueryClientProvider>)
+  return client
 }
 describe('Cloudflare static fallback', () => {
   beforeEach(() => { vi.clearAllMocks(); vi.mocked(api.get).mockResolvedValue(off) })
@@ -25,7 +27,7 @@ describe('Cloudflare static fallback', () => {
     await user.click(screen.getByRole('switch', { name: 'Push the status page' }))
     await user.selectOptions(screen.getByLabelText('How often'), '300')
     await user.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() => expect(api.put).toHaveBeenCalledWith('/admin/static-mirror', { enabled: true, intervalSeconds: 300 }))
+    await waitFor(() => expect(api.put).toHaveBeenCalledWith('/admin/static-mirror', { enabled: true, intervalSeconds: 300, settingsRevision: 'off-revision' }))
     expect(await screen.findByText('The copy is up to date')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Push now' }))
     await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/static-mirror/test'))
@@ -47,5 +49,95 @@ describe('Cloudflare static fallback', () => {
     expect(await screen.findByRole('heading', { name: 'The latest push failed' })).toBeInTheDocument()
     expect(screen.getByText('Publication failed')).toBeInTheDocument()
     expect(screen.getByLabelText('1 of the last 1 pushes succeeded')).toBeInTheDocument()
+  })
+  it('reflects changed settings from another administrator while the form is clean', async () => {
+    vi.mocked(api.get).mockResolvedValue(on)
+    const client = renderPage()
+    expect(await screen.findByRole('switch', { name: 'Push the status page' })).toBeChecked()
+    vi.mocked(api.get).mockResolvedValue(off)
+    await act(async () => { await client.refetchQueries({ queryKey: ['static-mirror'] }) })
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Push the status page' })).not.toBeChecked())
+    expect(screen.getByLabelText('How often')).toHaveValue('60')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+  })
+  it('preserves unsaved edits and requires a reload when settings changed elsewhere', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockResolvedValue(on)
+    const client = renderPage()
+    await user.selectOptions(await screen.findByLabelText('How often'), '900')
+    vi.mocked(api.get).mockResolvedValue(off)
+    await act(async () => { await client.refetchQueries({ queryKey: ['static-mirror'] }) })
+    expect(screen.getByLabelText('How often')).toHaveValue('900')
+    expect(screen.getByRole('switch', { name: 'Push the status page' })).toBeChecked()
+    expect(await screen.findByText(/Settings changed elsewhere/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Push now' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Reload settings' }))
+    expect(screen.getByLabelText('How often')).toHaveValue('60')
+    expect(screen.getByRole('switch', { name: 'Push the status page' })).not.toBeChecked()
+    expect(screen.queryByText(/Settings changed elsewhere/)).not.toBeInTheDocument()
+    expect(api.put).not.toHaveBeenCalled()
+  })
+  it('reports a failed background refresh while retaining the last status', async () => {
+    vi.mocked(api.get).mockResolvedValue(on)
+    const client = renderPage()
+    expect(await screen.findByRole('heading', { name: 'The copy is up to date' })).toBeInTheDocument()
+    vi.mocked(api.get).mockRejectedValue(new Error('Storage unavailable'))
+    await act(async () => { await client.refetchQueries({ queryKey: ['static-mirror'] }) })
+    expect(await screen.findByText('Could not refresh static fallback status. Showing the last response.')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'The copy is up to date' })).toBeInTheDocument()
+  })
+  it('preserves the draft and refreshes the revision when a concurrent save returns 409', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockResolvedValueOnce(on).mockResolvedValue(off)
+    vi.mocked(api.put).mockRejectedValue(new ApiError('Settings changed', 409))
+    renderPage()
+    await user.selectOptions(await screen.findByLabelText('How often'), '900')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(api.put).toHaveBeenCalledWith('/admin/static-mirror', { enabled: true, intervalSeconds: 900, settingsRevision: 'on-revision' }))
+    expect(await screen.findByText(/Settings changed elsewhere/)).toBeInTheDocument()
+    expect(screen.getByLabelText('How often')).toHaveValue('900')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    await user.click(await screen.findByRole('button', { name: 'Reload settings' }))
+    expect(screen.getByLabelText('How often')).toHaveValue('60')
+    await user.selectOptions(screen.getByLabelText('How often'), '300')
+    vi.mocked(api.put).mockResolvedValue(on)
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(api.put).toHaveBeenLastCalledWith('/admin/static-mirror', { enabled: false, intervalSeconds: 300, settingsRevision: 'off-revision' }))
+  })
+  it('keeps a conflicted draft blocked until the latest settings can be fetched', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockResolvedValueOnce(on).mockRejectedValueOnce(new Error('Offline')).mockResolvedValue(off)
+    vi.mocked(api.put).mockRejectedValue(new ApiError('Settings changed', 409))
+    renderPage()
+    await user.selectOptions(await screen.findByLabelText('How often'), '900')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByRole('button', { name: 'Retry refresh' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(screen.getByLabelText('How often')).toHaveValue('900')
+    await user.click(screen.getByRole('button', { name: 'Retry refresh' }))
+    await user.click(await screen.findByRole('button', { name: 'Reload settings' }))
+    expect(screen.getByLabelText('How often')).toHaveValue('60')
+  })
+  it('disables settings while a save is pending so the saved form cannot overwrite later edits', async () => {
+    const user = userEvent.setup()
+    let resolveSave!: (value: unknown) => void
+    const pending = new Promise(resolve => { resolveSave = resolve })
+    vi.mocked(api.put).mockReturnValue(pending)
+    renderPage()
+    await user.click(await screen.findByRole('switch', { name: 'Push the status page' }))
+    await user.selectOptions(screen.getByLabelText('How often'), 'custom')
+    const interval = screen.getByLabelText('Interval in minutes')
+    await user.clear(interval)
+    await user.type(interval, '4')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(screen.getByRole('switch', { name: 'Push the status page' })).toBeDisabled()
+    expect(screen.getByLabelText('How often')).toBeDisabled()
+    expect(interval).toBeDisabled()
+    expect(interval).toHaveValue(4)
+    await act(async () => { resolveSave({ ...on, settings: { enabled: true, intervalSeconds: 240 } }); await pending })
+    expect(screen.getByRole('switch', { name: 'Push the status page' })).toBeEnabled()
+    expect(screen.getByLabelText('How often')).toBeEnabled()
+    expect(screen.getByLabelText('Interval in minutes')).toHaveValue(4)
   })
 })

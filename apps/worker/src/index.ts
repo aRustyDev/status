@@ -623,10 +623,22 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       }
       if (route === '/admin/static-mirror' && method === 'PUT') {
         const body = await parseBody(request)
-        if (typeof body.enabled !== 'boolean' || !Number.isSafeInteger(body.intervalSeconds) || Number(body.intervalSeconds) < 60 || Number(body.intervalSeconds) > 86400 || Number(body.intervalSeconds) % 60 !== 0) return bad('Invalid static fallback settings')
+        if (typeof body.settingsRevision !== 'string' || body.settingsRevision.length < 1 || body.settingsRevision.length > 128 || typeof body.enabled !== 'boolean' || !Number.isSafeInteger(body.intervalSeconds) || Number(body.intervalSeconds) < 60 || Number(body.intervalSeconds) > 86400 || Number(body.intervalSeconds) % 60 !== 0) return bad('Invalid static fallback settings')
         const settings = { enabled: body.enabled, intervalSeconds: Number(body.intervalSeconds) }
-        await saveFallback(bucket, settings)
-        await audit(db, user, 'update', 'static_mirror', 'fallback', { enabled: settings.enabled, intervalSeconds: settings.intervalSeconds }).run()
+        // D1 and R2 do not share a transaction. Record and authorize the attempt before
+        // touching R2, and record its completion separately after the write succeeds.
+        const attempt = await stmt(db, `INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details)
+          SELECT ?,?,'update_attempt','static_mirror','fallback',?,? FROM users
+          WHERE id=? AND role='admin' AND version=? AND email=?`,
+          id(), user.email, Date.now(), JSON.stringify({ enabled: settings.enabled }), user.id, user.version, user.email).run()
+        if (!attempt.meta.changes) throw new HttpError(403, 'Identity changed; refresh and try again')
+        await saveFallback(bucket, settings, body.settingsRevision)
+        try {
+          await audit(db, user, 'update', 'static_mirror', 'fallback', { enabled: settings.enabled }).run()
+        } catch {
+          // The attempt is durable, while the R2 update has already completed.
+          console.error(JSON.stringify({ event: 'static_fallback_audit_completion_failed' }))
+        }
         return json(settings.enabled ? await publishFallback(bucket, interval => buildFallbackSnapshot(env, interval)) : await getFallback(bucket))
       }
       throw new HttpError(405, 'Method not allowed')
@@ -1139,7 +1151,7 @@ export default {
       const fallback = new URL('/',url)
       return env.ASSETS.fetch(new Request(fallback,request))
     } catch (error) {
-      if (error instanceof FallbackConflictError) return json({error:'Static fallback changed during publication. Retry.'},409)
+      if (error instanceof FallbackConflictError) return json({error:'Static fallback changed. Reload and try again.'},409)
       if (error instanceof ActionError) return json({error:error.message},error.status)
       if (error instanceof ChannelError) return json({error:error.message},error.status)
       if (error instanceof VaultError) return json({error:error.message},error.status)

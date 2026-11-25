@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { expect, it, vi } from 'vitest'
 import { getJSON } from './api'
 import App from './App'
@@ -28,4 +28,8 @@ it('renders a snapshot without requesting live identity or capabilities', async 
   await waitFor(() => expect(vi.mocked(getJSON)).toHaveBeenCalledWith('/api/v1/public/status', expect.anything(), 15_000))
   expect(vi.mocked(getJSON).mock.calls.every(([path]) => path.startsWith('/api/v1/public/'))).toBe(true)
   expect(screen.getAllByRole('img').some(image => image.getAttribute('src') === '/__fallback/logo_light.png')).toBe(true)
+  fireEvent(window, new Event('access-session-expired'))
+  expect(screen.getByText('Your Access session has expired.')).toBeInTheDocument()
+  expect(screen.queryByText('Saved copy')).not.toBeInTheDocument()
+  expect(client.getQueryCache().getAll()).toHaveLength(0)
 })

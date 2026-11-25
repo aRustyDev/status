@@ -1809,18 +1809,20 @@ test('static fallback requires an administrator and publishes the live reader da
     fallbackEnv.FALLBACK_READY = 'true'
     const path = '/api/v1/bsp/admin/static-mirror'
     assert.equal((await request(path, viewerToken)).response.status, 403)
-    assert.equal((await request(path, operatorToken, 'PUT', { enabled: true, intervalSeconds: 60 })).response.status, 403)
-    assert.equal((await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 61 })).response.status, 400)
-    assert.equal((await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 60 }, 'https://attacker.example')).response.status, 403)
+    assert.equal((await request(path, operatorToken, 'PUT', { enabled: true, intervalSeconds: 60, settingsRevision: 'initial' })).response.status, 403)
+    assert.equal((await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 61, settingsRevision: 'initial' })).response.status, 400)
+    assert.equal((await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 60, settingsRevision: 'initial' }, 'https://attacker.example')).response.status, 403)
     assert.equal((await request(`${path}/check`, adminToken, 'POST', {})).response.status, 200)
-    const saved = await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 60 })
+    const saved = await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 60, settingsRevision: 'initial' })
     assert.equal(saved.response.status, 200)
     assert.equal((saved.body as unknown as {health:string}).health, 'ok')
     const state = await (await bucket.get('fallback/current.json'))!.json() as {snapshot:{status:unknown; incidents:unknown[]}}
     const live = await request('/api/v1/bsp/public/status', viewerToken)
     assert.deepEqual(state.snapshot.status, live.body)
     assert.ok(state.snapshot.incidents.every(incident => !(incident as {draft?:boolean}).draft))
-    assert.equal((await request(path, adminToken, 'PUT', { enabled: false, intervalSeconds: 60 })).response.status, 200)
+    const revision = (saved.body as unknown as {settingsRevision:string}).settingsRevision
+    assert.equal((await request(path, adminToken, 'PUT', { enabled: false, intervalSeconds: 60, settingsRevision: 'initial' })).response.status, 409)
+    assert.equal((await request(path, adminToken, 'PUT', { enabled: false, intervalSeconds: 60, settingsRevision: revision })).response.status, 200)
   } finally {
     delete fallbackEnv.FALLBACK_BUCKET
     delete fallbackEnv.FALLBACK_READY
@@ -1854,4 +1856,66 @@ test('monitor dependencies are versioned, cycle checked, and administrator contr
     request(`${path}/${b}`, adminToken, 'PATCH', { name: 'Dependency second', manualStatus: 'operational', position: 0, version: 2, dependsOnIds: [a] }, 'https://status.example', mutation()),
   ])
   assert.deepEqual(concurrent.map(result => result.response.status).sort(), [200, 400])
+})
+
+test('static fallback settings require a durable authorized audit attempt', async () => {
+  const mf = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', r2Buckets: ['FALLBACK'] }))
+  const fallbackEnv = env as typeof env & { FALLBACK_BUCKET?: unknown; FALLBACK_READY?: string }
+  const originalDb = env.DB
+  const admin = await db.prepare('SELECT id,role,version FROM users WHERE subject=?').bind('admin-id').first<{id:string;role:string;version:number}>()
+  assert.ok(admin)
+  const bucket = await mf.getR2Bucket('FALLBACK')
+  const path = '/api/v1/bsp/admin/static-mirror'
+  try {
+    fallbackEnv.FALLBACK_BUCKET = bucket
+    fallbackEnv.FALLBACK_READY = 'true'
+    let mode: 'attempt-fails' | 'demoted' | 'completion-fails' = 'attempt-fails'
+    env.DB = {
+      prepare(sql: string) {
+        const statement = originalDb.prepare(sql)
+        return {
+          bind(...values: unknown[]) {
+            const bound = statement.bind(...values)
+            return {
+              bind: (...more: unknown[]) => bound.bind(...more),
+              first: <T = Record<string, unknown>>() => bound.first<T>(),
+              all: <T>() => bound.all<T>(),
+              run: async () => {
+                if (sql.includes("'update_attempt','static_mirror'")) {
+                  if (mode === 'attempt-fails') throw new Error('simulated database outage')
+                  if (mode === 'demoted') await db.prepare("UPDATE users SET role='viewer',version=version+1 WHERE id=?").bind(admin.id).run()
+                } else if (sql.startsWith('INSERT INTO audit_events (id, actor_email') && mode === 'completion-fails') {
+                  throw new Error('simulated completion audit outage')
+                }
+                return bound.run()
+              },
+            }
+          },
+          first: <T = Record<string, unknown>>() => statement.first<T>(),
+          all: <T>() => statement.all<T>(),
+          run: () => statement.run(),
+        }
+      },
+      batch: originalDb.batch.bind(originalDb),
+    }
+    assert.equal((await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 60, settingsRevision: 'initial' })).response.status, 503)
+    assert.equal(await bucket.get('fallback/current.json'), null)
+    mode = 'demoted'
+    assert.equal((await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 60, settingsRevision: 'initial' })).response.status, 403)
+    assert.equal(await bucket.get('fallback/current.json'), null)
+    await db.prepare('UPDATE users SET role=?,version=? WHERE id=?').bind(admin.role, admin.version, admin.id).run()
+    mode = 'completion-fails'
+    const response = await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 60, settingsRevision: 'initial' })
+    assert.equal(response.response.status, 200)
+    const state = await (await bucket.get('fallback/current.json'))!.json() as { enabled:boolean }
+    assert.equal(state.enabled, true)
+    const attempt = await db.prepare("SELECT action FROM audit_events WHERE action='update_attempt' AND entity_type='static_mirror' ORDER BY rowid DESC LIMIT 1").first<{action:string}>()
+    assert.equal(attempt?.action, 'update_attempt')
+  } finally {
+    env.DB = originalDb
+    delete fallbackEnv.FALLBACK_BUCKET
+    delete fallbackEnv.FALLBACK_READY
+    await db.prepare('UPDATE users SET role=?,version=? WHERE id=?').bind(admin.role, admin.version, admin.id).run()
+    await mf.dispose()
+  }
 })

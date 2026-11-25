@@ -52,6 +52,9 @@ try {
   assert.deepEqual(await result.json(), { schemaVersion: 1, generatedAt: 100 })
   assert.equal((await fallback.fetch(request('/__fallback/assets/a.js', ''), env)).status, 401)
   assert.equal((await fallback.fetch(request('/__fallback/snapshot.json', otherToken), env)).status, 401)
+  enabled = false
+  assert.equal((await fallback.fetch(request('/'), env)).status, 503)
+  enabled = true
   probeStatus = 401
   assert.equal((await fallback.fetch(request('/'), env)).status, 401)
   liveStatus = 503

@@ -26,6 +26,7 @@ interface AuditPage {
 const ACTION_COLORS: Record<string, { bg: string; color: string; label: string }> = {
   create: { bg: 'var(--audit-create-bg)', color: 'var(--audit-create-text)', label: 'Create' },
   update: { bg: 'var(--audit-update-bg)', color: 'var(--audit-update-text)', label: 'Update' },
+  update_attempt: { bg: 'var(--audit-update-bg)', color: 'var(--audit-update-text)', label: 'Update attempt' },
   delete: { bg: 'var(--audit-delete-bg)', color: 'var(--audit-delete-text)', label: 'Delete' },
   allow:  { bg: 'var(--audit-create-bg)', color: 'var(--audit-create-text)', label: 'Allowed' },
   deny:   { bg: 'var(--audit-delete-bg)', color: 'var(--audit-delete-text)', label: 'Denied' },
@@ -101,9 +102,9 @@ const DETAILS_MIN = 160
 const FILTER_LABEL = 'font-mono text-[10px] uppercase tracking-widest'
 
 const entities: AuditEntities = {
-  labels: { component: 'Monitor', check: 'Check', incident: 'Incident', maintenance: 'Maintenance', user: 'User', backup: 'Backup' },
-  icons: { component: 'monitor_heart', check: 'check_circle', incident: 'warning', maintenance: 'construction', user: 'person', backup: 'backup' },
-  groups: [{ label: 'Status', types: ['component', 'check', 'incident', 'maintenance'] }, { label: 'Administration', types: ['user', 'backup'] }],
+  labels: { component: 'Monitor', check: 'Check', incident: 'Incident', maintenance: 'Maintenance', user: 'User', backup: 'Backup', static_mirror: 'Static fallback' },
+  icons: { component: 'monitor_heart', check: 'check_circle', incident: 'warning', maintenance: 'construction', user: 'person', backup: 'backup', static_mirror: 'cloud_upload' },
+  groups: [{ label: 'Status', types: ['component', 'check', 'incident', 'maintenance'] }, { label: 'Administration', types: ['user', 'backup', 'static_mirror'] }],
 }
 
 export default function AuditLogPage() {
@@ -205,6 +206,7 @@ export default function AuditLogPage() {
             <option value="">{uiText('All actions')}</option>
             <option value="create">{uiText('Create')}</option>
             <option value="update">{uiText('Update')}</option>
+            <option value="update_attempt">Update attempt</option>
             <option value="delete">{uiText('Delete')}</option>
             <option value="publish">Publish</option>
             <option value="timeline_update">Timeline update</option>

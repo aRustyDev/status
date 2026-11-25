@@ -95,7 +95,6 @@ export default {
     } catch {
       // The independently stored copy is available when the primary service times out or throws.
     }
-    const fallback = await protectedCopy(request, env, '/')
-    return fallback.status === 503 && live ? live : fallback
+    return protectedCopy(request, env, '/')
   },
 }

@@ -15,6 +15,7 @@ export class FallbackConflictError extends Error {}
 
 interface FallbackState {
   revision: string
+  settingsRevision?: string
   enabled: boolean
   settings: FallbackSettings
   snapshot: unknown | null
@@ -24,6 +25,7 @@ interface FallbackState {
 
 const emptyState = (): FallbackState => ({
   revision: crypto.randomUUID(),
+  settingsRevision: 'initial',
   enabled: false,
   settings: { enabled: false, intervalSeconds: 60 },
   snapshot: null,
@@ -48,17 +50,18 @@ async function writeState(bucket: R2Bucket, state: FallbackState, etag: string |
 export function fallbackView(state: FallbackState, now = Date.now()) {
   const { settings, status, runs } = state
   const health = !settings.enabled ? 'disabled' : status.lastError ? 'error' : !status.lastSuccessAt ? 'pending' : now - status.lastSuccessAt > settings.intervalSeconds * 3000 ? 'stale' : 'ok'
-  return { settings, status, runs, health }
+  return { settings, settingsRevision: state.settingsRevision ?? 'initial', status, runs, health }
 }
 
 export async function getFallback(bucket: R2Bucket) {
   return fallbackView((await readState(bucket)).state)
 }
 
-export async function saveFallback(bucket: R2Bucket, settings: FallbackSettings) {
+export async function saveFallback(bucket: R2Bucket, settings: FallbackSettings, expectedRevision: string) {
   for (let attempt = 0; attempt < 8; attempt++) {
     const { state, etag } = await readState(bucket)
-    const next = { ...state, revision: crypto.randomUUID(), enabled: settings.enabled, settings }
+    if ((state.settingsRevision ?? 'initial') !== expectedRevision) throw new FallbackConflictError('Static fallback settings changed')
+    const next = { ...state, revision: crypto.randomUUID(), settingsRevision: crypto.randomUUID(), enabled: settings.enabled, settings }
     if (await writeState(bucket, next, etag)) return fallbackView(next)
   }
   throw new Error('Concurrent fallback update')
