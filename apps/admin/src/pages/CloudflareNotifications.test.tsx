@@ -24,6 +24,11 @@ beforeEach(()=>{
   })
 })
 describe('Cloudflare notification channels',()=>{
+  it('describes first-observation alert behavior accurately',async()=>{
+    setup()
+    expect(await screen.findByText(/first unhealthy monitor result can send an alert/)).toHaveTextContent('a first healthy result establishes a baseline')
+    expect(screen.queryByText(/Initial monitor results do not send an alert/)).not.toBeInTheDocument()
+  })
   it('creates a webhook using only a Vault Secure Value and selected local monitor',async()=>{
     const user=setup(); await user.click(await screen.findByRole('button',{name:'Add Channel'}))
     const form=screen.getByRole('dialog')

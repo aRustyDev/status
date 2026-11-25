@@ -11,6 +11,7 @@ type StoredSecret = { type: string; nonce: string; ciphertext: string; version: 
 type DecryptedSecret = { data: Record<string, unknown>; version: number; nonce: string }
 export type ValueCredentialSnapshot = { value: string; vaultId: number; secretId: number; version: number; nonce: string }
 export type MonitorCredential = { username: string; password: string }
+export type MonitorCredentialSnapshot = MonitorCredential & { vaultId: number; secretId: number; version: number; nonce: string }
 
 function reference(value: unknown): Reference | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -41,7 +42,7 @@ async function decrypt(db: D1Database, key: string | undefined, ref: Reference, 
 }
 
 /** Resolve only the Basic credential configured on this exact saved check version. */
-export async function resolveMonitorCredential(db: D1Database, key: string | undefined, checkId: string, configVersion: number): Promise<MonitorCredential | null> {
+export async function resolveMonitorCredentialSnapshot(db: D1Database, key: string | undefined, checkId: string, configVersion: number): Promise<MonitorCredentialSnapshot | null> {
   if (!checkId || !Number.isSafeInteger(configVersion) || configVersion < 1) return null
   try {
     const row = await db.prepare('SELECT advanced_config FROM http_checks WHERE id=? AND config_version=?')
@@ -55,11 +56,18 @@ export async function resolveMonitorCredential(db: D1Database, key: string | und
     if (type !== 'basic' || !basic || typeof basic !== 'object' || Array.isArray(basic)) return null
     const ref = reference((basic as Record<string, unknown>).vault)
     if (!ref) return null
-    const result = (await decrypt(db, key, ref, 'userpass'))?.data
+    const decrypted = await decrypt(db, key, ref, 'userpass')
+    const result = decrypted?.data
     if (!result || Object.keys(result).some(field => field !== 'username' && field !== 'password') ||
         typeof result.username !== 'string' || !result.username || typeof result.password !== 'string' || !result.password) return null
-    return { username: result.username, password: result.password }
+    return { username: result.username, password: result.password, ...ref, version: decrypted.version, nonce: decrypted.nonce }
   } catch { return null }
+}
+
+/** String-only convenience for non-transport callers. */
+export async function resolveMonitorCredential(db: D1Database, key: string | undefined, checkId: string, configVersion: number): Promise<MonitorCredential | null> {
+  const snapshot = await resolveMonitorCredentialSnapshot(db, key, checkId, configVersion)
+  return snapshot ? { username: snapshot.username, password: snapshot.password } : null
 }
 
 /** Resolve a scoped saved value and the exact encrypted record used to produce it. */
