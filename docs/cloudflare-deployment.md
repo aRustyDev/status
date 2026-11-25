@@ -99,6 +99,12 @@ On November 23, 2026 at 11:58 p.m. Eastern, the shared monitor editor was verifi
 
 ## Upstream UI staging gateway
 
+### System Health
+
+The administrator-only System Health page adapts the incorporated BetterStatusPage card, badge, and refresh UI. The Node report describes a persistent process and scheduler, so the Cloudflare page retains the presentation but uses a separate Worker report instead of inventing those metrics. See `UPSTREAM.md` and `THIRD_PARTY_LICENSE_BetterStatusPage` for attribution and license terms.
+
+The report checks the operations Worker response and D1, summarizes enabled native checks against the endpoint registry and their freshness, and checks the Gatus snapshot when configured. It does not establish scheduler liveness or report the health of each monitored service. The backup check only verifies that the configured backup service and its R2 binding respond to a read; it does not verify backup integrity or a schedule. Notifications and static fallback remain unavailable until those integrations provide health signals. Disabled checks do not make the overall report degraded; failed dependencies or stale checks do. Access authentication and the administrator role are required, and dependency errors and configuration details are not returned. Because authentication itself uses D1, a D1 outage can prevent the report from being returned at all. Deploy the backup Worker with its private `/health` endpoint before deploying an operations Worker that uses it; an older backup Worker returns 404 and will be reported unavailable until upgraded. Keep the backup Worker private and preserve its configured bindings when deploying it.
+
 The cutover gateway is configured in `apps/gateway/wrangler.jsonc`. Its staging `UI_MODE` selects `legacy` or `upstream` HTML while both `/api/v1/` and `/api/v1/bsp/` remain routed to the internal Workers. The gateway serves the legacy board from the operations Worker and forwards upstream assets to the status and admin UI Workers. Keep both UI Workers deployed during a rollback so existing tabs can load their assets.
 
 Apply the additive migrations to staging D1 using the existing migration owner before deploying code that reads aliases. Build `@bsp/shared`, `@bsp/board`, `@bsp/status`, and `@bsp/admin`. Deploy the internal Workers first, then the gateway:

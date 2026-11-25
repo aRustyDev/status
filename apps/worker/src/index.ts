@@ -3,6 +3,7 @@ import { endpointFingerprint, parseEndpoints } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
 import { parsePersistedHttpConfig } from '../../probe/src/http-monitor'
 import { ProbeTestTimeout, requestProbeTest } from './probe-test'
+import { getSystemHealthReport } from './system-health'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
 interface Env {
@@ -558,6 +559,10 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   const db = env.DB
   const method = request.method
   const route = path.slice('/api/v1/bsp'.length)
+  if (route === '/admin/system-health' && method === 'GET') {
+    requireRole(user, 'admin')
+    return json(await getSystemHealthReport(env))
+  }
   if (route === '/admin/audit-log' && method === 'GET') {
     requireRole(user, 'admin')
     return auditPage(db, request)
@@ -742,7 +747,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     return json({ id: saved.result_alias, version: saved.result_version }, saved.status)
   }
   if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now() })
-  if (route === '/capabilities' && method === 'GET') return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : [])], subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+  if (route === '/capabilities' && method === 'GET') return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : [])], subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
   if (method === 'GET' && route === '/public/access') return json({ private: true, signedIn: true, email: user.email, role: user.role, passwordChangeRequired: false, branding: null })

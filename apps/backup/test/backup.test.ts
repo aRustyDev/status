@@ -50,6 +50,22 @@ function fixture() {
 const createdAt = String(Date.now())
 function request(path: string, method = 'GET', backupId = id) { return new Request(`https://backup.internal${path}`, { method, headers: { 'x-backup-id': backupId, 'x-backup-created-at': createdAt } }) }
 
+test('health probes only one R2 read and reports failure without details', async () => {
+  const { env, bucket } = fixture()
+  const calls: string[] = []
+  bucket.head = async key => { calls.push(key); return null }
+  bucket.list = async () => { throw new Error('health must not list jobs') }
+  const healthy = await backupService(request('/health'), env)
+  assert.equal(healthy.status, 200)
+  assert.equal(healthy.headers.get('cache-control'), 'no-store')
+  assert.deepEqual(calls, ['health-probe'])
+  bucket.head = async () => { throw new Error('private R2 detail') }
+  const failed = await backupService(request('/health'), env)
+  assert.equal(failed.status, 503)
+  assert.doesNotMatch(await failed.text(), /private R2 detail/)
+  assert.equal((await backupService(request('/health', 'POST'), env)).status, 404)
+})
+
 test('starts one idempotent job and lists its running state', async () => {
   const { env, workflows } = fixture()
   assert.equal((await backupService(request('/backups', 'POST', 'invalid'), env)).status, 400)

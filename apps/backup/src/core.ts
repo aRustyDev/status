@@ -32,6 +32,12 @@ async function digest(body: ReadableStream): Promise<string> {
 }
 export async function backupService(request: Request, env: BackupEnv): Promise<Response> {
   const url = new URL(request.url)
+  if (url.pathname === '/health' && request.method === 'GET') {
+    // A missing object is a successful read; no backup data or job status is needed.
+    try { await env.BACKUP_BUCKET.head('health-probe') }
+    catch { return error('Backup service unavailable', 503) }
+    return json({ status: 'ok' })
+  }
   if (url.pathname === '/backups' && request.method === 'GET') {
     const cursor = url.searchParams.get('cursor')
     if (cursor !== null && (cursor.length === 0 || cursor.length > 2048)) return error('Invalid backup cursor', 400)

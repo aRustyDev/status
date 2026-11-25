@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 import worker from '../src/index.ts'
+import { getSystemHealthReport } from '../src/system-health.ts'
 import probeWorker from '../../probe/src/index.ts'
 import { endpointFingerprint } from '../src/endpoint-config.ts'
 import { syncGatusCatalog } from '../src/gatus-catalog.ts'
@@ -143,6 +144,96 @@ test('Access identity, roles and same-origin mutations are enforced', async () =
   assert.equal((await request('/api/v1/admin/users', operatorToken)).response.status, 403)
   assert.equal((await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'API' }, 'https://evil.example')).response.status, 403)
   assert.equal((await request('/api/v1/admin/users', adminToken)).response.status, 200)
+})
+
+test('system health is administrator-only and reports observed dependency state', async () => {
+  const path = '/api/v1/bsp/admin/system-health'
+  assert.equal((await request(path)).response.status, 401)
+  assert.equal((await request(path, viewerToken)).response.status, 403)
+  assert.equal((await request(path, operatorToken)).response.status, 403)
+  const initial = await request(path, adminToken)
+  assert.equal(initial.response.status, 200)
+  assert.equal(initial.response.headers.get('cache-control'), 'no-store')
+  const report = initial.body as unknown as { status: string; database: { status: string }; monitoring: { status: string }; backups: { status: string }; notifications: { status: string }; staticMirror: { status: string } }
+  assert.equal(report.status, 'healthy')
+  assert.equal(report.database.status, 'ok')
+  assert.equal(report.monitoring.status, 'disabled')
+  assert.equal(report.backups.status, 'disabled')
+  env.BACKUPS_READY = 'true'
+  try {
+    const missing = (await request(path, adminToken)).body as unknown as { status: string; backups: { status: string } }
+    assert.equal(missing.status, 'degraded')
+    assert.equal(missing.backups.status, 'error')
+  } finally { delete env.BACKUPS_READY }
+  assert.equal(report.notifications.status, 'disabled')
+  assert.equal(report.staticMirror.status, 'disabled')
+  env.GATUS_REQUIRED = 'true'
+  try {
+    const missing = (await request(path, adminToken)).body as unknown as { status: string; gatus: { status: string } }
+    assert.equal(missing.status, 'degraded')
+    assert.equal(missing.gatus.status, 'error')
+  } finally { delete env.GATUS_REQUIRED }
+
+  await db.prepare("INSERT INTO components (id, name, position, manual_status, updated_at) VALUES ('health-gatus', 'Gatus fixture', 0, 'operational', 0)").run()
+  await db.prepare("INSERT INTO gatus_sources (source_id,component_id,kind,source_key,source_name,source_group,stale_after_seconds,advisory) VALUES ('health-source','health-gatus','endpoint','health-key','Health Gatus','',180,0)").run()
+  try {
+    const status = { key: 'health-key', name: 'Health Gatus', group: '', results: [{ success: true, timestamp: new Date().toISOString(), duration: 1000 }] }
+    env.GATUS = { fetch: async incoming => Response.json(new URL(incoming.url).pathname.includes('/endpoints/') ? [status] : []) }
+    assert.equal(((await request(path, adminToken)).body as unknown as {gatus:{status:string}}).gatus.status, 'ok')
+    status.results = []
+    assert.equal(((await request(path, adminToken)).body as unknown as {gatus:{status:string}}).gatus.status, 'attention')
+    env.GATUS = { fetch: async () => { throw new Error('private gatus failure') } }
+    const unavailable = (await request(path, adminToken)).body as unknown as {gatus:{status:string}}
+    assert.equal(unavailable.gatus.status, 'error')
+    assert.doesNotMatch(JSON.stringify(unavailable), /private gatus failure/)
+  } finally {
+    delete env.GATUS
+    await db.prepare("DELETE FROM gatus_sources WHERE source_id='health-source'").run()
+    await db.prepare("DELETE FROM components WHERE id='health-gatus'").run()
+  }
+  const endpoint = { id: 'health-endpoint', name: 'Health fixture', url: 'https://example.com/' }
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  await db.prepare('INSERT INTO endpoint_registry (endpoint_id, fingerprint) VALUES (?, ?)').bind(endpoint.id, await endpointFingerprint(endpoint)).run()
+  await db.prepare("INSERT INTO components (id, name, position, manual_status, updated_at) VALUES ('health-component', 'Health fixture', 0, 'operational', 0)").run()
+  await db.prepare("INSERT INTO http_checks (id, component_id, endpoint_id, enabled, interval_minutes, expected_status, last_result_at) VALUES ('health-check', 'health-component', 'health-endpoint', 1, 1, 200, ?)").bind(Date.now()).run()
+  try {
+    const fresh = (await request(path, adminToken)).body as unknown as { status: string; monitoring: { status: string; configuredMonitors: number; overdueMonitors: number } }
+    assert.equal(fresh.status, 'healthy')
+    assert.deepEqual([fresh.monitoring.status, fresh.monitoring.configuredMonitors, fresh.monitoring.overdueMonitors], ['ok', 1, 0])
+    env.ENDPOINTS = JSON.stringify([{ ...endpoint, url: 'https://other.example/' }])
+    const mismatch = (await request(path, adminToken)).body as unknown as typeof fresh
+    assert.deepEqual([mismatch.status, mismatch.monitoring.status, mismatch.monitoring.overdueMonitors], ['degraded', 'attention', 1])
+    env.ENDPOINTS = JSON.stringify([endpoint])
+    await db.prepare("UPDATE http_checks SET last_result_at=0 WHERE id='health-check'").run()
+    const stale = (await request(path, adminToken)).body as unknown as typeof fresh
+    assert.equal(stale.status, 'degraded')
+    assert.deepEqual([stale.monitoring.status, stale.monitoring.overdueMonitors], ['attention', 1])
+    env.BACKUPS_READY = 'true'
+    env.BACKUPS = { fetch: async () => { throw new Error('secret backup credentials') } }
+    const failed = (await request(path, adminToken)).body as unknown as { status: string; backups: { status: string } }
+    assert.equal(failed.status, 'degraded')
+    assert.equal(failed.backups.status, 'error')
+    assert.doesNotMatch(JSON.stringify(failed), /secret backup credentials/)
+    env.BACKUPS = { fetch: async incoming => {
+      assert.equal(new URL(incoming.url).pathname, '/health')
+      return Response.json({ status: 'ok' })
+    } }
+    assert.equal(((await request(path, adminToken)).body as unknown as { backups: { status: string } }).backups.status, 'ok')
+  } finally {
+    delete env.BACKUPS; delete env.BACKUPS_READY; env.ENDPOINTS = '[]'
+    await db.prepare('DELETE FROM endpoint_registry WHERE endpoint_id=?').bind(endpoint.id).run()
+    await db.prepare("DELETE FROM http_checks WHERE id='health-check'").run()
+    await db.prepare("DELETE FROM components WHERE id='health-component'").run()
+  }
+})
+
+test('system health redacts unavailable database errors', async () => {
+  const failed = { prepare() { throw new Error('sensitive database detail') } }
+  const report = await getSystemHealthReport({ DB: failed as unknown as D1Database, ENDPOINTS: '[]' })
+  assert.equal(report.status, 'degraded')
+  assert.equal(report.database.status, 'error')
+  assert.equal(report.monitoring.status, 'error')
+  assert.doesNotMatch(JSON.stringify(report), /sensitive database detail/)
 })
 
 test('backup service stays capability-gated, administrator-only and idempotent', async () => {

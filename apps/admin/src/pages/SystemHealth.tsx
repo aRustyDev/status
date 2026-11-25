@@ -1,48 +1,25 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
-import { Alert, ErrorState, LoadingState, PageContainer, PageHeader } from '@better-forge/ui'
-import { formatDateTime } from '@better-forge/ui'
+import { Alert, ErrorState, LoadingState, PageContainer, PageHeader, formatDateTime } from '@better-forge/ui'
 
+// Adapted from BetterStatusPage's SystemHealth page (MIT; see THIRD_PARTY_LICENSE_BetterStatusPage).
+// Cloudflare Workers have no persistent process uptime or in-process scheduler, so
+// this page presents only the signals supplied by the Cloudflare health endpoint.
 type ComponentStatus = 'ok' | 'attention' | 'error' | 'disabled'
-
 interface SystemHealthReport {
   status: 'healthy' | 'degraded'
   generatedAt: number
-  application: { status: 'ok'; version: string; uptimeSeconds: number; update: { version: string; url: string } | null }
+  application: { status: 'ok' }
   database: { status: 'ok' | 'error'; responseMs: number | null }
-  monitoring: {
-    status: ComponentStatus
-    schedulerRunning: boolean
-    configuredMonitors: number | null
-    overdueMonitors: number | null
-    lastMonitorCheckAt: number | null
-    lastTickStartedAt: number | null
-    lastTickCompletedAt: number | null
-    lastTickDurationMs: number | null
-    lastTickDueMonitors: number
-    lastTickFailedChecks: number
-  }
-  notifications: { status: ComponentStatus; pending: number | null; failed: number | null; lastDeliveredAt: number | null }
-  backups: {
-    status: ComponentStatus
-    scheduleEnabled: boolean
-    state: 'idle' | 'running' | 'success' | 'error'
-    storedBackups: number | null
-    latestBackupAt: number | null
-    lastCompletedAt: number | null
-  }
-  staticMirror: { status: ComponentStatus; enabled: boolean; lastRunAt: number | null; lastSuccessAt: number | null; lastError: string | null }
+  monitoring: { status: ComponentStatus; configuredMonitors: number | null; overdueMonitors: number | null; lastMonitorCheckAt: number | null }
+  gatus: { status: ComponentStatus; configuredMonitors: number | null }
+  notifications: { status: 'disabled' }
+  backups: { status: 'ok' | 'error' | 'disabled' }
+  staticMirror: { status: 'disabled' }
 }
 
 function formatDate(value: number | null) {
-  return value === null ? 'Never' : formatDateTime(value)
-}
-
-function formatUptime(totalSeconds: number) {
-  const days = Math.floor(totalSeconds / 86_400)
-  const hours = Math.floor(totalSeconds % 86_400 / 3_600)
-  const minutes = Math.floor(totalSeconds % 3_600 / 60)
-  return [days && `${days}d`, (days || hours) && `${hours}h`, `${minutes}m`].filter(Boolean).join(' ')
+  return value === null ? 'Unavailable' : formatDateTime(value)
 }
 
 function StatusBadge({ status }: { status: ComponentStatus | 'healthy' | 'degraded' }) {
@@ -56,12 +33,7 @@ function StatusBadge({ status }: { status: ComponentStatus | 'healthy' | 'degrad
   return <span className="rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wide" style={palette}>{status}</span>
 }
 
-function HealthCard({ icon, title, status, children }: {
-  icon: string
-  title: string
-  status: ComponentStatus | 'ok' | 'error'
-  children: React.ReactNode
-}) {
+function HealthCard({ icon, title, status, children }: { icon: string; title: string; status: ComponentStatus; children: React.ReactNode }) {
   return (
     <section className="rounded-2xl p-5 md:p-6 space-y-5" style={{ background: 'var(--m3-surface-container-lowest)', border: '1px solid var(--m3-outline-variant)' }}>
       <div className="flex items-center justify-between gap-4">
@@ -84,100 +56,68 @@ export default function SystemHealthPage() {
   const [report, setReport] = useState<SystemHealthReport | null>(null)
   const [error, setError] = useState('')
   const [refreshing, setRefreshing] = useState(false)
-
+  const requestSequence = useRef(0)
   const load = useCallback(async (manual = false) => {
+    const sequence = ++requestSequence.current
     if (manual) setRefreshing(true)
     try {
-      setReport(await api.get<SystemHealthReport>('/admin/system-health'))
-      setError('')
+      const next = await api.get<SystemHealthReport>('/admin/system-health')
+      if (sequence === requestSequence.current) { setReport(next); setError('') }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      if (sequence === requestSequence.current) setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
-      if (manual) setRefreshing(false)
+      if (sequence === requestSequence.current) setRefreshing(false)
     }
   }, [])
-
   useEffect(() => {
+    const sequence = requestSequence
     void load()
     const interval = window.setInterval(() => { void load() }, 15_000)
-    return () => window.clearInterval(interval)
+    return () => { window.clearInterval(interval); sequence.current++ }
   }, [load])
-
-  const header = (
-    <PageHeader
-      title="System Health"
-      subtitle="Internal health of this BetterStatusPage instance."
-      actions={
-        <button type="button" disabled={refreshing} onClick={() => { void load(true) }} className="btn btn-primary">
-          <span className="material-symbols-outlined" aria-hidden="true">refresh</span>
-          {refreshing ? 'Refreshing…' : 'Refresh'}
-        </button>
-      }
-    />
-  )
-
+  const header = <PageHeader title="System Health" subtitle="Internal health of this Cloudflare deployment." actions={
+    <button type="button" disabled={refreshing} onClick={() => { void load(true) }} className="btn btn-primary">
+      <span className="material-symbols-outlined" aria-hidden="true">refresh</span>{refreshing ? 'Refreshing…' : 'Refresh'}
+    </button>
+  } />
   if (!report && !error) return <PageContainer>{header}<LoadingState label="Loading system health…" /></PageContainer>
-
-  return (
-    <PageContainer className="text-[color:var(--m3-on-surface)]">
-      {header}
-
-      {error && (report
-        ? <Alert tone="error">{error}</Alert>
-        : <ErrorState message={error} onRetry={() => { void load(true) }} />)}
-
-      {report && <>
-        <div className="rounded-2xl p-5 flex flex-wrap items-center justify-between gap-4" style={{ background: report.status === 'healthy' ? 'var(--m3-up-bg)' : 'var(--m3-error-container)' }}>
-          <div><p className="font-headline text-xl font-semibold">{report.status === 'healthy' ? 'BetterStatusPage is healthy' : 'BetterStatusPage needs attention'}</p><p className="text-sm opacity-80">Updated {formatDateTime(report.generatedAt)} · refreshes every 15 seconds</p></div>
-          <StatusBadge status={report.status} />
-        </div>
-
-        <div className="grid gap-6 lg:grid-cols-2">
-          <HealthCard icon="deployed_code" title="Application" status={report.application.status}>
-            <Metric label="Version" value={report.application.update
-              ? <>{report.application.version} · <a href={report.application.update.url} target="_blank" rel="noopener" className="underline" style={{ color: 'var(--m3-primary)' }}>{report.application.update.version} available</a></>
-              : report.application.version} />
-            <Metric label="Process uptime" value={formatUptime(report.application.uptimeSeconds)} />
-          </HealthCard>
-
-          <HealthCard icon="database" title="Database" status={report.database.status}>
-            <Metric label="Connection" value={report.database.status === 'ok' ? 'Available' : 'Unavailable'} />
-            <Metric label="Response time" value={report.database.responseMs === null ? 'Unavailable' : `${report.database.responseMs} ms`} />
-          </HealthCard>
-
-          <HealthCard icon="monitor_heart" title="Monitor scheduler" status={report.monitoring.status}>
-            <Metric label="Scheduler" value={report.monitoring.schedulerRunning ? 'Running' : 'Stopped'} />
-            <Metric label="Configured monitors" value={report.monitoring.configuredMonitors ?? 'Unavailable'} />
-            <Metric label="Overdue monitors" value={report.monitoring.overdueMonitors ?? 'Unavailable'} />
-            <Metric label="Latest stored check" value={formatDate(report.monitoring.lastMonitorCheckAt)} />
-            <Metric label="Last scheduler tick" value={formatDate(report.monitoring.lastTickCompletedAt)} />
-            <Metric label="Last tick duration" value={report.monitoring.lastTickDurationMs === null ? 'Never' : `${report.monitoring.lastTickDurationMs} ms`} />
-            <Metric label="Checks due in last tick" value={report.monitoring.lastTickDueMonitors} />
-            <Metric label="Failed jobs in last tick" value={report.monitoring.lastTickFailedChecks} />
-          </HealthCard>
-
-          <HealthCard icon="notifications_active" title="Notification delivery" status={report.notifications.status}>
-            <Metric label="Pending deliveries" value={report.notifications.pending ?? 'Unavailable'} />
-            <Metric label="Failed deliveries" value={report.notifications.failed ?? 'Unavailable'} />
-            <Metric label="Last delivered" value={formatDate(report.notifications.lastDeliveredAt)} />
-          </HealthCard>
-
-          <HealthCard icon="backup" title="Backups" status={report.backups.status}>
-            <Metric label="Automatic schedule" value={report.backups.scheduleEnabled ? 'Enabled' : 'Disabled'} />
-            <Metric label="Last operation" value={report.backups.state} />
-            <Metric label="Stored backups" value={report.backups.storedBackups ?? 'Unavailable'} />
-            <Metric label="Latest backup" value={formatDate(report.backups.latestBackupAt)} />
-            <Metric label="Last completed operation" value={formatDate(report.backups.lastCompletedAt)} />
-          </HealthCard>
-
-          <HealthCard icon="cloud_upload" title="Static fallback" status={report.staticMirror.status}>
-            <Metric label="Push" value={report.staticMirror.enabled ? 'Enabled' : 'Disabled'} />
-            <Metric label="Last attempt" value={formatDate(report.staticMirror.lastRunAt)} />
-            <Metric label="Last success" value={formatDate(report.staticMirror.lastSuccessAt)} />
-            {report.staticMirror.lastError && <Metric label="Last error" value={report.staticMirror.lastError} />}
-          </HealthCard>
-        </div>
-      </>}
-    </PageContainer>
-  )
+  return <PageContainer className="text-[color:var(--m3-on-surface)]">
+    {header}
+    {error && (report ? <Alert tone="error">{error}</Alert> : <ErrorState message={error} onRetry={() => { void load(true) }} />)}
+    {report && <>
+      <div className="rounded-2xl p-5 flex flex-wrap items-center justify-between gap-4" style={{ background: report.status === 'healthy' ? 'var(--m3-up-bg)' : 'var(--m3-error-container)' }}>
+        <div><p className="font-headline text-xl font-semibold">{report.status === 'healthy' ? 'BetterStatusPage is healthy' : 'BetterStatusPage needs attention'}</p><p className="text-sm opacity-80">Updated {formatDateTime(report.generatedAt)} · refreshes every 15 seconds</p></div>
+        <StatusBadge status={report.status} />
+      </div>
+      <div className="grid gap-6 lg:grid-cols-2">
+        <HealthCard icon="deployed_code" title="Application" status={report.application.status}>
+          <Metric label="Worker" value="Responding" />
+        </HealthCard>
+        <HealthCard icon="database" title="Database" status={report.database.status}>
+          <Metric label="Connection" value={report.database.status === 'ok' ? 'Available' : 'Unavailable'} />
+          <Metric label="Response time" value={report.database.responseMs === null ? 'Unavailable' : `${report.database.responseMs} ms`} />
+        </HealthCard>
+        <HealthCard icon="monitor_heart" title="Monitoring" status={report.monitoring.status}>
+          <Metric label="Configured checks" value={report.monitoring.configuredMonitors ?? 'Unavailable'} />
+          <Metric label="Overdue checks" value={report.monitoring.overdueMonitors ?? 'Unavailable'} />
+          <Metric label="Latest stored check" value={formatDate(report.monitoring.lastMonitorCheckAt)} />
+          <Metric label="Scheduler liveness" value="Unavailable" />
+        </HealthCard>
+        <HealthCard icon="monitoring" title="Gatus integration" status={report.gatus.status}>
+          <Metric label="Snapshot" value={report.gatus.status === 'ok' ? 'Available' : report.gatus.status === 'attention' ? 'Stale or pending' : report.gatus.status === 'disabled' ? 'Not configured' : 'Unavailable'} />
+          <Metric label="Configured monitors" value={report.gatus.configuredMonitors ?? 'Unavailable'} />
+        </HealthCard>
+        <HealthCard icon="notifications_active" title="Notification delivery" status={report.notifications.status}>
+          <Metric label="Delivery" value="Not available" />
+        </HealthCard>
+        <HealthCard icon="backup" title="Backups" status={report.backups.status}>
+          <Metric label="Backup service" value={report.backups.status === 'ok' ? 'Available' : report.backups.status === 'disabled' ? 'Not enabled' : 'Unavailable'} />
+          <Metric label="Backup integrity" value="Not checked" />
+        </HealthCard>
+        <HealthCard icon="cloud_upload" title="Static fallback" status={report.staticMirror.status}>
+          <Metric label="Push" value="Not available" />
+        </HealthCard>
+      </div>
+    </>}
+  </PageContainer>
 }
