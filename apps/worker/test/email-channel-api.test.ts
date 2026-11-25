@@ -196,7 +196,7 @@ test('channel saves reject a check moved after its catalog snapshot', async () =
   assert.equal((local.db.prepare('SELECT COUNT(*) AS n FROM monitor_notification_channels WHERE channel_id=?').get(channel.id) as {n:number}).n,0)
 })
 
-test('a name-only channel edit preserves only still-linked current queued jobs', async () => {
+test('a rename preserves history only while monitor associations are unchanged', async () => {
   const {local,env}=setup()
   const snapshots=[{id:checkA,componentId:'component-a',version:1},{id:checkB,componentId:'component-b',version:1}]
   const payload={name:'Original name',type:'email',recipientId:'ops',enabled:true,checkIds:[checkA,checkB],expectedChecks:snapshots}
@@ -210,21 +210,40 @@ test('a name-only channel edit preserves only still-linked current queued jobs',
   const delivery=local.db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,?,'down')")
   delivery.run(channel.id,checkA,channel.version)
   delivery.run(channel.id,checkB,channel.version)
-  const edited=await channelApi(request('PATCH',{...payload,name:'Renamed',checkIds:[checkA],expectedChecks:[snapshots[0]],version:channel.version,expectedCheckIds:[checkA,checkB],expectedAssociationVersion:channel.associationVersion}),env,actor,`/admin/notifications/channels/${channel.id}`)
+  const renamed=await channelApi(request('PATCH',{...payload,name:'Renamed',checkIds:[checkB,checkA],expectedChecks:[snapshots[1],snapshots[0]],version:channel.version,expectedCheckIds:[checkA,checkB],expectedAssociationVersion:channel.associationVersion}),env,actor,`/admin/notifications/channels/${channel.id}`)
+  const afterRename=await renamed.json() as {version:number;associationVersion:number}
+  assert.equal(afterRename.version,channel.version+1)
+  assert.deepEqual(local.db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? ORDER BY check_id').all(channel.id).map(row=>row.channel_version),[afterRename.version,afterRename.version])
+  assert.equal((local.db.prepare("SELECT channel_version FROM notification_outbox WHERE id='keep-pending'").get() as {channel_version:number}).channel_version,afterRename.version)
+  const edited=await channelApi(request('PATCH',{...payload,name:'Renamed again',checkIds:[checkA],expectedChecks:[snapshots[0]],version:afterRename.version,expectedCheckIds:[checkA,checkB],expectedAssociationVersion:afterRename.associationVersion}),env,actor,`/admin/notifications/channels/${channel.id}`)
   const after=await edited.json() as {version:number;associationVersion:number}
-  assert.equal(after.version,channel.version+1)
-  assert.deepEqual(local.db.prepare('SELECT check_id,channel_version FROM notification_delivery_state WHERE channel_id=?').all(channel.id).map(row=>({...row})),[{check_id:checkA,channel_version:after.version}])
+  assert.equal(after.version,afterRename.version+1)
+  assert.deepEqual(local.db.prepare('SELECT check_id,channel_version FROM notification_delivery_state WHERE channel_id=?').all(channel.id).map(row=>({...row})),[{check_id:checkA,channel_version:afterRename.version}])
   const jobs=local.db.prepare('SELECT id,state,channel_version,lease_token FROM notification_outbox ORDER BY id').all().map(row=>({...row}))
   assert.deepEqual(jobs,[
-    {id:'keep-pending',state:'pending',channel_version:after.version,lease_token:null},
-    {id:'keep-sending',state:'sending',channel_version:after.version,lease_token:'active'},
+    {id:'keep-pending',state:'pending',channel_version:afterRename.version,lease_token:null},
+    {id:'keep-sending',state:'sending',channel_version:afterRename.version,lease_token:'active'},
     {id:'older',state:'pending',channel_version:0,lease_token:null},
-    {id:'removed',state:'failed',channel_version:after.version,lease_token:null},
+    {id:'removed',state:'failed',channel_version:afterRename.version,lease_token:null},
     {id:'sent',state:'sent',channel_version:channel.version,lease_token:null},
   ])
   const changedEnv={...env,EMAIL_DESTINATIONS:JSON.stringify([{id:'ops',name:'Operations',address:'ops@example.test'},{id:'backup',name:'Backup',address:'backup@example.test'}])}
-  const changed=await channelApi(request('PATCH',{...payload,name:'Renamed',recipientId:'backup',checkIds:[checkA],expectedChecks:[snapshots[0]],version:after.version,expectedCheckIds:[checkA],expectedAssociationVersion:after.associationVersion}),changedEnv,actor,`/admin/notifications/channels/${channel.id}`)
+  const changed=await channelApi(request('PATCH',{...payload,name:'Renamed again',recipientId:'backup',checkIds:[checkA],expectedChecks:[snapshots[0]],version:after.version,expectedCheckIds:[checkA],expectedAssociationVersion:after.associationVersion}),changedEnv,actor,`/admin/notifications/channels/${channel.id}`)
   assert.equal((await changed.json() as {version:number}).version,after.version+1)
-  assert.equal((local.db.prepare('SELECT channel_version FROM notification_outbox WHERE id=?').get('keep-pending') as {channel_version:number}).channel_version,after.version)
-  assert.equal((local.db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkA) as {channel_version:number}).channel_version,after.version)
+  assert.equal((local.db.prepare('SELECT channel_version FROM notification_outbox WHERE id=?').get('keep-pending') as {channel_version:number}).channel_version,afterRename.version)
+  assert.equal((local.db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkA) as {channel_version:number}).channel_version,afterRename.version)
+})
+
+test('a rename combined with a new monitor does not carry prior deliveries', async () => {
+  const {local,env}=setup()
+  const a={id:checkA,componentId:'component-a',version:1}, b={id:checkB,componentId:'component-b',version:1}
+  const payload={name:'Original',type:'email',recipientId:'ops',enabled:true,checkIds:[checkA],expectedChecks:[a]}
+  const channel=await (await channelApi(request('POST',payload),env,actor,'/admin/notifications/channels')).json() as {id:string;version:number;associationVersion:number}
+  local.db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,state,created_at,updated_at) VALUES ('pending',?,?,?,1,100,'down','pending',100,100)").run(channel.id,channel.version,checkA)
+  local.db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,?,'down')").run(channel.id,checkA,channel.version)
+  const response=await channelApi(request('PATCH',{...payload,name:'Renamed',checkIds:[checkA,checkB],expectedChecks:[a,b],version:channel.version,expectedCheckIds:[checkA],expectedAssociationVersion:channel.associationVersion}),env,actor,`/admin/notifications/channels/${channel.id}`)
+  const edited=await response.json() as {version:number}
+  assert.equal(edited.version,channel.version+1)
+  assert.equal((local.db.prepare("SELECT channel_version FROM notification_outbox WHERE id='pending'").get() as {channel_version:number}).channel_version,channel.version)
+  assert.equal((local.db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkA) as {channel_version:number}).channel_version,channel.version)
 })

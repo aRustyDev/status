@@ -134,7 +134,10 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
     FROM notification_channels WHERE id=? AND version=?`,id,version).first<{name:string;channel_type:string;endpoint_id:string;endpoint_fingerprint:string;vault_id:number;secret_id:number;enabled:number;recipient_id:string | null;email_fingerprint:string | null}>() : null
   // A display-name-only edit must not discard already queued deliveries. The
   // mutation and retarget below share the same version and mutation-key fence.
-  const carryQueued = !!before && before.name!==input.name.trim() && before.channel_type===type && before.endpoint_id===endpointId && before.endpoint_fingerprint===fingerprint && before.vault_id===vaultId && before.secret_id===secretId && before.enabled===(input.enabled?1:0) && before.recipient_id===recipientId && before.email_fingerprint===emailFingerprint
+  const expectedChecks = method === 'PATCH' ? input.expectedCheckIds as string[] : []
+  const expectedCheckSet = new Set(expectedChecks)
+  const unchangedChecks = checks.length === expectedCheckSet.size && checks.every(check => expectedCheckSet.has(check))
+  const carryQueued = !!before && unchangedChecks && before.name!==input.name.trim() && before.channel_type===type && before.endpoint_id===endpointId && before.endpoint_fingerprint===fingerprint && before.vault_id===vaultId && before.secret_id===secretId && before.enabled===(input.enabled?1:0) && before.recipient_id===recipientId && before.email_fingerprint===emailFingerprint
   const expected=JSON.stringify(input.expectedCheckIds ?? [])
   const checkSnapshots=JSON.stringify(snapshots)
   const checkSnapshotGuard = `NOT EXISTS (SELECT 1 FROM json_each(?) snapshot WHERE NOT EXISTS (
