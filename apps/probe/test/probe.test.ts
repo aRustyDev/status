@@ -895,6 +895,75 @@ test('first observation after a configuration version change still establishes a
   sqlite.close()
 })
 
+test('saved Vault headers are sent by tests and schedules and fenced against rotation', async () => {
+  const { sqlite, now, env } = fixture()
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0008_vault.sql', import.meta.url), 'utf8'))
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0015_monitor_request.sql', import.meta.url), 'utf8'))
+  const endpoint = { id:'endpoint-0', name:'Fixture', url:'https://example.com/0', requestPolicy:{allowPost:true,plaintextHeaders:['x-public'],vaultHeaders:['x-api-key']} }
+  const { endpointFingerprint } = await import('../../worker/src/endpoint-config.ts')
+  const fingerprint = await endpointFingerprint(endpoint)
+  sqlite.prepare('UPDATE endpoint_registry SET fingerprint=? WHERE endpoint_id=?').run(fingerprint, endpoint.id)
+  const keyHex = 'ab'.repeat(32)
+  const { vaultKeyReady } = await import('../../worker/src/vault.ts')
+  assert.equal(await vaultKeyReady(env.DB as never, keyHex), true)
+  sqlite.prepare('INSERT INTO vaults(id,name,created_at,updated_at) VALUES (1,?,?,?)').run('fixture', now, now)
+  const key = await crypto.subtle.importKey('raw', new Uint8Array(32).fill(0xab), 'AES-GCM', false, ['encrypt'])
+  const nonce = crypto.getRandomValues(new Uint8Array(12))
+  const bytes = await crypto.subtle.encrypt({name:'AES-GCM',iv:nonce,additionalData:new TextEncoder().encode('status-vault-v1:1:2:value')},key,new TextEncoder().encode(JSON.stringify({value:'synthetic-secret'})))
+  const b64 = (value: Uint8Array) => btoa(Array.from(value, byte => String.fromCharCode(byte)).join(''))
+  sqlite.prepare("INSERT INTO vault_secrets(id,vault_id,name,type,ciphertext,nonce,created_at,updated_at) VALUES (2,1,'fixture','value',?,?,?,?)").run(b64(new Uint8Array(bytes)),b64(nonce),now,now)
+  const advanced = {method:'POST',timeoutMs:5000,attempts:1,headers:{'x-public':'public'},vaultHeaders:{'x-api-key':{vaultId:1,secretId:2}},body:'{"probe":true}'}
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify(advanced),'check-0')
+  const runtime = {...env,ENDPOINTS:JSON.stringify([endpoint]),VAULT_ENCRYPTION_KEY:keyHex,MONITOR_AUTH_READY:'true'}
+  const checkVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+  let calls = 0
+  globalThis.fetch = async (_url, init) => {
+    calls++
+    assert.equal(init?.method, 'POST')
+    assert.equal(init?.body, advanced.body)
+    assert.equal(new Headers(init?.headers).get('x-public'), 'public')
+    assert.equal(new Headers(init?.headers).get('x-api-key'), 'synthetic-secret')
+    assert.equal(new Headers(init?.headers).get('content-type'), 'application/json')
+    return new Response(null, {status:200})
+  }
+  const request = (input: unknown) => new Request('https://probe.internal/test',{method:'POST',body:JSON.stringify(input)})
+  const saved = await worker.fetch(request({checkId:'check-0',checkVersion}),runtime as never)
+  const result = await saved.text()
+  assert.match(result,/HTTP check passed/)
+  assert.doesNotMatch(result,/synthetic-secret/)
+  await runChecks(now,runtime as never)
+  assert.equal(calls,2)
+  assert.equal((await worker.fetch(request({endpointId:'endpoint-0',expectedStatus:200,advancedConfig:advanced}),runtime as never)).status,400)
+  let changed = false
+  const guardedDb = {...env.DB,prepare(sql: string) {
+    if (!changed && sql.includes('SELECT c.advanced_config AS advanced_config FROM http_checks c JOIN endpoint_registry')) {
+      changed = true
+      sqlite.prepare('UPDATE vault_secrets SET version=version+1 WHERE id=2').run()
+    }
+    return env.DB.prepare(sql)
+  }}
+  const raced = await worker.fetch(request({checkId:'check-0',checkVersion}),{...runtime,DB:guardedDb} as never)
+  assert.match(await raced.text(),/credential_unavailable/)
+  assert.equal(calls,2)
+  const nonce2 = crypto.getRandomValues(new Uint8Array(12))
+  const basicBytes = await crypto.subtle.encrypt({name:'AES-GCM',iv:nonce2,additionalData:new TextEncoder().encode('status-vault-v1:1:3:userpass')},key,new TextEncoder().encode(JSON.stringify({username:'u',password:'x'.repeat(6130)})))
+  sqlite.prepare("INSERT INTO vault_secrets(id,vault_id,name,type,ciphertext,nonce,created_at,updated_at) VALUES (3,1,'basic','userpass',?,?,?,?)").run(b64(new Uint8Array(basicBytes)),b64(nonce2),now,now)
+  const combined = {...advanced,headers:{'x-public':'x'.repeat(100)},auth:{type:'basic',basic:{vault:{vaultId:1,secretId:3}}}}
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify(combined),'check-0')
+  let version = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+  const oversized = await worker.fetch(request({checkId:'check-0',checkVersion:version}),runtime as never)
+  assert.match(await oversized.text(),/credential_unavailable/)
+  assert.equal(calls,2)
+  const nonce3 = crypto.getRandomValues(new Uint8Array(12))
+  const badValue = await crypto.subtle.encrypt({name:'AES-GCM',iv:nonce3,additionalData:new TextEncoder().encode('status-vault-v1:1:2:value')},key,new TextEncoder().encode(JSON.stringify({value:'secret\tvalue'})))
+  sqlite.prepare('UPDATE vault_secrets SET ciphertext=?,nonce=?,version=version+1 WHERE id=2').run(b64(new Uint8Array(badValue)),b64(nonce3))
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify(advanced),'check-0')
+  version = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+  const invalid = await worker.fetch(request({checkId:'check-0',checkVersion:version}),runtime as never)
+  assert.match(await invalid.text(),/credential_unavailable/)
+  assert.equal(calls,2)
+  sqlite.close()
+})
 
 test('dependencies order checks and preserve raw observations across transitive outages and recovery', async () => {
   const { sqlite, now, env } = fixture(3)
