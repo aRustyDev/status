@@ -94,6 +94,72 @@ test('draft and scheduled checks agree on status ranges and assertion outcomes',
   }
 })
 
+test('legacy exact-status tests and schedules both reject redirects with a location', async () => {
+  for (const location of [true, false]) {
+    const { sqlite, now, env } = fixture()
+    sqlite.prepare('UPDATE http_checks SET expected_status=302 WHERE id=?').run('check-0')
+    globalThis.fetch = async (_input, init) => {
+      assert.equal(init?.redirect, 'manual')
+      return new Response(null, { status: 302, headers: location ? { location: 'https://unapproved.example/' } : {} })
+    }
+    const response = await worker.fetch(new Request('https://probe.internal/test', {
+      method: 'POST', body: JSON.stringify({ endpointId: 'endpoint-0', expectedStatus: 302, advancedConfig: null }),
+    }), env as never)
+    const tested = await response.json() as { overall: string; steps: { detail?: string }[] }
+    await runChecks(now, env as never)
+    assert.equal(tested.overall, location ? 'error' : 'ok')
+    if (location) assert.equal(tested.steps[0]?.detail, 'redirect_blocked')
+    assert.equal(sqlite.prepare('SELECT effective_status FROM http_check_results').get()?.effective_status, location ? 'down' : 'up')
+    sqlite.close()
+  }
+})
+
+test('tests and schedules saved multibyte assertions without a smaller test byte limit', async () => {
+  const { sqlite, now, env } = fixture()
+  const value = '界'.repeat(1000)
+  const advancedConfig = { assertions: Array.from({ length: 20 }, () => ({ type: 'json', path: '$.value', op: 'equals', value, onFail: 'down' })) }
+  const serialized = JSON.stringify(advancedConfig)
+  assert.ok(serialized.length < 32_000)
+  assert.ok(new TextEncoder().encode(serialized).length > 32_000)
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(serialized, 'check-0')
+  globalThis.fetch = async () => Response.json({ value })
+  const response = await worker.fetch(new Request('https://probe.internal/test', {
+    method: 'POST', body: JSON.stringify({ endpointId: 'endpoint-0', expectedStatus: 200, advancedConfig }),
+  }), env as never)
+  assert.equal(response.status, 200)
+  assert.equal((await response.json() as { overall: string }).overall, 'ok')
+  await runChecks(now, env as never)
+  assert.equal(sqlite.prepare('SELECT effective_status FROM http_check_results').get()?.effective_status, 'up')
+  const oversized = await worker.fetch(new Request('https://probe.internal/test', { method: 'POST', body: 'x'.repeat(256_001) }), env as never)
+  assert.equal(oversized.status, 413)
+  sqlite.close()
+})
+
+test('saved advanced checks without a timeout use the same deadline in Test and schedule', async () => {
+  const { sqlite, now, env } = fixture()
+  const originalSetTimeout = globalThis.setTimeout
+  const deadlines: number[] = []
+  try {
+    sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({ keyword: 'ready' }), 'check-0')
+    globalThis.setTimeout = ((fn: () => void, delay?: number) => {
+      if (delay === 10_000) deadlines.push(delay)
+      return originalSetTimeout(fn, delay === 10_000 ? 1 : delay)
+    }) as typeof setTimeout
+    globalThis.fetch = async (_input, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+    })
+    const response = await worker.fetch(new Request('https://probe.internal/test', {
+      method: 'POST', body: JSON.stringify({ endpointId: 'endpoint-0', expectedStatus: 200, advancedConfig: { keyword: 'ready', timeoutMs: 10_000, attempts: 1 } }),
+    }), env as never)
+    const result = await response.json() as { overall: string; steps: { detail?: string }[] }
+    await runChecks(now, env as never)
+    assert.deepEqual(deadlines, [10_000, 10_000])
+    assert.equal(result.overall, 'error')
+    assert.equal(result.steps[0]?.detail, 'request_timeout')
+    assert.equal(sqlite.prepare('SELECT effective_status FROM http_check_results').get()?.effective_status, 'down')
+  } finally { globalThis.setTimeout = originalSetTimeout; sqlite.close() }
+})
+
 test('checks use four concurrent requests and record nonmatching status', async () => {
   const { sqlite, now, env } = fixture(9)
   let active = 0

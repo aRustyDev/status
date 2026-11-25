@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 import worker from '../src/index.ts'
+import probeWorker from '../../probe/src/index.ts'
 import { endpointFingerprint } from '../src/endpoint-config.ts'
 import { syncGatusCatalog } from '../src/gatus-catalog.ts'
 import { gatusSourceId, type GatusCatalogEntry } from '../src/gatus.ts'
@@ -983,6 +984,26 @@ test('draft monitor tests require an admin and forward only approved destination
     assert.equal(result.response.status, 200)
     assert.deepEqual(forwarded, body)
   } finally { delete env.PROBE; env.ENDPOINTS = '[]' }
+})
+
+test('a saved multibyte advanced check can be tested through the real probe binding', async () => {
+  const endpoint = { id: 'unicode-target', name: 'Unicode target', url: 'https://unicode.example.test/health' }
+  const value = '界'.repeat(1000)
+  const config = { assertions: Array.from({ length: 20 }, () => ({ type: 'json', path: '$.value', op: 'equals', value, onFail: 'down' })) }
+  const previousFetch = globalThis.fetch
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  await db.prepare('INSERT INTO endpoint_registry(endpoint_id,fingerprint) VALUES (?,?)').bind(endpoint.id, await endpointFingerprint(endpoint)).run()
+  env.PROBE = { fetch: request => probeWorker.fetch(request, env as never) }
+  globalThis.fetch = async (input, init) => String(input) === endpoint.url ? Response.json({ value }) : previousFetch(input, init)
+  try {
+    const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Unicode checks' })
+    const created = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: true, intervalMinutes: 1, expectedStatus: 200 })
+    const saved = await request(`/api/v1/bsp/admin/checks/${created.body.id}/advanced`, adminToken, 'PUT', { version: 1, advancedConfig: config })
+    assert.equal(saved.response.status, 200)
+    const tested = await request('/api/v1/bsp/admin/monitors/test', adminToken, 'POST', { endpointId: endpoint.id, expectedStatus: 200, advancedConfig: config })
+    assert.equal(tested.response.status, 200)
+    assert.equal((tested.body as unknown as { overall: string }).overall, 'ok')
+  } finally { globalThis.fetch = previousFetch; delete env.PROBE; env.ENDPOINTS = '[]' }
 })
 
 test('atomic monitor writes preserve checks and reject stale versions', async () => {

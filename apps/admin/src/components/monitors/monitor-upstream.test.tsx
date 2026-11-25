@@ -56,6 +56,25 @@ it('preserves an unchanged legacy check when saving service settings', async () 
   await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', { name: 'API', manualStatus: 'operational', position: 1, version: 4 }))
 })
 
+it.each([
+  { advancedConfig: null, timeout: 5000 },
+  { advancedConfig: { keyword: 'ready' }, timeout: 10000 },
+])('tests the persisted effective timeout and preserves unchanged settings', async ({ advancedConfig, timeout }) => {
+  const user = userEvent.setup()
+  vi.mocked(api.post).mockResolvedValue({ overall: 'ok', steps: [], totalMs: 5 })
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [{ ...check, advancedConfig }]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor)
+  await user.click(await screen.findByRole('button', { name: 'Test' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors/test', expect.objectContaining({ advancedConfig: expect.objectContaining({ timeoutMs: timeout, attempts: 1 }) }), expect.anything()))
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', { name: 'API', manualStatus: 'operational', position: 1, version: 4 }))
+})
+
 it('shows and preserves configured status ranges while editing other check settings', async () => {
   const user = userEvent.setup()
   const ranges = [{ min: 200, max: 299 }, { min: 401, max: 401 }]
