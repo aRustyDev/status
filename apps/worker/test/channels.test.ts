@@ -221,9 +221,14 @@ test('a lost or expired notification lease cannot transmit after slow resolution
 test('notification jobs that expire after selection cannot be claimed',async()=>{
   const x=await setup();await queueTimingEvent(x)
   const db={...x.db,prepare(sql:string){
-    if(sql.includes("WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?"))
-      x.local.db.prepare('UPDATE notification_outbox SET created_at=?').run(Date.now()-3_600_001)
-    return x.db.prepare(sql)
+    const statement=x.db.prepare(sql)
+    if(!sql.includes("WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?")) return statement
+    return {bind(...values:unknown[]){
+      // The cutoff is sampled after selection, so use that exact value even
+      // if preparing the update takes longer than a millisecond.
+      x.local.db.prepare('UPDATE notification_outbox SET created_at=?').run(Number(values[3])-1)
+      return statement.bind(...values)
+    }} as D1PreparedStatement
   }} as D1Database
   await flushChannelDeliveries({...x.env,DB:db})
   assert.equal(x.calls.length,0)

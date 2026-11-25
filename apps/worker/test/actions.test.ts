@@ -153,9 +153,14 @@ test('an expired or superseded action claim cannot transmit after slow resolutio
 test('action jobs that expire after selection cannot be claimed',async()=>{
  const x=await setup();await queue(x)
  const db={...x.db,prepare(sql:string){
-  if(sql.includes("WHERE o.id=? AND o.state='pending' AND o.created_at<?"))
-   x.local.db.prepare('UPDATE worker_action_outbox SET created_at=?').run(Date.now()-3_600_001)
-  return x.db.prepare(sql)
+  const statement=x.db.prepare(sql)
+  if(!sql.includes("WHERE o.id=? AND o.state='pending' AND o.created_at<?")) return statement
+  return {bind(...values:unknown[]){
+   // This cutoff is sampled after selection. Place the job just beyond it,
+   // independent of any time spent between sampling and preparing the query.
+   x.local.db.prepare('UPDATE worker_action_outbox SET created_at=?').run(Number(values[2])-1)
+   return statement.bind(...values)
+  }} as D1PreparedStatement
  }} as D1Database
  await flushActions({...x.env,DB:db})
  assert.equal(x.calls.length,0)
