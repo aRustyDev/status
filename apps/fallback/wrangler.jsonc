@@ -1,0 +1,20 @@
+{
+  "name": "status-fallback",
+  "main": "index.ts",
+  "compatibility_date": "2026-11-23",
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": { "directory": "../status/dist-fallback", "binding": "ASSETS", "run_worker_first": true },
+  "observability": { "enabled": true, "traces": { "enabled": true } },
+  "env": {
+    "staging": {
+      "name": "status-fallback-staging",
+      "workers_dev": false,
+      "preview_urls": false,
+      "vars": { "ACCESS_TEAM_DOMAIN": "REPLACE_ACCESS_TEAM_DOMAIN", "ACCESS_AUD": "REPLACE_ACCESS_AUDIENCE" },
+      "services": [{ "binding": "GATEWAY", "service": "status-gateway-staging" }],
+      "r2_buckets": [{ "binding": "FALLBACK_BUCKET", "bucket_name": "status-fallback-staging" }],
+      "routes": []
+    }
+  }
+}

@@ -11,6 +11,7 @@ import { emailChannelFingerprint, emailDestinations, emailReady, type EmailChann
 import { resolveChannelCredential } from './vault-resolver'
 import { actionApi, ActionError } from './actions'
 import { actionEndpoints, type ActionEnvironment } from './actions-runtime'
+import { checkFallback, FallbackConflictError, getFallback, publishFallback, saveFallback } from './static-fallback'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
 interface Env extends EmailChannelEnv {
@@ -31,6 +32,8 @@ interface Env extends EmailChannelEnv {
   GATUS_REQUIRED?: string
   BACKUPS?: Fetcher
   BACKUPS_READY?: string
+  FALLBACK_BUCKET?: R2Bucket
+  FALLBACK_READY?: string
 }
 
 async function notificationsReady(env: Env): Promise<boolean> {
@@ -606,6 +609,32 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   const db = env.DB
   const method = request.method
   const route = path.slice('/api/v1/bsp'.length)
+  if (route === '/admin/static-mirror' || route === '/admin/static-mirror/check' || route === '/admin/static-mirror/test') {
+    requireRole(user, 'admin')
+    if (!env.FALLBACK_BUCKET || env.FALLBACK_READY !== 'true') throw new HttpError(503, 'Static fallback is unavailable')
+    const bucket = env.FALLBACK_BUCKET
+    try {
+      if (route === '/admin/static-mirror' && method === 'GET') return json(await getFallback(bucket))
+      if (route === '/admin/static-mirror/check' && method === 'POST') return json(await checkFallback(bucket))
+      if (route === '/admin/static-mirror/test' && method === 'POST') {
+        const current = await getFallback(bucket)
+        if (!current.settings.enabled) throw new HttpError(409, 'Turn on static fallback before publishing')
+        return json(await publishFallback(bucket, interval => buildFallbackSnapshot(env, interval)))
+      }
+      if (route === '/admin/static-mirror' && method === 'PUT') {
+        const body = await parseBody(request)
+        if (typeof body.enabled !== 'boolean' || !Number.isSafeInteger(body.intervalSeconds) || Number(body.intervalSeconds) < 60 || Number(body.intervalSeconds) > 86400 || Number(body.intervalSeconds) % 60 !== 0) return bad('Invalid static fallback settings')
+        const settings = { enabled: body.enabled, intervalSeconds: Number(body.intervalSeconds) }
+        await saveFallback(bucket, settings)
+        await audit(db, user, 'update', 'static_mirror', 'fallback', { enabled: settings.enabled, intervalSeconds: settings.intervalSeconds }).run()
+        return json(settings.enabled ? await publishFallback(bucket, interval => buildFallbackSnapshot(env, interval)) : await getFallback(bucket))
+      }
+      throw new HttpError(405, 'Method not allowed')
+    } catch (error) {
+      if (error instanceof HttpError || error instanceof FallbackConflictError) throw error
+      throw new HttpError(503, 'Static fallback operation failed')
+    }
+  }
   if (route === '/admin/system-health' && method === 'GET') {
     requireRole(user, 'admin')
     return json(await getSystemHealthReport(env))
@@ -904,7 +933,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
     const notificationsAvailable = await notificationsReady(env)
     const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
-    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
@@ -1013,6 +1042,29 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   return api(forwarded, env, user, target, receipt)
 }
 
+async function buildFallbackSnapshot(env: Env, intervalSeconds: number) {
+  const user: User = { id: '', issuer: '', subject: '', email: '', role: 'viewer', version: 0 }
+  const read = async (route: string) => {
+    const url = new URL(`/api/v1/bsp/public/${route}`, 'https://fallback.internal')
+    const response = await bspApi(new Request(url), env, user, url.pathname)
+    if (!response.ok) throw new Error('Snapshot source unavailable')
+    return response.json()
+  }
+  const [status, layout, incidents, maintenances, locales] = await Promise.all([
+    read('status'), read('layout'), read('incidents'), read('maintenances'), read('locales'),
+  ]) as [Record<string, unknown>, unknown, unknown[], unknown[], unknown[]]
+  const monitors = status.monitors as Array<{ id: number; source?: string }>
+  const uptimeEntries = await Promise.all(monitors.filter(monitor => monitor.source !== 'gatus').map(async monitor => [String(monitor.id), await read(`monitor/${monitor.id}/uptime?days=14`)] as const))
+  return { schemaVersion: 1, generatedAt: Date.now(), intervalSeconds, showBanner: true, status, layout, incidents, maintenances, uptime: Object.fromEntries(uptimeEntries), locales, translations: {} }
+}
+
+export async function scheduledFallback(env: Env): Promise<void> {
+  if (env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true') {
+    try { await publishFallback(env.FALLBACK_BUCKET, interval => buildFallbackSnapshot(env, interval), true) }
+    catch (error) { if (!(error instanceof FallbackConflictError)) throw error }
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     let receipt: ReceiptContext | null = null
@@ -1067,6 +1119,7 @@ export default {
       const fallback = new URL('/',url)
       return env.ASSETS.fetch(new Request(fallback,request))
     } catch (error) {
+      if (error instanceof FallbackConflictError) return json({error:'Static fallback changed during publication. Retry.'},409)
       if (error instanceof ActionError) return json({error:error.message},error.status)
       if (error instanceof ChannelError) return json({error:error.message},error.status)
       if (error instanceof VaultError) return json({error:error.message},error.status)

@@ -78,6 +78,11 @@ const ACCESS_QUERY_KEY = ['access-identity']
  * nothing else is requested before that. Should the check itself fail, the page loads and reports its own errors.
  */
 export default function App() {
+  if (SNAPSHOT_URL) return <StatusPage account={null} subscriptionsEnabled={false} retentionDays={14} />
+  return <LiveApp />
+}
+
+function LiveApp() {
   const qc = useQueryClient()
   const [expired, setExpired] = useState(false)
   useEffect(() => {
@@ -335,6 +340,7 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
 
   const siteName = branding?.siteName || t('page.defaultTitle')
   const imageLogoUrl = resolveBrandingLogoUrl(branding, isDark, brandingEnabled)
+  const defaultLogoUrl = `${SNAPSHOT_URL ? '/__fallback' : ''}/logo_${isDark ? 'dark' : 'light'}.png`
   const customCss = resolveBrandingCustomCss(branding)
   document.title = siteName
 
@@ -359,7 +365,7 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
               <img src={imageLogoUrl} alt={siteName} style={{ height: '40px', maxWidth: '200px', objectFit: 'contain' }} />
             ) : (
               <img
-                src={isDark ? '/logo_dark.png' : '/logo_light.png'}
+                src={defaultLogoUrl}
                 alt={siteName}
                 style={{ height: '36px', objectFit: 'contain' }}
               />
@@ -589,7 +595,7 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
           {branding?.logoType === 'text' && branding.logoText ? (
             <span className="bsp-site-name font-headline font-extrabold block mb-4" style={{ fontSize: '22px' }}>{branding.logoText}</span>
           ) : (
-            <img src={imageLogoUrl ?? (isDark ? '/logo_dark.png' : '/logo_light.png')} alt={siteName} style={{ height: '80px', maxWidth: '260px', objectFit: 'contain', margin: '0 auto 16px', opacity: 0.75 }} />
+            <img src={imageLogoUrl ?? defaultLogoUrl} alt={siteName} style={{ height: '80px', maxWidth: '260px', objectFit: 'contain', margin: '0 auto 16px', opacity: 0.75 }} />
           )}
           <p className="text-xs uppercase tracking-widest">{siteName}</p>
         </footer>}

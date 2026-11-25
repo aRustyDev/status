@@ -1794,3 +1794,31 @@ test('atomic monitor check edits increment exactly once and fence stale results'
     current=await getCheck(); assert.equal(current!.config_version,beforeNullOther+1)
   } finally { env.ENDPOINTS='[]' }
 })
+
+test('static fallback requires an administrator and publishes the live reader data', async () => {
+  const mf = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', r2Buckets: ['FALLBACK'] }))
+  const fallbackEnv = env as typeof env & { FALLBACK_BUCKET?: unknown; FALLBACK_READY?: string }
+  try {
+    const bucket = await mf.getR2Bucket('FALLBACK')
+    fallbackEnv.FALLBACK_BUCKET = bucket
+    fallbackEnv.FALLBACK_READY = 'true'
+    const path = '/api/v1/bsp/admin/static-mirror'
+    assert.equal((await request(path, viewerToken)).response.status, 403)
+    assert.equal((await request(path, operatorToken, 'PUT', { enabled: true, intervalSeconds: 60 })).response.status, 403)
+    assert.equal((await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 61 })).response.status, 400)
+    assert.equal((await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 60 }, 'https://attacker.example')).response.status, 403)
+    assert.equal((await request(`${path}/check`, adminToken, 'POST', {})).response.status, 200)
+    const saved = await request(path, adminToken, 'PUT', { enabled: true, intervalSeconds: 60 })
+    assert.equal(saved.response.status, 200)
+    assert.equal((saved.body as unknown as {health:string}).health, 'ok')
+    const state = await (await bucket.get('fallback/current.json'))!.json() as {snapshot:{status:unknown; incidents:unknown[]}}
+    const live = await request('/api/v1/bsp/public/status', viewerToken)
+    assert.deepEqual(state.snapshot.status, live.body)
+    assert.ok(state.snapshot.incidents.every(incident => !(incident as {draft?:boolean}).draft))
+    assert.equal((await request(path, adminToken, 'PUT', { enabled: false, intervalSeconds: 60 })).response.status, 200)
+  } finally {
+    delete fallbackEnv.FALLBACK_BUCKET
+    delete fallbackEnv.FALLBACK_READY
+    await mf.dispose()
+  }
+})

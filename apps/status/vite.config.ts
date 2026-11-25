@@ -1,11 +1,12 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+const fallbackBuild = process.env['BSP_FALLBACK_BUILD'] === 'true'
 const apiTarget = process.env['VITE_API_PROXY_TARGET'] ?? 'http://127.0.0.1:3000'
 
 export default defineConfig({
   plugins: [react()],
-  base: '/',
+  base: fallbackBuild ? '/__fallback/' : '/',
   server: {
     host: '127.0.0.1',
     port: 5174,
@@ -30,6 +31,6 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: 'dist',
+    outDir: fallbackBuild ? 'dist-fallback' : 'dist',
   },
 })
