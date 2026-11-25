@@ -97,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -123,6 +123,7 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0011_email_channels.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0012_notification_delivery_state.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0013_notification_unlink_cancel.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0014_monitor_alert_channel_limit.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -1512,6 +1513,37 @@ test('monitor alert selections persist atomically, including manual monitors, an
     assert.equal(cleared.response.status,200)
     assert.deepEqual((await find())?.channelIds,[])
   } finally { delete env.VAULT_ENCRYPTION_KEY; delete env.CHANNEL_ENDPOINTS; delete env.CHANNELS_READY; env.ENDPOINTS='[]' }
+})
+
+test('channel association limit rejects concurrent monitor edits atomically', async () => {
+  env.CHANNELS_READY='true';env.EMAIL_READY='true';env.EMAIL_FROM='sender@example.test'
+  env.EMAIL_DESTINATIONS=JSON.stringify([{id:'ops',name:'Operations',address:'ops@example.test'}])
+  env.EMAIL={send:async()=>({messageId:'fixture'})}
+  try {
+    const response=await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{name:'Association limit fixture',type:'email',recipientId:'ops',enabled:true,checkIds:[],expectedChecks:[]})
+    const channel=(response.body as unknown as {id:string}).id
+    const fixtures=Array.from({length:19},()=>crypto.randomUUID())
+    await db.batch(fixtures.flatMap((id,index)=>[
+      db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').bind(id,`Limit ${index}`,Date.now()),
+      db.prepare('INSERT INTO monitor_notification_channels (component_id,channel_id) VALUES (?,?)').bind(id,channel),
+    ]))
+    const key=()=>`${Date.now()}.${crypto.randomUUID()}`
+    const path='/api/v1/bsp/admin/monitors'
+    const results=await Promise.all(['Concurrent limit A','Concurrent limit B'].map(name=>request(path,adminToken,'POST',{name,channelIds:[channel]},'https://status.example',key())))
+    assert.deepEqual(results.map(result=>result.response.status).sort(),[201,409])
+    const rejected=results.find(result=>result.response.status===409)!
+    assert.match((rejected.body as unknown as {error:string}).error,/at most 20 monitors/i)
+    const count=await db.prepare('SELECT COUNT(*) AS n FROM monitor_notification_channels WHERE channel_id=?').bind(channel).first<{n:number}>()
+    assert.equal(count?.n,20)
+    const names=await db.prepare("SELECT name FROM components WHERE name IN ('Concurrent limit A','Concurrent limit B')").all<{name:string}>()
+    assert.equal(names.results.length,1)
+    const untouched=await request(path,adminToken,'POST',{name:'Unchanged limit fixture'},'https://status.example',key())
+    const alias=(untouched.body as unknown as {id:number}).id
+    const patch=await request(`${path}/${alias}`,adminToken,'PATCH',{name:'Must not persist',version:1,channelIds:[channel],expectedChannelIds:[]},'https://status.example',key())
+    assert.equal(patch.response.status,409)
+    const row=await db.prepare("SELECT c.name,c.version FROM components c JOIN entity_aliases a ON a.entity_id=c.id WHERE a.entity_type='component' AND a.alias=?").bind(alias).first<{name:string;version:number}>()
+    assert.deepEqual(row && {...row},{name:'Unchanged limit fixture',version:1})
+  } finally { delete env.EMAIL;delete env.EMAIL_READY;delete env.EMAIL_FROM;delete env.EMAIL_DESTINATIONS;delete env.CHANNELS_READY }
 })
 
 test('email-only notifications expose admin catalog and persist monitor selection without Vault', async () => {

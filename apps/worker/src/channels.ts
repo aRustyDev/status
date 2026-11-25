@@ -95,7 +95,7 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
   if (type!=='webhook' && type!=='email') return fail(400,'Unsupported channel type')
   const allowedKeys = type==='email' ? [...commonKeys,'recipientId'] : [...commonKeys,'endpointId','vaultId','secretId']
   if (Object.keys(input).some(k=>!allowedKeys.includes(k))) return fail(400,'Invalid channel')
-  const validChecks = (value:unknown): value is string[] => Array.isArray(value) && value.length<=20 && value.every(x=>typeof x==='string' && /^[a-f0-9-]{36}$/.test(x)) && new Set(value).size===value.length
+  const validChecks = (value:unknown): value is string[] => Array.isArray(value) && value.every(x=>typeof x==='string' && /^[a-f0-9-]{36}$/.test(x)) && new Set(value).size===value.length
   if (typeof input.name!=='string' || !input.name.trim() || input.name.length>100 || typeof input.enabled!=='boolean' || !validChecks(input.checkIds)) return fail(400,'Invalid channel')
   const checks=input.checkIds
   const snapshots=input.expectedChecks
@@ -105,6 +105,10 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
     return Object.keys(snapshot).some(key=>!['id','componentId','version'].includes(key)) || typeof snapshot.id!=='string' || !checks.includes(snapshot.id) || typeof snapshot.componentId!=='string' || !snapshot.componentId || snapshot.componentId.length>100 || !Number.isSafeInteger(snapshot.version) || Number(snapshot.version)<1
   }) || new Set(snapshots.map((value:Body)=>value.id)).size!==checks.length) return fail(400,'Invalid monitor snapshot')
   if ((method==='PATCH' && !validChecks(input.expectedCheckIds)) || (method==='POST' && (input.expectedCheckIds!==undefined || input.expectedAssociationVersion!==undefined))) return fail(400,'Invalid channel snapshot')
+  // Before the association limit existed a channel could acquire more than
+  // 20 checks through monitor edits. Allow those links to be retained or
+  // reduced, but never add new links while the channel is over the limit.
+  if (checks.length>20 && (method==='POST' || !checks.every(check => (input.expectedCheckIds as string[]).includes(check)))) return fail(400,'A channel can be assigned to at most 20 monitors')
   const expectedAssociation = method==='PATCH' ? associationVersion(input.expectedAssociationVersion) : 0
   let endpointId='', fingerprint='', vaultId=0, secretId=0, recipientId:string | null=null, emailFingerprint:string | null=null
   if (type==='webhook') {

@@ -27,9 +27,10 @@ const actor = { id:'admin', email:'admin@example.test', version:1 }
 const request = (method: string, input?: unknown) => new Request('https://status.example.test', { method, headers: { 'content-type':'application/json' }, ...(input === undefined ? {} : { body:JSON.stringify(input) }) })
 const checkA = '00000000-0000-4000-8000-000000000001'
 const checkB = '00000000-0000-4000-8000-000000000002'
-function setup() {
+function setup(applyLimit = true) {
   const local = new DB()
   for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0010_monitor_alert_links.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+  if (applyLimit) local.db.exec(readFileSync(new URL('../migrations/0014_monitor_alert_channel_limit.sql',import.meta.url),'utf8'))
   local.db.exec("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')")
   local.db.exec("INSERT INTO components (id,name,updated_at) VALUES ('component-a','A',0),('component-b','B',0),('manual','Manual',0)")
   local.db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status) VALUES (?,'component-a','check',1,1,200)").run(checkA)
@@ -37,6 +38,27 @@ function setup() {
   const env = { DB:local as unknown as D1Database, CHANNELS_READY:'true', EMAIL_READY:'true', EMAIL_FROM:'alerts@example.test', EMAIL_DESTINATIONS:JSON.stringify([{id:'ops',name:'Operations',address:'ops@example.test'}]), EMAIL:{ send:async () => ({messageId:'test'}) } } as unknown as ChannelEnvironment
   return {local, env}
 }
+
+test('migration preserves oversized channels and lets admins rename and reduce them', async () => {
+  const {local,env}=setup(false)
+  const payload={name:'Oversized',type:'email',recipientId:'ops',enabled:true,checkIds:[],expectedChecks:[]}
+  const created=await (await channelApi(request('POST',payload),env,actor,'/admin/notifications/channels')).json() as {id:string;version:number}
+  const checks=Array.from({length:21},()=>({id:crypto.randomUUID(),componentId:crypto.randomUUID(),version:1}))
+  for (const [index,check] of checks.entries()) {
+    local.db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,0)').run(check.componentId,`Oversized ${index}`)
+    local.db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status) VALUES (?,?,'check',0,1,200)").run(check.id,check.componentId)
+    local.db.prepare('INSERT INTO monitor_notification_channels (component_id,channel_id) VALUES (?,?)').run(check.componentId,created.id)
+  }
+  local.db.exec(readFileSync(new URL('../migrations/0014_monitor_alert_channel_limit.sql',import.meta.url),'utf8'))
+  const ids=checks.map(check=>check.id)
+  const renamed=await channelApi(request('PATCH',{...payload,name:'Renamed oversized',checkIds:ids,expectedChecks:checks,version:1,expectedCheckIds:ids,expectedAssociationVersion:21}),env,actor,`/admin/notifications/channels/${created.id}`)
+  assert.equal(renamed.status,200)
+  const state=await renamed.json() as {version:number;associationVersion:number}
+  assert.equal(state.version,2)
+  const reduced=await channelApi(request('PATCH',{...payload,name:'Renamed oversized',checkIds:ids.slice(0,20),expectedChecks:checks.slice(0,20),version:state.version,expectedCheckIds:ids,expectedAssociationVersion:state.associationVersion}),env,actor,`/admin/notifications/channels/${created.id}`)
+  assert.equal(reduced.status,200)
+  assert.equal((local.db.prepare('SELECT COUNT(*) AS n FROM monitor_notification_channels WHERE channel_id=?').get(created.id) as {n:number}).n,20)
+})
 
 test('email channel tests reject a changed or deleted channel before sending', async () => {
   for (const change of ['retarget', 'delete'] as const) {

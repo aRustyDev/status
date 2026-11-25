@@ -1062,6 +1062,7 @@ export default {
       if (error instanceof HttpError) return json({error:error.message},error.status)
       if (error instanceof Error && error.message.includes('Inactive Gatus source cannot be associated')) return json({error:'Inactive Gatus source cannot be associated'},409)
       if (error instanceof Error && error.message.includes('Gatus-managed component is read-only')) return json({error:'Gatus-managed component is read-only'},403)
+      if (error instanceof Error && error.message.includes('notification channel monitor limit reached')) return json({error:'A channel can be assigned to at most 20 monitors. Remove an assignment before adding another.'},409)
       if (error instanceof Error && (error.message.includes('maximum enabled checks reached') || error.message.includes('UNIQUE constraint failed: http_checks.component_id'))) return json({error:'Check limit reached or component already has a check'},409)
       console.error(JSON.stringify({event:'request_error',message:error instanceof Error ? error.message : 'Unknown error'}))
       return json({error:'Internal server error'},500)
