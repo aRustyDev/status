@@ -725,3 +725,43 @@ test('maintenance preserves a shared automation baseline and re-evaluates global
   } finally { Date.now=realNow;sqlite.close() }
  }
 })
+
+test('Basic credentials rotated or deleted after resolution are not sent by tests or scheduled checks', async () => {
+  for (const mode of ['test', 'scheduled'] as const) for (const change of ['rotate', 'delete', 'replace'] as const) {
+    const { sqlite, now, env } = fixture()
+    sqlite.exec(readFileSync(new URL('../../worker/migrations/0008_vault.sql', import.meta.url), 'utf8'))
+    const keyHex = 'ab'.repeat(32)
+    const { vaultKeyReady } = await import('../../worker/src/vault.ts')
+    assert.equal(await vaultKeyReady(env.DB as never, keyHex), true)
+    sqlite.prepare('INSERT INTO vaults(id,name,created_at,updated_at) VALUES (1,?,?,?)').run('fixture', now, now)
+    const key = await crypto.subtle.importKey('raw', new Uint8Array(32).fill(0xab), 'AES-GCM', false, ['encrypt'])
+    const nonce = crypto.getRandomValues(new Uint8Array(12))
+    const bytes = await crypto.subtle.encrypt({ name:'AES-GCM', iv:nonce, additionalData:new TextEncoder().encode('status-vault-v1:1:2:userpass') }, key, new TextEncoder().encode(JSON.stringify({username:'fixture-user',password:'fixture-password'})))
+    const b64 = (v: Uint8Array) => btoa(Array.from(v, b => String.fromCharCode(b)).join(''))
+    sqlite.prepare("INSERT INTO vault_secrets(id,vault_id,name,type,ciphertext,nonce,created_at,updated_at) VALUES (2,1,'fixture','userpass',?,?,?,?)").run(b64(new Uint8Array(bytes)), b64(nonce), now, now)
+    sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({ auth:{type:'basic',basic:{vault:{vaultId:1,secretId:2}}} }), 'check-0')
+    let changed = false, calls = 0
+    const guardedDb = { ...env.DB, prepare(sql: string) {
+      if (!changed && sql.includes('SELECT c.advanced_config AS advanced_config FROM http_checks c JOIN endpoint_registry')) {
+        changed = true
+        if (change === 'delete') sqlite.prepare('DELETE FROM vault_secrets WHERE id=2').run()
+        else if (change === 'rotate') sqlite.prepare('UPDATE vault_secrets SET version=version+1 WHERE id=2').run()
+        else sqlite.prepare("UPDATE vault_secrets SET nonce='replacement' WHERE id=2").run()
+      }
+      return env.DB.prepare(sql)
+    } }
+    globalThis.fetch = async () => { calls++; return new Response() }
+    const runtime = { ...env, DB:guardedDb, VAULT_ENCRYPTION_KEY:keyHex, MONITOR_AUTH_READY:'true' }
+    if (mode === 'test') {
+      const checkVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+      const response = await worker.fetch(new Request('https://probe.internal/test', {method:'POST',body:JSON.stringify({checkId:'check-0',checkVersion})}), runtime as never)
+      assert.match(await response.text(), /credential_unavailable/)
+    } else {
+      await runChecks(now, runtime as never)
+      assert.equal(sqlite.prepare('SELECT transition_suppressed FROM http_checks WHERE id=?').get('check-0')?.transition_suppressed, 1)
+    }
+    assert.equal(changed, true, `${mode} ${change} reached transport fence`)
+    assert.equal(calls, 0, `${mode} ${change} sent no credentials`)
+    sqlite.close()
+  }
+})

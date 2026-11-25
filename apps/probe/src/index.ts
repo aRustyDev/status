@@ -1,6 +1,6 @@
 import { endpointFingerprint, parseEndpoints, type Endpoint } from '../../worker/src/endpoint-config'
 import { evaluateHttpMonitor, isBlockedRedirect, parsePersistedHttpConfig, type HttpMonitorConfig, type HttpMonitorResult } from './http-monitor'
-import { resolveMonitorCredential } from '../../worker/src/vault-resolver'
+import { resolveMonitorCredentialSnapshot, type MonitorCredentialSnapshot } from '../../worker/src/vault-resolver'
 import { channelEndpoints, enqueueTransition, flushChannelDeliveries } from '../../worker/src/channels-runtime'
 import { enqueueActionTransition, flushActions } from '../../worker/src/actions-runtime'
 
@@ -73,6 +73,7 @@ async function probe(endpoint: Endpoint, expectedStatus: number, env: Environmen
 // immediately before transmission; responses and errors never include values.
 async function evaluateConfigured(check: Check, config: HttpMonitorConfig, env: Environment, approved: ReadonlyMap<string, Endpoint>): Promise<HttpMonitorResult> {
   let authorization: string | undefined
+  let credential: MonitorCredentialSnapshot | undefined
   let credentialFault = false
   const unavailable = (): HttpMonitorResult => ({ status: 'down', responseMs: null, httpStatus: null, reasons: ['credential_unavailable'], attempts: 1 })
   if (config.auth) {
@@ -80,12 +81,13 @@ async function evaluateConfigured(check: Check, config: HttpMonitorConfig, env: 
     try {
     const target = approved.get(check.endpoint_id)
     if (!target || new URL(target.url).protocol !== 'https:') return unavailable()
-    const credentials = await resolveMonitorCredential(env.DB, env.VAULT_ENCRYPTION_KEY, check.id, check.config_version)
+    const credentials = await resolveMonitorCredentialSnapshot(env.DB, env.VAULT_ENCRYPTION_KEY, check.id, check.config_version)
     if (!credentials || credentials.username.includes(':')) return unavailable()
     const current = await env.DB.prepare('SELECT endpoint_id, advanced_config FROM http_checks WHERE id=? AND config_version=?').bind(check.id, check.config_version).first<{endpoint_id:string;advanced_config:string | null}>()
     if (!current || current.endpoint_id !== check.endpoint_id || current.advanced_config !== check.advanced_config) return unavailable()
     const bytes = new TextEncoder().encode(`${credentials.username}:${credentials.password}`)
     authorization = `Basic ${btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''))}`
+    credential = credentials
     } catch { return unavailable() }
   }
   const result = await evaluateHttpMonitor(config, {
@@ -93,10 +95,11 @@ async function evaluateConfigured(check: Check, config: HttpMonitorConfig, env: 
     fetch: async (url, init, endpoint) => {
       if (authorization) {
         // Fencing again at the transport boundary prevents a stale saved check
-        // or registry update from sending credentials to the old destination.
+        // registry update, or secret rotation from sending stale credentials.
         try {
           const active = await env.DB.prepare(`SELECT c.advanced_config AS advanced_config FROM http_checks c JOIN endpoint_registry r ON r.endpoint_id=c.endpoint_id
-            WHERE c.id=? AND c.config_version=? AND c.endpoint_id=? AND r.fingerprint=?`).bind(check.id,check.config_version,check.endpoint_id,config.registryFingerprint).first<{advanced_config:string | null}>()
+            JOIN vault_secrets v ON v.id=? AND v.vault_id=? AND v.type='userpass' AND v.version=? AND v.nonce=?
+            WHERE c.id=? AND c.config_version=? AND c.endpoint_id=? AND r.fingerprint=?`).bind(credential!.secretId,credential!.vaultId,credential!.version,credential!.nonce,check.id,check.config_version,check.endpoint_id,config.registryFingerprint).first<{advanced_config:string | null}>()
           if (!active || active.advanced_config !== check.advanced_config) throw new Error('Check changed')
         } catch { credentialFault = true; throw new Error('Check unavailable') }
         init = { ...init, headers: { authorization } }
