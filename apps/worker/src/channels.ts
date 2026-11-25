@@ -132,12 +132,9 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
   if (method==='POST' && input.version!==undefined) return fail(400,'Invalid channel')
   const before = method==='PATCH' ? await statement(db,`SELECT name,channel_type,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,recipient_id,email_fingerprint
     FROM notification_channels WHERE id=? AND version=?`,id,version).first<{name:string;channel_type:string;endpoint_id:string;endpoint_fingerprint:string;vault_id:number;secret_id:number;enabled:number;recipient_id:string | null;email_fingerprint:string | null}>() : null
-  // A display-name-only edit must not discard already queued deliveries. The
-  // mutation and retarget below share the same version and mutation-key fence.
-  const expectedChecks = method === 'PATCH' ? input.expectedCheckIds as string[] : []
-  const expectedCheckSet = new Set(expectedChecks)
-  const unchangedChecks = checks.length === expectedCheckSet.size && checks.every(check => expectedCheckSet.has(check))
-  const carryQueued = !!before && unchangedChecks && before.name!==input.name.trim() && before.channel_type===type && before.endpoint_id===endpointId && before.endpoint_fingerprint===fingerprint && before.vault_id===vaultId && before.secret_id===secretId && before.enabled===(input.enabled?1:0) && before.recipient_id===recipientId && before.email_fingerprint===emailFingerprint
+  // A rename preserves deliveries for retained checks only. Removed checks
+  // are cancelled by the unlink trigger; new checks begin without history.
+  const carryQueued = !!before && before.name!==input.name.trim() && before.channel_type===type && before.endpoint_id===endpointId && before.endpoint_fingerprint===fingerprint && before.vault_id===vaultId && before.secret_id===secretId && before.enabled===(input.enabled?1:0) && before.recipient_id===recipientId && before.email_fingerprint===emailFingerprint
   const expected=JSON.stringify(input.expectedCheckIds ?? [])
   const checkSnapshots=JSON.stringify(snapshots)
   const checkSnapshotGuard = `NOT EXISTS (SELECT 1 FROM json_each(?) snapshot WHERE NOT EXISTS (
@@ -155,10 +152,10 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
       input.name.trim(),endpointId,fingerprint,vaultId,secretId,input.enabled?1:0,recipientId,emailFingerprint,token,now,recipientId,emailFingerprint,id,version,type,expectedAssociation,checkSnapshots,expected,expected)
   const operations:D1PreparedStatement[]=[mutation]
   if (carryQueued) {
-    operations.push(statement(db,`UPDATE notification_outbox SET channel_version=? WHERE channel_id=? AND channel_version=? AND state IN ('pending','sending')
-      AND EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND version=? AND mutation_key=?)`,version+1,id,version,id,version+1,token))
-    operations.push(statement(db,`UPDATE notification_delivery_state SET channel_version=? WHERE channel_id=? AND channel_version=?
-      AND EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND version=? AND mutation_key=?)`,version+1,id,version,id,version+1,token))
+    operations.push(statement(db,`UPDATE notification_outbox SET channel_version=? WHERE channel_id=? AND channel_version=? AND state IN ('pending','sending') AND check_id IN (SELECT value FROM json_each(?))
+      AND EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND version=? AND mutation_key=?)`,version+1,id,version,JSON.stringify(checks),id,version+1,token))
+    operations.push(statement(db,`UPDATE notification_delivery_state SET channel_version=? WHERE channel_id=? AND channel_version=? AND check_id IN (SELECT value FROM json_each(?))
+      AND EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND version=? AND mutation_key=?)`,version+1,id,version,JSON.stringify(checks),id,version+1,token))
   }
   operations.push(statement(db,'DELETE FROM notification_channel_checks WHERE channel_id=? AND check_id NOT IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND mutation_key=?)',id,JSON.stringify(checks),id,token))
   for (const check of checks) operations.push(statement(db,'INSERT OR IGNORE INTO notification_channel_checks (channel_id,check_id) SELECT ?,? WHERE EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND mutation_key=?)',id,check,id,token))
