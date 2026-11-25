@@ -4,6 +4,9 @@ import { CHANNEL_TYPES, CHANNEL_TYPE_ORDER, type ChannelType } from './channelTy
 interface Props {
   value: ChannelType
   onChange: (type: ChannelType) => void
+  disabledTypes?: ChannelType[]
+  disabled?: boolean
+  hints?: Partial<Record<ChannelType, string>>
 }
 
 function TypeIcon({ type }: { type: ChannelType }) {
@@ -15,7 +18,7 @@ function TypeIcon({ type }: { type: ChannelType }) {
 }
 
 /** Searchable channel type list: stays one control tall however many types exist. */
-export function ChannelTypePicker({ value, onChange }: Props) {
+export function ChannelTypePicker({ value, onChange, disabledTypes = [], disabled = false, hints = {} }: Props) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
@@ -43,8 +46,9 @@ export function ChannelTypePicker({ value, onChange }: Props) {
     }
   }, [open])
 
+  const hint = (type: ChannelType) => hints[type] ?? CHANNEL_TYPES[type].hint
   const needle = query.trim().toLowerCase()
-  const matches = CHANNEL_TYPE_ORDER.filter((id) => !needle || `${CHANNEL_TYPES[id].label} ${CHANNEL_TYPES[id].hint}`.toLowerCase().includes(needle))
+  const matches = CHANNEL_TYPE_ORDER.filter((id) => !needle || `${CHANNEL_TYPES[id].label} ${hint(id)}`.toLowerCase().includes(needle))
 
   function pick(type: ChannelType) {
     setOpen(false)
@@ -59,6 +63,7 @@ export function ChannelTypePicker({ value, onChange }: Props) {
         ref={buttonRef}
         id={buttonId}
         type="button"
+        disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-labelledby={`${labelId} ${buttonId}`}
@@ -69,7 +74,7 @@ export function ChannelTypePicker({ value, onChange }: Props) {
         <TypeIcon type={value} />
         <span className="min-w-0 flex-1">
           <span className="block text-sm font-semibold">{selected.label}</span>
-          <span className="block text-xs truncate" style={{ color: 'var(--m3-secondary)' }}>{selected.hint}</span>
+          <span className="block text-xs truncate" style={{ color: 'var(--m3-secondary)' }}>{hint(value)}</span>
         </span>
         <span className="material-symbols-outlined" aria-hidden="true" style={{ color: 'var(--m3-secondary)' }}>unfold_more</span>
       </button>
@@ -101,14 +106,15 @@ export function ChannelTypePicker({ value, onChange }: Props) {
                   type="button"
                   role="option"
                   aria-selected={isSelected}
+                  disabled={disabledTypes.includes(id)}
                   onClick={() => pick(id)}
                   className={`w-full flex items-center gap-3 text-left rounded-lg px-2 py-1.5 focus-ring hover:bg-[var(--m3-surface-container)] ${isSelected ? 'selection-active' : ''}`}
                   style={{ border: '1px solid transparent' }}
                 >
                   <TypeIcon type={id} />
                   <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-semibold">{CHANNEL_TYPES[id].label}</span>
-                    <span className="block text-xs truncate opacity-75">{CHANNEL_TYPES[id].hint}</span>
+                    <span className="block text-sm font-semibold">{CHANNEL_TYPES[id].label}{disabledTypes.includes(id) ? ' — Unavailable' : ''}</span>
+                    <span className="block text-xs truncate opacity-75">{hint(id)}</span>
                   </span>
                 </button>
               )

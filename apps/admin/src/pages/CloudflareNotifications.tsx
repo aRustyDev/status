@@ -1,107 +1,97 @@
-// Adapts the upstream Notifications page and Vault picker to the supported Workers providers.
-import { useEffect, useState, type FormEvent } from 'react'
+// Adapts the upstream Notifications page to the supported Workers providers.
+import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ApiError, Modal, ModalFooter } from '@better-forge/ui'
+import { Alert, ConfirmModal, DataTable, DataTh, ErrorState, LoadingState, PageContainer, PageHeader, QuickStartPanel, useTableSort, type QuickStartOption } from '@better-forge/ui'
 import { api } from '../api/client'
+import CloudflareChannelForm, { type Channel } from '../components/notifications/CloudflareChannelForm'
+import { CHANNEL_TYPES } from '../components/notifications/channelTypes'
 
-type Channel = { id:string; name:string; type?:'webhook'|'email'; endpointId?:string; recipientId?:string; vaultId?:number; secretId?:number; enabled:number; version:number; associationVersion:number; checkIds:string[] }
-type Choice = {id:string;name:string}
-type CheckChoice = Choice & {componentId:string;version:number}
-type Vault = {id:number;name:string}
-type Secret = {id:number;name:string;type:string}
-type Delivery = {channelId:string;checkId:string;status:string;state:string;attempts:number;errorCode:string|null;updatedAt:number}
+type ChannelType = 'email' | 'webhook'
+type Choice = { id: string; name: string }
+type Delivery = { channelId: string; checkId: string; status: string; state: string; attempts: number; errorCode: string | null; updatedAt: number }
 
 export default function CloudflareNotifications() {
-  const qc=useQueryClient(), [editing,setEditing]=useState<Channel|'new'|null>(null), [removing,setRemoving]=useState<Channel|null>(null)
-  const [busy,setBusy]=useState(false), [message,setMessage]=useState('')
-  const channels=useQuery<Channel[]>({queryKey:['worker-channels'],queryFn:()=>api.get('/admin/notifications/channels')})
-  const deliveries=useQuery<Delivery[]>({queryKey:['worker-channel-deliveries'],queryFn:()=>api.get('/admin/notifications/deliveries')})
-  async function test(channel:Channel) {
-    setMessage(''); setBusy(true)
-    try { await api.post(`/admin/notifications/channels/${channel.id}/test`,{version:channel.version}); setMessage('Test sent successfully.') }
-    catch { setMessage('Test failed. Check the destination and channel settings, then try again.') }
-    finally { setBusy(false) }
+  const qc = useQueryClient()
+  const [editing, setEditing] = useState<Channel | 'new' | null>(null)
+  const [initialType, setInitialType] = useState<ChannelType>('webhook')
+  const [removing, setRemoving] = useState<Channel | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  const channels = useQuery<Channel[]>({ queryKey: ['worker-channels'], queryFn: () => api.get('/admin/notifications/channels') })
+  const deliveries = useQuery<Delivery[]>({ queryKey: ['worker-channel-deliveries'], queryFn: () => api.get('/admin/notifications/deliveries') })
+  const destinations = useQuery<Choice[]>({ queryKey: ['worker-channel-destinations'], queryFn: () => api.get('/admin/notifications/destinations') })
+  const emailDestinations = useQuery<Choice[]>({ queryKey: ['worker-email-destinations'], queryFn: () => api.get('/admin/notifications/email-destinations') })
+  const vaults = useQuery<Choice[]>({ queryKey: ['vaults'], queryFn: () => api.get('/admin/vaults') })
+  const { rows, sort } = useTableSort(channels.data ?? [], {
+    name: channel => channel.name,
+    type: channel => channel.type ?? 'webhook',
+    status: channel => channel.enabled,
+  })
+  const options: QuickStartOption<ChannelType>[] = []
+  if (destinations.data?.length && vaults.data?.length) options.push({ key: 'webhook', label: CHANNEL_TYPES.webhook.label, hint: 'Approved HTTPS destination', icon: CHANNEL_TYPES.webhook.icon(18) })
+  if (emailDestinations.data?.length) options.push({ key: 'email', label: CHANNEL_TYPES.email.label, hint: 'Approved email recipient', icon: CHANNEL_TYPES.email.icon(18) })
+  const choicesLoading = destinations.isLoading || emailDestinations.isLoading || vaults.isLoading
+  const choicesError = destinations.isError || emailDestinations.isError || vaults.isError
+
+  function openCreate(type: ChannelType = 'webhook') {
+    setInitialType(type)
+    setEditing('new')
   }
+
   async function remove() {
     if (!removing) return
-    setMessage(''); setBusy(true)
-    try { await api.delete(`/admin/notifications/channels/${removing.id}`,{version:removing.version,expectedAssociationVersion:removing.associationVersion}); setRemoving(null); await qc.invalidateQueries({queryKey:['worker-channels']}) }
-    catch { setMessage('Could not delete channel. Reload and try again.') }
-    finally { setBusy(false) }
-  }
-  return <div className="p-4 md:p-6 space-y-5">
-    <div className="flex flex-wrap justify-between gap-3"><div><h1 className="font-headline font-bold text-xl">Notifications</h1><p className="text-sm">Send monitor status changes to approved destinations.</p></div><button className="btn btn-primary" onClick={()=>setEditing('new')}>Add Channel</button></div>
-    <p className="text-sm">Channel names are visible metadata. Webhook channels use a Vault Secure Value as a Bearer token. Email recipients and senders are configured by the deployment administrator. Other providers and alert policies are unavailable. Delivery retries may produce duplicates.</p>
-    {message && <p role="status">{message}</p>}
-    {channels.isLoading && <p>Loading channels…</p>}{channels.isError && <p role="alert">Could not load channels. <button onClick={()=>void channels.refetch()}>Retry</button></p>}
-    {channels.data?.length===0 && <p>No channels yet.</p>}
-    <div className="space-y-2">{channels.data?.map(channel=><div key={channel.id} className="p-4 rounded-xl flex flex-wrap items-center gap-3" style={{background:'var(--m3-surface-container)',border:'1px solid var(--m3-outline-variant)'}}>
-      <div className="flex-1"><p className="font-semibold">{channel.name}</p><p className="text-xs">{channel.type === 'email' ? 'Email' : 'Webhook'} · {channel.enabled?'Enabled':'Disabled'} · {channel.checkIds.length} monitor(s) with checks</p></div>
-      <button className="btn btn-secondary btn-sm" disabled={busy} onClick={()=>void test(channel)}>Send test</button><button className="btn btn-secondary btn-sm" onClick={()=>setEditing(channel)}>Edit</button><button className="btn-icon" aria-label={`Delete channel ${channel.name}`} onClick={()=>{setMessage('');setRemoving(channel)}}>×</button>
-    </div>)}</div>
-    <section><h2 className="font-headline font-bold">Recent delivery attempts</h2><p className="text-sm">An unavailable credential or destination fails closed; check Vault and deployment settings. A first unhealthy monitor result can send an alert; a first healthy result establishes a baseline.</p>
-      {deliveries.isError && <p role="alert">Could not load delivery status.</p>}
-      {deliveries.data?.length===0 && <p>No deliveries yet.</p>}
-      {deliveries.data?.map((delivery,index)=><p key={`${delivery.channelId}-${delivery.checkId}-${delivery.updatedAt}-${index}`} className="text-sm">{channels.data?.find(c=>c.id===delivery.channelId)?.name ?? 'Channel'}: {delivery.status}, {delivery.state}{delivery.errorCode ? ` (${delivery.errorCode})` : ''} · attempts {delivery.attempts}</p>)}
-    </section>
-    {editing && <ChannelForm channel={editing==='new'?null:editing} onClose={()=>setEditing(null)} onSaved={async()=>{setEditing(null);await qc.invalidateQueries({queryKey:['worker-channels']})}} />}
-    {removing && <Modal icon="delete" title="Delete channel" onClose={()=>{if(!busy)setRemoving(null)}}><div className="p-6"><p>Delete {removing.name}? Its pending delivery records will also be removed.</p>{message && <p role="alert">{message}</p>}</div><ModalFooter><button className="btn btn-secondary" disabled={busy} onClick={()=>setRemoving(null)}>Cancel</button><button className="btn btn-primary" disabled={busy} onClick={()=>void remove()}>Delete</button></ModalFooter></Modal>}
-  </div>
-}
-
-function ChannelForm({channel,onClose,onSaved}:{channel:Channel|null;onClose:()=>void;onSaved:()=>Promise<void>}) {
-  const [name,setName]=useState(channel?.name??''), [type,setType]=useState<'email'|'webhook'>(channel?.type??'webhook'), [recipientId,setRecipientId]=useState(channel?.recipientId??''), [endpointId,setEndpointId]=useState(channel?.endpointId??''), [vaultId,setVaultId]=useState(channel?.vaultId??0), [secretId,setSecretId]=useState(channel?.secretId??0)
-  const [enabled,setEnabled]=useState(channel?.enabled!==0), [initialCheckIds]=useState<string[]>(() => [...(channel?.checkIds??[])]), [checkIds,setCheckIds]=useState<string[]>(() => [...(channel?.checkIds??[])]), [busy,setBusy]=useState(false), [error,setError]=useState('')
-  const destinations=useQuery<Choice[]>({queryKey:['worker-channel-destinations'],queryFn:()=>api.get('/admin/notifications/destinations'),enabled:type==='webhook'})
-  const emailDestinations=useQuery<Choice[]>({queryKey:['worker-email-destinations'],queryFn:()=>api.get('/admin/notifications/email-destinations'),enabled:type==='email'})
-  const checks=useQuery<CheckChoice[]>({queryKey:['worker-channel-checks'],queryFn:()=>api.get('/admin/notifications/checks'),refetchOnMount:'always'})
-  const [checkSnapshots,setCheckSnapshots]=useState<Record<string,CheckChoice>>({})
-  useEffect(()=>{
-    if (!checks.isFetchedAfterMount || !checks.data) return
-    setCheckSnapshots(current=>{
-      const next={...current}
-      for (const check of checks.data) if (checkIds.includes(check.id) && !next[check.id]) next[check.id]=check
-      return next
-    })
-  },[checks.isFetchedAfterMount,checks.data,checkIds])
-  const missingCheckSnapshots=checkIds.filter(id=>!checkSnapshots[id] || !checks.data?.some(check=>check.id===id))
-  const vaults=useQuery<Vault[]>({queryKey:['vaults'],queryFn:()=>api.get('/admin/vaults'),enabled:type==='webhook'})
-  const secrets=useQuery<Secret[]>({queryKey:['vault-secrets',vaultId],queryFn:()=>api.get(`/admin/vaults/${vaultId}/secrets`),enabled:type==='webhook' && vaultId>0})
-  async function submit(event:FormEvent) {
-    event.preventDefault(); setError(''); setBusy(true)
+    setMessage('')
+    setBusy(true)
     try {
-      if (missingCheckSnapshots.length) throw new Error('Selected monitors are unavailable. Remove them or retry loading.')
-      const expectedChecks=checkIds.map(id=>({id,componentId:checkSnapshots[id]!.componentId,version:checkSnapshots[id]!.version}))
-      const payload=type==='email' ? {name,type,recipientId,enabled,checkIds,expectedChecks,...(channel?{version:channel.version,expectedCheckIds:initialCheckIds,expectedAssociationVersion:channel.associationVersion}:{})} : {name,endpointId,vaultId,secretId,enabled,checkIds,expectedChecks,...(channel?{version:channel.version,expectedCheckIds:initialCheckIds,expectedAssociationVersion:channel.associationVersion}:{})}
-      if (channel) await api.patch(`/admin/notifications/channels/${channel.id}`,payload)
-      else await api.post('/admin/notifications/channels',payload)
-      await onSaved()
-    } catch (error) {
-      setError(error instanceof ApiError && error.status===409 && error.message==='Monitor choices are out of date. Refresh the page and try again.'
-        ? 'Monitor choices are out of date. Refresh the page and try again.'
-        : 'Could not save channel. Check your selections and reload if it was changed.')
+      await api.delete(`/admin/notifications/channels/${removing.id}`, { version: removing.version, expectedAssociationVersion: removing.associationVersion })
+      setRemoving(null)
+      await qc.invalidateQueries({ queryKey: ['worker-channels'] })
+    } catch {
+      setMessage('Could not delete channel. Reload and try again.')
+    } finally {
+      setBusy(false)
     }
-    finally { setBusy(false) }
   }
-  return <Modal icon="notifications" title={channel?'Edit channel':'Add Channel'} onClose={onClose}><form onSubmit={event=>void submit(event)}><div className="p-6 space-y-3">
-    <label className="block">Channel name<input className="input-sig w-full" value={name} maxLength={100} required onChange={event=>setName(event.target.value)} /></label>
-    <label className="block">Channel type<select className="input-sig w-full" value={type} disabled={!!channel} onChange={event=>setType(event.target.value as 'email'|'webhook')}><option value="webhook">Webhook</option><option value="email">Email</option></select></label>
-    {type==='email' ? <>
-      <label className="block">Approved email recipient<select className="input-sig w-full" required value={recipientId} onChange={event=>setRecipientId(event.target.value)}><option value="">— select recipient —</option>{emailDestinations.data?.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-      {emailDestinations.isLoading && <p role="status">Loading email recipients…</p>}
-      {emailDestinations.isError && <p role="alert">Could not load approved email recipients. <button type="button" className="underline" onClick={()=>void emailDestinations.refetch()}>Retry</button></p>}
-      {emailDestinations.data?.length===0 && <p>No approved email recipients are configured. Contact the deployment administrator.</p>}
-      <p className="text-sm">The sender and recipients are configured by the deployment administrator.</p>
-    </> : <>
-    <label className="block">Approved webhook destination<select className="input-sig w-full" required value={endpointId} onChange={event=>setEndpointId(event.target.value)}><option value="">— select destination —</option>{destinations.data?.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-    <p className="text-sm">Destinations are configured by the deployment administrator. Only HTTPS endpoints are supported. The Vault token must be at most 4096 characters and use only letters, digits, hyphen, dot, underscore, tilde, plus, slash, and optional trailing equals signs.</p>
-    <label className="block">Vault<select className="input-sig w-full" required value={vaultId||''} onChange={event=>{setVaultId(Number(event.target.value));setSecretId(0)}}><option value="">— select vault —</option>{vaults.data?.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}</select></label>
-    <label className="block">Secure Value secret<select className="input-sig w-full" required disabled={!vaultId} value={secretId||''} onChange={event=>setSecretId(Number(event.target.value))}><option value="">— select secret —</option>{secrets.data?.filter(s=>s.type==='value').map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
-    </>}
-    <label className="flex gap-2"><input type="checkbox" checked={enabled} onChange={event=>setEnabled(event.target.checked)} />Enabled</label>
-    <fieldset><legend>Monitors</legend><p className="text-sm">Select local monitors with checks. Gatus-managed monitors remain read-only.</p>{!checks.isFetchedAfterMount && <p role="status">Loading monitors…</p>}{checks.isFetchedAfterMount && !checks.isError && checks.data?.map(check=><label className="flex gap-2" key={check.id}><input type="checkbox" checked={checkIds.includes(check.id)} onChange={event=>{ const selected=event.target.checked; setCheckIds(current=>selected?[...current,check.id]:current.filter(id=>id!==check.id)); setCheckSnapshots(current=>{const next={...current};if(selected)next[check.id]=check;else delete next[check.id];return next}) }} />{check.name}</label>)}
-      {checkIds.filter(id=>checks.isFetchedAfterMount && !checks.isError && !checks.data?.some(check=>check.id===id)).map(id=><p key={id} role="alert">A selected monitor is unavailable. <button type="button" className="underline" onClick={()=>{setCheckIds(current=>current.filter(value=>value!==id));setCheckSnapshots(current=>{const next={...current};delete next[id];return next})}}>Remove unavailable monitor</button></p>)}
-    </fieldset>
-    {((type==='webhook' && (destinations.isError||vaults.isError||secrets.isError))||checks.isError) && <p role="alert">Could not load channel choices. Close and try again.</p>}{error && <p role="alert">{error}</p>}
-  </div><ModalFooter><button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="btn btn-primary" disabled={busy||!checks.isFetchedAfterMount||checks.isError||missingCheckSnapshots.length>0||(type==='email' ? !recipientId||emailDestinations.isLoading||emailDestinations.isError : !endpointId||!vaultId||!secretId||destinations.isLoading||destinations.isError||vaults.isLoading||vaults.isError||secrets.isLoading||secrets.isError)}>{channel?'Save Channel':'Create Channel'}</button></ModalFooter></form></Modal>
+
+  return <PageContainer>
+    <PageHeader title="Notifications" subtitle="Alert channels fired when a monitor changes status" actions={<>
+      <button type="button" className="btn btn-primary" onClick={() => openCreate(options[0]?.key ?? 'webhook')}>
+        <span className="material-symbols-outlined" aria-hidden="true">add</span> Add Channel
+      </button>
+      <button type="button" className="btn btn-secondary" disabled title="SMTP settings are unavailable">SMTP Settings</button>
+    </>} />
+    <Alert tone="info">Create notification channels here, then assign them to individual monitors via the monitor editor. Email recipients and webhook destinations are configured by the deployment administrator. Other providers and alert policies are unavailable.</Alert>
+    {message && <p role="alert">{message}</p>}
+    {channels.isLoading ? <LoadingState label="Loading channels…" /> : channels.isError ? <ErrorState message="Could not load notification channels." onRetry={() => void channels.refetch()} /> : channels.data?.length === 0 ? <>
+      {options.length > 0 && <QuickStartPanel title="Where should alerts go?" description="Pick a channel type. You can assign it to monitors afterwards." options={options} onPick={openCreate} />}
+      {options.length === 0 && (choicesLoading ? <p role="status">Loading available channel types…</p> : choicesError ? <p role="alert">Could not load available channel types. <button type="button" className="underline" onClick={() => { if (destinations.isError) void destinations.refetch(); if (emailDestinations.isError) void emailDestinations.refetch(); if (vaults.isError) void vaults.refetch() }}>Retry</button></p> : <p>No channels yet. Configure an approved destination to create one.</p>)}
+    </> : <div className="rounded-2xl overflow-x-auto" style={{ background: 'var(--m3-surface-container-low)', border: '1px solid var(--m3-outline-variant)' }}>
+      <DataTable sort={sort} className="w-full min-w-[600px] text-sm">
+        <thead><tr style={{ borderBottom: '1px solid var(--m3-outline-variant)' }}>
+          <DataTh sortKey="name" className="px-4 py-3 text-left">Name</DataTh>
+          <DataTh sortKey="type" className="px-4 py-3 text-left">Type</DataTh>
+          <DataTh className="px-4 py-3 text-left">Monitors with checks</DataTh>
+          <DataTh sortKey="status" className="px-4 py-3 text-left">Status</DataTh>
+          <DataTh className="px-4 py-3 text-right"><span className="sr-only">Actions</span></DataTh>
+        </tr></thead>
+        <tbody>{rows.map(channel => <tr key={channel.id} style={{ borderTop: '1px solid var(--m3-outline-variant)' }}>
+          <td className="px-4 py-3 font-medium">{channel.name}</td>
+          <td className="px-4 py-3">{channel.type === 'email' ? 'Email' : 'Webhook'}</td>
+          <td className="px-4 py-3">{channel.checkIds.length}</td>
+          <td className="px-4 py-3">{channel.enabled ? 'Enabled' : 'Disabled'}</td>
+          <td className="px-4 py-3 text-right"><div className="flex justify-end gap-2">
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setEditing(channel)}>Edit</button>
+            <button type="button" className="btn-icon" aria-label={`Delete channel ${channel.name}`} onClick={() => { setMessage(''); setRemoving(channel) }}>×</button>
+          </div></td>
+        </tr>)}</tbody>
+      </DataTable>
+    </div>}
+    <section className="mt-6"><h2 className="font-headline font-bold">Recent delivery attempts</h2><p className="text-sm">An unavailable credential or destination fails closed; check Vault and deployment settings. A first unhealthy monitor result can send an alert; a first healthy result establishes a baseline.</p>
+      {deliveries.isError && <p role="alert">Could not load delivery status.</p>}
+      {deliveries.data?.length === 0 && <p>No deliveries yet.</p>}
+      {deliveries.data?.map((delivery, index) => <p key={`${delivery.channelId}-${delivery.checkId}-${delivery.updatedAt}-${index}`} className="text-sm">{channels.data?.find(channel => channel.id === delivery.channelId)?.name ?? 'Channel'}: {delivery.status}, {delivery.state}{delivery.errorCode ? ` (${delivery.errorCode})` : ''} · attempts {delivery.attempts}</p>)}
+    </section>
+    {editing && <CloudflareChannelForm channel={editing === 'new' ? null : editing} initialType={initialType} onClose={() => setEditing(null)} onSaved={async () => { setEditing(null); await qc.invalidateQueries({ queryKey: ['worker-channels'] }) }} />}
+    {removing && <ConfirmModal title="Delete channel" message={`Delete "${removing.name}"? Its pending delivery records will also be removed.${message ? ` ${message}` : ''}`} confirmLabel="Delete" pending={busy} pendingLabel="Deleting…" onConfirm={() => void remove()} onCancel={() => { if (!busy) setRemoving(null) }} />}
+  </PageContainer>
 }
