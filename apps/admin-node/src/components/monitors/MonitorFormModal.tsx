@@ -93,7 +93,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   const [name, setName]               = useState(monitor?.name ?? '')
   const [type, setType]               = useState<MonitorType>(monitor?.type as MonitorType ?? initialType)
   const [intervalSecs, setIntervalSecs] = useState(cloudflare?.check ? cloudflare.check.intervalMinutes * 60 : monitor?.intervalSecs ?? 60)
-  const [timeoutMs, setTimeoutMs]     = useState(cloudflare?.check ? Number(cloudflare.check.advancedConfig?.timeoutMs ?? 5000) : monitor?.timeoutMs ?? 10000)
+  const [timeoutMs, setTimeoutMs]     = useState(cloudflare?.check ? Number(cloudflare.check.advancedConfig?.timeoutMs ?? (cloudflare.check.advancedConfig == null ? 5000 : 10000)) : monitor?.timeoutMs ?? 10000)
   const [config, setConfig]           = useState<Record<string, unknown>>(
     cloudflare ? { method: 'GET', expectedStatus: cloudflare.check?.expectedStatus ?? 200, ...cloudflare.check?.advancedConfig } : monitor ? (monitor.config as unknown as Record<string, unknown>) : (defaultConfigs[initialType] as Record<string, unknown>),
   )
@@ -292,7 +292,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         if (config['method'] === 'HEAD' && (config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).some(assertion => assertion.type === 'json'))) throw new Error('HEAD responses have no body. Remove the keyword and JSON checks or use GET.')
         const previous = initialCloudflareCheck
         if (previous && !endpointId) throw new Error('Select an approved destination for this check.')
-        const previousAdvanced = { method: 'GET', ...previous?.advancedConfig, timeoutMs: Number(previous?.advancedConfig?.timeoutMs ?? 5000), attempts: Number(previous?.advancedConfig?.attempts ?? 1) }
+        const previousAdvanced = { method: 'GET', ...previous?.advancedConfig, timeoutMs: Number(previous?.advancedConfig?.timeoutMs ?? (previous?.advancedConfig == null ? 5000 : 10000)), attempts: Number(previous?.advancedConfig?.attempts ?? 1) }
         const advancedUnchanged = comparable(advanced) === comparable(previousAdvanced)
         const basicUnchanged = previous && endpointId === previous.endpointId && enabled === Boolean(previous.enabled) && intervalSecs === previous.intervalMinutes * 60 && Number(config['expectedStatus'] ?? 200) === previous.expectedStatus
         if (previous?.advancedConfigInvalid && !(basicUnchanged && advancedUnchanged)) throw new Error('Check settings are invalid. Contact an administrator to review the configuration.')

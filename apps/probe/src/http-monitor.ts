@@ -57,6 +57,10 @@ function fail(reason: string, attempts = 0): HttpMonitorResult {
 function validStatus(value: unknown): value is number {
   return Number.isInteger(value) && Number(value) >= 100 && Number(value) <= 599
 }
+/** Never follow or accept a redirect to a destination outside the registry. */
+export function isBlockedRedirect(response: Response): boolean {
+  return response.status >= 300 && response.status < 400 && response.headers.has('location')
+}
 function validate(config: HttpMonitorConfig): boolean {
   if (!config || typeof config !== 'object' || Array.isArray(config) || Object.keys(config).some(key => !CONFIG_FIELDS.has(key)) || typeof config.endpointId !== 'string' || !config.endpointId || typeof config.registryFingerprint !== 'string') return false
   if (config.method !== undefined && (typeof config.method !== 'string' || !['GET', 'POST', 'HEAD'].includes(config.method.toUpperCase()))) return false
@@ -179,7 +183,7 @@ async function oneAttempt(config: HttpMonitorConfig, endpoint: Endpoint, env: Ht
       const responseMs = Math.max(0, Date.now() - start)
       const httpStatus = response.status
       // Do not permit an accepted 3xx to hide an unapproved redirect destination.
-      if (httpStatus >= 300 && httpStatus < 400 && response.headers.has('location')) return { status: 'down' as const, responseMs, httpStatus, reasons: ['redirect_blocked'] }
+      if (isBlockedRedirect(response)) return { status: 'down' as const, responseMs, httpStatus, reasons: ['redirect_blocked'] }
       const accepted = config.acceptedStatusRanges?.some(range => httpStatus >= range.min && httpStatus <= range.max) ?? (httpStatus === (config.expectedStatus ?? 200))
       if (!accepted) return { status: 'down' as const, responseMs, httpStatus, reasons: ['unexpected_status'] }
       const assertions = config.assertions ?? []

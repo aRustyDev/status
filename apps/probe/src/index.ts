@@ -1,5 +1,5 @@
 import { endpointFingerprint, parseEndpoints, type Endpoint } from '../../worker/src/endpoint-config'
-import { evaluateHttpMonitor, parsePersistedHttpConfig } from './http-monitor'
+import { evaluateHttpMonitor, isBlockedRedirect, parsePersistedHttpConfig } from './http-monitor'
 
 type Check = {
   id: string
@@ -48,7 +48,7 @@ async function probe(endpoint: Endpoint, expectedStatus: number, env: Environmen
       response = await fetch(endpoint.url, options)
     }
     httpStatus = response.status
-    status = httpStatus === expectedStatus ? 'up' : 'down'
+    status = !isBlockedRedirect(response) && httpStatus === expectedStatus ? 'up' : 'down'
     await response.body?.cancel()
   } catch (error) {
     // Exception names and messages may contain destination URLs or credentials.
@@ -164,7 +164,9 @@ export default {
       const part = await reader.read()
       if (part.done) break
       size += part.value.byteLength
-      if (size > 32_000) { await reader.cancel(); return Response.json({ error: 'Test request too large' }, { status: 413 }) }
+      // Match the management Worker's bounded byte limit: a valid saved
+      // configuration may use many more UTF-8 bytes than UTF-16 characters.
+      if (size > 256_000) { await reader.cancel(); return Response.json({ error: 'Test request too large' }, { status: 413 }) }
       raw += decoder.decode(part.value, { stream: true })
     }
     raw += decoder.decode()
