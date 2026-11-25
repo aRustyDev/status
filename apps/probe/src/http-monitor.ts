@@ -36,6 +36,7 @@ export type HttpMonitorConfig = {
   expectedStatus?: number
   acceptedStatusRanges?: StatusRange[]
   headers?: Record<string, string>
+  vaultHeaders?: Record<string, { vaultId: number; secretId: number }>
   body?: string
   keyword?: string
   assertions?: HttpAssertion[]
@@ -62,7 +63,7 @@ const MAX_BODY = 1024 * 1024
 const MAX_REQUEST_BODY = 64 * 1024
 const MAX_ASSERTIONS = 20
 const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/
-const CONFIG_FIELDS = new Set(['endpointId', 'registryFingerprint', 'method', 'expectedStatus', 'acceptedStatusRanges', 'headers', 'body', 'keyword', 'assertions', 'degradedAboveMs', 'timeoutMs', 'attempts', 'auth'])
+const CONFIG_FIELDS = new Set(['endpointId', 'registryFingerprint', 'method', 'expectedStatus', 'acceptedStatusRanges', 'headers', 'vaultHeaders', 'body', 'keyword', 'assertions', 'degradedAboveMs', 'timeoutMs', 'attempts', 'auth'])
 const FORBIDDEN_HEADERS = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'upgrade', 'proxy-authorization'])
 const CODES = { invalid: 'invalid_configuration', unapproved: 'unapproved_destination', stale: 'destination_fingerprint_mismatch', network: 'request_failed', timeout: 'request_timeout' } as const
 
@@ -87,6 +88,7 @@ function validate(config: HttpMonitorConfig): boolean {
   if (config.attempts !== undefined && (!Number.isInteger(config.attempts) || config.attempts < 1 || config.attempts > 10)) return false
   if (config.degradedAboveMs !== undefined && (!Number.isInteger(config.degradedAboveMs) || config.degradedAboveMs < 1 || config.degradedAboveMs > 300_000)) return false
   if (config.body !== undefined && (typeof config.body !== 'string' || new TextEncoder().encode(config.body).length > MAX_REQUEST_BODY || (config.method ?? 'GET').toUpperCase() !== 'POST')) return false
+  if (config.vaultHeaders !== undefined && (!config.vaultHeaders || typeof config.vaultHeaders !== 'object' || Array.isArray(config.vaultHeaders))) return false
   if (config.keyword !== undefined && (typeof config.keyword !== 'string' || config.keyword.length > 1000)) return false
   if (config.headers !== undefined) {
     if (!config.headers || typeof config.headers !== 'object' || Array.isArray(config.headers) || Object.keys(config.headers).length > 100) return false
@@ -116,25 +118,72 @@ function validAssertion(assertion: HttpAssertion): boolean {
 
 /**
  * Strictly validate persisted, non-secret advanced settings. This is shared by
- * the management API and the scheduled probe so an invalid write cannot create
- * a check that later fails silently. It deliberately excludes request headers,
- * request body, credentials, POST and user-specified destinations.
+ * the management API and scheduled probe so an invalid write cannot create
+ * a check that later fails silently. Destination policy is checked separately.
  */
 export function parsePersistedHttpConfig(value: unknown, endpointId: string, registryFingerprint: string, expectedStatus: number): HttpMonitorConfig | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const config = value as Record<string, unknown>
-  const allowed = ['method', 'acceptedStatusRanges', 'keyword', 'assertions', 'timeoutMs', 'attempts', 'degradedAboveMs', 'auth']
+  const allowed = ['method', 'acceptedStatusRanges', 'keyword', 'assertions', 'timeoutMs', 'attempts', 'degradedAboveMs', 'auth', 'headers', 'body', 'vaultHeaders']
   if (Object.keys(config).some(key => !allowed.includes(key))) return null
-  if (config.method !== undefined && (typeof config.method !== 'string' || !['GET', 'HEAD'].includes(config.method.toUpperCase()))) return null
   if (Array.isArray(config.acceptedStatusRanges) && config.acceptedStatusRanges.some(range => !range || typeof range !== 'object' || Array.isArray(range) || Object.keys(range).some(key => !['min', 'max'].includes(key)))) return null
   const candidate = { ...config, endpointId, registryFingerprint, ...(config.acceptedStatusRanges === undefined ? { expectedStatus } : {}) } as HttpMonitorConfig
-  if (!validate(candidate)) return null
+  if (!validate(candidate) || !validRequestSettings(candidate)) return null
   // With at most 20 enabled checks and batches of four, this bounds the
   // timeout-dominated portion of a full scheduled tick to about 50 seconds.
   // It does not eliminate overlap under platform delays; save fences remain
   // necessary. This is narrower than the full upstream Node runner.
   return (candidate.timeoutMs ?? 10_000) * (candidate.attempts ?? 1) <= 10_000 ? candidate : null
 }
+const SENSITIVE_HEADER = /authorization|cookie|api[-_]?key|token|secret/i
+const UNSAFE_HEADERS = new Set([...FORBIDDEN_HEADERS, 'proxy-connection', 'te', 'trailer', 'keep-alive', 'set-cookie'])
+
+function validRequestSettings(config: HttpMonitorConfig): boolean {
+  const method = (config.method ?? 'GET').toUpperCase()
+  if (method === 'POST' && (config.attempts ?? 1) !== 1) return false
+  if (config.body !== undefined) {
+    if (new TextEncoder().encode(config.body).length > 16 * 1024 || method !== 'POST') return false
+    try { JSON.parse(config.body) } catch { return false }
+  }
+  const headers = Object.entries(config.headers ?? {})
+  const vaultHeaders = Object.entries(config.vaultHeaders ?? {})
+  if (headers.length + vaultHeaders.length > 20) return false
+  const names = new Set<string>()
+  let bytes = 0
+  for (const [name, value] of headers) {
+    const normalized = name.toLowerCase()
+    if (!HEADER_NAME.test(name) || UNSAFE_HEADERS.has(normalized) || SENSITIVE_HEADER.test(name) || names.has(normalized) || typeof value !== 'string' || Array.from(value).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) return false
+    if (normalized === 'content-type' && config.body !== undefined && value.toLowerCase() !== 'application/json') return false
+    names.add(normalized)
+    const size = new TextEncoder().encode(value).length
+    if (size > 2048) return false
+    bytes += size
+  }
+  for (const [name, ref] of vaultHeaders) {
+    const normalized = name.toLowerCase()
+    if (!HEADER_NAME.test(name) || UNSAFE_HEADERS.has(normalized) || normalized === 'content-type' || names.has(normalized) || (normalized === 'authorization' && config.auth)) return false
+    if (!ref || typeof ref !== 'object' || Array.isArray(ref) || Object.keys(ref).some(key => key !== 'vaultId' && key !== 'secretId') || !Number.isSafeInteger(ref.vaultId) || ref.vaultId < 1 || !Number.isSafeInteger(ref.secretId) || ref.secretId < 1) return false
+    names.add(normalized)
+  }
+  return bytes <= 8192
+}
+
+/** Enforce the deployment-approved target and request policy at each send. */
+export function requestAllowedForEndpoint(config: HttpMonitorConfig, endpoint: Endpoint): boolean {
+  if (!validRequestSettings(config)) return false
+  const method = (config.method ?? 'GET').toUpperCase()
+  const headers = Object.keys(config.headers ?? {})
+  const vaultHeaders = Object.keys(config.vaultHeaders ?? {})
+  if (method === 'POST' || config.body !== undefined || headers.length || vaultHeaders.length) {
+    if (new URL(endpoint.url).protocol !== 'https:') return false
+  }
+  const policy = endpoint.requestPolicy
+  if (method === 'POST' && !policy?.allowPost) return false
+  if (headers.some(name => !policy?.plaintextHeaders?.includes(name.toLowerCase()))) return false
+  if (vaultHeaders.some(name => !policy?.vaultHeaders?.includes(name.toLowerCase()))) return false
+  return true
+}
+
 function resolvePath(root: unknown, path: string): unknown {
   let value: unknown = root
   for (const segment of parseJsonPath(path) ?? []) {
@@ -195,7 +244,9 @@ async function oneAttempt(config: HttpMonitorConfig, endpoint: Endpoint, env: Ht
   const deadline = new Promise<never>((_, reject) => controller.signal.addEventListener('abort', () => reject(new Error('deadline')), { once: true }))
   try {
     const work = (async () => {
-      response = await env.fetch(endpoint.url, { method: (config.method ?? 'GET').toUpperCase(), headers: config.headers, body: config.body, redirect: 'manual', signal: controller.signal }, endpoint)
+      const headers = { ...config.headers }
+      if (config.body !== undefined && !Object.keys(headers).some(name => name.toLowerCase() === 'content-type')) headers['content-type'] = 'application/json'
+      response = await env.fetch(endpoint.url, { method: (config.method ?? 'GET').toUpperCase(), headers, body: config.body, redirect: 'manual', signal: controller.signal }, endpoint)
       const responseMs = Math.max(0, Date.now() - start)
       const httpStatus = response.status
       // Do not permit an accepted 3xx to hide an unapproved redirect destination.
@@ -241,6 +292,7 @@ export async function evaluateHttpMonitor(config: HttpMonitorConfig, env: HttpMo
   // Snapshot the deployed target before hashing so mutation cannot change the
   // URL or binding between the fingerprint check and the request.
   const endpoint = { ...configuredEndpoint }
+  if (!requestAllowedForEndpoint(config, endpoint)) return fail(CODES.invalid)
   if (await endpointFingerprint(endpoint) !== config.registryFingerprint) return fail(CODES.stale)
   let result: Omit<HttpMonitorResult, 'attempts'> = fail(CODES.network)
   for (let attempts = 1; attempts <= (config.attempts ?? 1); attempts++) {

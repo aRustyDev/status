@@ -57,6 +57,7 @@ function CloudflareMonitorFormModal({ monitor, allTags = [], onClose, onSaved, s
   const profile: CloudflareProfile = {
     isAdmin,
     monitorAuth: !!capabilities.monitorAuth,
+    monitorRequest: !!capabilities.monitorRequest,
     monitorAlerts: isAdmin && !!capabilities.notifications,
     monitorActions: isAdmin && !!capabilities.actions,
     actionsPanel: isAdmin && capabilities.actions ? <CloudflareActionsPanel componentId={component?.uuid} /> : undefined,

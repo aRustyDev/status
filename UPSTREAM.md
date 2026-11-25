@@ -6,6 +6,8 @@ The upstream source is licensed under the MIT License. Its copyright notice and 
 
 The Cloudflare monitor editor reuses the incorporated upstream `TagsSection` and sidebar for coloured labels and existing-tag suggestions. Monitor tag storage and API handling are adapted to the Workers and D1 architecture; Gatus-managed monitors remain read-only, and tag-based subscriptions are not supported by this profile.
 
+The Cloudflare Request panel reuses the upstream body editor and sidebar, with deployment-approved plaintext headers and Vault Secure Value selectors adapted to the Workers request policy. The upstream free-form header editor remains available in the Node profile.
+
 The scheduled HTTP-check design was informed by [cf-workers-status-page](https://github.com/eidam/cf-workers-status-page), including its use of Workers Cron Triggers and HTTP response checks. This fork implements its own probe and D1 persistence; it does not incorporate that project's source code.
 
 The Cloudflare Vault screen adapts the layout and shared modal components of the upstream `@better-forge/ui` Vault page. The upstream page is coupled to the Node API client and offers reveal and HashiCorp operations that the Workers API does not implement, so it cannot be used unchanged. The adapted screen uses the Cloudflare API client, local encrypted vaults, and write-only secret creation and rotation. External vault providers and secret reveal remain unavailable.

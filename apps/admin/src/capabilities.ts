@@ -10,6 +10,7 @@ export interface Capabilities {
   runNow?: boolean
   monitorModal?: boolean
   monitorAuth?: boolean
+  monitorRequest?: boolean
   incidentDelete?: boolean
 }
 

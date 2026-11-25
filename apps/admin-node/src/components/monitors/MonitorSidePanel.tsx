@@ -23,7 +23,7 @@ export const PANEL_META: Record<SidePanelKey, SidePanelMeta> = {
 
 // ── Request (headers & body) ──────────────────────────────────────────────────
 
-export function RequestSection({ config, updateConfig }: { config: Record<string, unknown>; updateConfig: (key: string, value: unknown) => void }) {
+export function RequestSection({ config, updateConfig, hideHeaders = false, bodyDisabled = false }: { config: Record<string, unknown>; updateConfig: (key: string, value: unknown) => void; hideHeaders?: boolean; bodyDisabled?: boolean }) {
   const headers = (config['headers'] as Record<string, string> | undefined) ?? {}
   const headerRows = Object.entries(headers)
 
@@ -41,7 +41,7 @@ export function RequestSection({ config, updateConfig }: { config: Record<string
 
   return (
     <>
-      <div>
+      {!hideHeaders && <div>
         <div className="flex items-center justify-between mb-2">
           <span className="font-mono text-xs uppercase tracking-wider" style={{ color: 'var(--m3-secondary)' }}>Request Headers</span>
           <button type="button" onClick={addHeader} className="text-xs px-2 py-0.5 rounded transition-colors focus-ring" style={{ color: 'var(--m3-primary)', border: '1px solid color-mix(in srgb, var(--m3-primary) 30%, transparent)' }}>+ Add</button>
@@ -56,13 +56,77 @@ export function RequestSection({ config, updateConfig }: { config: Record<string
             </div>
           ))}
         </div>
-      </div>
+      </div>}
       <div>
         <label htmlFor="monitor-request-body" className="block font-mono text-xs uppercase tracking-wider mb-2" style={{ color: 'var(--m3-secondary)' }}>Request Body (JSON)</label>
-        <textarea id="monitor-request-body" className="input-sig text-xs w-full font-mono" rows={10} placeholder={'{\n  "key": "value"\n}'} value={(config['body'] as string) ?? ''} onChange={(e) => updateConfig('body', e.target.value)} style={{ resize: 'vertical' }} />
+        <textarea id="monitor-request-body" className="input-sig text-xs w-full font-mono" rows={10} disabled={bodyDisabled} placeholder={'{\n  "key": "value"\n}'} value={(config['body'] as string) ?? ''} onChange={(e) => updateConfig('body', hideHeaders && !e.target.value ? undefined : e.target.value)} style={{ resize: 'vertical' }} />
       </div>
     </>
   )
+}
+
+export type RequestPolicy = { allowPost?: boolean; plaintextHeaders?: string[]; vaultHeaders?: string[] }
+
+export function CloudflareRequestSection({ config, updateConfig, policy, vaultPicker, vaultReady, vaultError }: {
+  config: Record<string, unknown>
+  updateConfig: (key: string, value: unknown) => void
+  policy?: RequestPolicy | undefined
+  vaultPicker: VaultPickerProps
+  vaultReady: boolean
+  vaultError: boolean
+}) {
+  const headers = (config['headers'] as Record<string, string> | undefined) ?? {}
+  const vaultHeaders = (config['vaultHeaders'] as Record<string, VaultRef> | undefined) ?? {}
+  const approved = (name: string, names: string[] | undefined) => names?.some(item => item.toLowerCase() === name.toLowerCase())
+  const namesFor = (configured: string[], allowed: string[]) => [
+    ...configured,
+    ...allowed.filter(name => !configured.some(item => item.toLowerCase() === name.toLowerCase())),
+  ]
+  const plainNames = namesFor(Object.keys(headers), policy?.plaintextHeaders ?? [])
+  const secretNames = namesFor(Object.keys(vaultHeaders), policy?.vaultHeaders ?? [])
+  const updateHeader = (name: string, value: string | undefined) => {
+    const next = { ...headers }
+    if (value === undefined) delete next[name]
+    else next[name] = value
+    updateConfig('headers', Object.keys(next).length ? next : undefined)
+  }
+  const updateVaultHeader = (name: string, value: VaultRef | undefined) => {
+    const next = { ...vaultHeaders }
+    if (value === undefined) delete next[name]
+    else next[name] = value
+    updateConfig('vaultHeaders', Object.keys(next).length ? next : undefined)
+  }
+  return <div className="space-y-4">
+    <div>
+      <h3 className="font-mono text-xs uppercase tracking-wider">Request headers</h3>
+      {plainNames.length === 0 && <p className="text-xs">No plaintext headers are approved for this destination.</p>}
+      {plainNames.map(name => <div key={name} className="space-y-1 mt-2">
+        <label><input type="checkbox" checked={Object.hasOwn(headers, name)} onChange={event => updateHeader(name, event.target.checked ? '' : undefined)} /> {name}</label>
+        {Object.hasOwn(headers, name) && <input aria-label={`${name} value`} className="input-sig w-full text-xs" value={headers[name] ?? ''} onChange={event => updateHeader(name, event.target.value)} />}
+        {!approved(name, policy?.plaintextHeaders) && <p role="alert">This header is no longer approved. Remove it before saving.</p>}
+      </div>)}
+    </div>
+    <div>
+      <h3 className="font-mono text-xs uppercase tracking-wider">Vault headers</h3>
+      {!vaultReady && <p className="text-xs">Vault headers are unavailable.</p>}
+      {vaultError && <p role="alert">Could not load Vault secrets. Close and reopen the editor to retry.</p>}
+      {secretNames.map(name => {
+        const ref = vaultHeaders[name]
+        return <div key={name} className="space-y-2 mt-2">
+          <label><input type="checkbox" disabled={!vaultReady && !ref} checked={!!ref} onChange={event => updateVaultHeader(name, event.target.checked ? { vaultId: 0, secretId: 0 } : undefined)} /> {name}</label>
+          {ref && <div className="grid grid-cols-2 gap-3">
+            <Field label={`${name} vault`}><select className="input-sig" value={ref.vaultId || ''} onChange={event => { const id = Number(event.target.value); if (id) vaultPicker.onLoadSecrets(id); updateVaultHeader(name, { vaultId: id, secretId: 0 }) }}><option value="">— select vault —</option>{vaultPicker.vaults.map(vault => <option key={vault.id} value={vault.id}>{vault.name}</option>)}</select></Field>
+            <Field label={`${name} secret`}><select className="input-sig" value={ref.secretId || ''} disabled={!ref.vaultId} onChange={event => updateVaultHeader(name, { vaultId: ref.vaultId, secretId: Number(event.target.value) })}><option value="">— select secret —</option>{(vaultPicker.secretsByVault[ref.vaultId] ?? []).filter(secret => secret.type === 'value').map(secret => <option key={secret.id} value={secret.id}>{secret.name}</option>)}</select></Field>
+          </div>}
+          {!approved(name, policy?.vaultHeaders) && <p role="alert">This header is no longer approved. Remove it before saving.</p>}
+        </div>
+      })}
+      {secretNames.length === 0 && <p className="text-xs">No Vault headers are approved for this destination.</p>}
+      {Object.keys(vaultHeaders).length > 0 && <p className="text-xs">Save these settings before testing the request.</p>}
+    </div>
+    <RequestSection config={config} updateConfig={updateConfig} hideHeaders bodyDisabled={String(config['method'] ?? 'GET').toUpperCase() !== 'POST' && !config['body']} />
+    <p className="text-xs">JSON bodies require POST and must contain at most 16 KiB of UTF-8 data. Request bodies are stored as entered.</p>
+  </div>
 }
 
 // ── Alert channels ────────────────────────────────────────────────────────────

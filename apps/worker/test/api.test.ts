@@ -71,7 +71,7 @@ let db: TestDatabase = sqlite
 let miniflare: Miniflare | undefined
 const issuer = 'https://test.cloudflareaccess.com'
 const audience = 'status-test'
-const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; CHANNELS_READY?: string; CHANNEL_ENDPOINTS?: string; ACTIONS_READY?: string; ACTION_ENDPOINTS?: string; EMAIL_READY?: string; EMAIL_FROM?: string; EMAIL_DESTINATIONS?: string; EMAIL?: { send: (message: unknown) => Promise<{messageId:string}> } } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
+const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; MONITOR_REQUEST_READY?: string; CHANNELS_READY?: string; CHANNEL_ENDPOINTS?: string; ACTIONS_READY?: string; ACTION_ENDPOINTS?: string; EMAIL_READY?: string; EMAIL_FROM?: string; EMAIL_DESTINATIONS?: string; EMAIL?: { send: (message: unknown) => Promise<{messageId:string}> } } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
 const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
@@ -97,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -127,6 +127,7 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0014_monitor_alert_channel_limit.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0015_monitor_dependencies.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0016_dependency_observations.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0015_monitor_request.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0017_monitor_action_links.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
@@ -1122,6 +1123,61 @@ test('advanced HTTP settings are admin-only, versioned, non-secret and no-op awa
   const removed = await request(path, adminToken, 'PUT', { version: 2, advancedConfig: null })
   assert.equal(removed.response.status, 200)
   assert.equal(removed.body.version, 3)
+})
+
+test('custom request settings require an approved destination and round-trip through the admin API', async () => {
+  const endpoint = { id: 'request-api', name: 'Request target', url: 'https://example.com/health', requestPolicy: { allowPost: true, plaintextHeaders: ['x-monitor'], vaultHeaders: [] } }
+  const other = { id: 'request-other', name: 'Other target', url: 'https://example.com/other' }
+  env.ENDPOINTS = JSON.stringify([endpoint, other])
+  env.MONITOR_REQUEST_READY = 'true'
+  try {
+    const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Request check' })
+    const created = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: false, intervalMinutes: 1, expectedStatus: 200 })
+    const path = `/api/v1/bsp/admin/checks/${created.body.id}/advanced`
+    const config = { method: 'POST', headers: { 'x-monitor': 'check' }, body: '{"check":true}' }
+    assert.equal((await request(path, adminToken, 'PUT', { version: 1, advancedConfig: { ...config, headers: { authorization: 'secret' } } })).response.status, 400)
+    assert.equal((await request(path, operatorToken, 'PUT', { version: 1, advancedConfig: config })).response.status, 403)
+    assert.equal((await request(path, adminToken, 'PUT', { version: 1, advancedConfig: config })).response.status, 200)
+    const checks = await request('/api/v1/admin/checks', adminToken)
+    assert.deepEqual((checks.body.find(check => check.id === created.body.id) as unknown as { advancedConfig: unknown }).advancedConfig, config)
+    const moved = await request(`/api/v1/admin/checks/${created.body.id}`, adminToken, 'PATCH', { componentId: component.body.id, endpointId: other.id, enabled: false, intervalMinutes: 1, expectedStatus: 200, version: 2 })
+    assert.equal(moved.response.status, 400)
+    const audit = await db.prepare('SELECT details FROM audit_events WHERE entity_id=? ORDER BY created_at DESC LIMIT 1').bind(created.body.id).first()
+    assert.ok(!String(audit?.details).includes('check":true'))
+  } finally { delete env.MONITOR_REQUEST_READY; env.ENDPOINTS = '[]' }
+})
+
+test('saved Vault header tests do not require the monitoring API to hold the Vault key', async () => {
+  const endpoint = { id: 'vault-header-api', name: 'Vault header target', url: 'https://example.com/health', requestPolicy: { allowPost: true, plaintextHeaders: [], vaultHeaders: ['x-token'] } }
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  env.MONITOR_REQUEST_READY = 'true'
+  env.MONITOR_AUTH_READY = 'true'
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  let forwarded: unknown
+  let vaultId: number | undefined
+  let secretId: number | undefined
+  env.PROBE = { async fetch(request) { forwarded = await request.json(); return Response.json({ overall: 'ok', steps: [], totalMs: 1 }) } }
+  try {
+    const vault = await request('/api/v1/bsp/admin/vaults', adminToken, 'POST', { name: 'Header test vault' })
+    vaultId = Number(vault.body.id)
+    const secret = await request(`/api/v1/bsp/admin/vaults/${vault.body.id}/secrets`, adminToken, 'POST', { name: 'Header test value', type: 'value', value: 'synthetic' })
+    assert.equal(secret.response.status, 201)
+    secretId = Number(secret.body.id)
+    const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Vault header test' })
+    const check = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: false, intervalMinutes: 1, expectedStatus: 200 })
+    const advancedConfig = { method: 'POST', vaultHeaders: { 'x-token': { vaultId: vault.body.id, secretId: secret.body.id } } }
+    const saved = await request(`/api/v1/bsp/admin/checks/${check.body.id}/advanced`, adminToken, 'PUT', { version: 1, advancedConfig })
+    assert.equal(saved.response.status, 200)
+    delete env.VAULT_ENCRYPTION_KEY
+    const tested = await request('/api/v1/bsp/admin/monitors/test', adminToken, 'POST', { endpointId: endpoint.id, expectedStatus: 200, advancedConfig, checkId: check.body.id, checkVersion: 2 })
+    assert.equal(tested.response.status, 200)
+    assert.deepEqual(forwarded, { checkId: check.body.id, checkVersion: 2 })
+  } finally {
+    if (secretId) await db.prepare('DELETE FROM vault_secrets WHERE id=?').bind(secretId).run()
+    if (vaultId) await db.prepare('DELETE FROM vaults WHERE id=?').bind(vaultId).run()
+    await db.prepare('DELETE FROM vault_key_verifier').run()
+    delete env.PROBE; delete env.VAULT_ENCRYPTION_KEY; delete env.MONITOR_AUTH_READY; delete env.MONITOR_REQUEST_READY; env.ENDPOINTS = '[]'
+  }
 })
 
 test('effective degraded state survives new reads and legacy-probe fallback uses its latest status', async () => {
