@@ -572,6 +572,19 @@ test('channel create and update reject a monitor moved or changed before the tra
   }
 })
 
+test('an old channel editor must refresh; malformed monitor snapshots remain invalid',async()=>{
+  const x=await setup(), legacy:Record<string,unknown>={...x.channelBody}
+  delete legacy.expectedChecks
+  for (const method of ['POST','PATCH'] as const) {
+    const route=method==='POST' ? '/admin/notifications/channels' : `/admin/notifications/channels/${x.channel.id}`
+    const input=method==='POST' ? {...legacy,name:'Second'} : {...legacy,version:1}
+    await assert.rejects(channelApi(request(method,input),x.env,actor,route),(e:unknown)=>e instanceof ChannelError && e.status===409 && /refresh/i.test(e.message))
+    await assert.rejects(channelApi(request(method,{...input,expectedChecks:null}),x.env,actor,route),(e:unknown)=>e instanceof ChannelError && e.status===400)
+  }
+  assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_channels').get()?.n,1)
+  assert.equal(x.local.db.prepare('SELECT version FROM notification_channels WHERE id=?').get(x.channel.id)?.version,1)
+})
+
 test('removing a monitor still invokes integrated unlink cancellation',async()=>{
   const x=await setup();await queueTimingEvent(x)
   x.local.db.exec(`CREATE TRIGGER notification_check_unlink_cancel AFTER DELETE ON notification_channel_checks BEGIN

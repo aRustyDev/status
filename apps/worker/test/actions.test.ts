@@ -480,6 +480,19 @@ test('action no-op and rename retain the pending transition',async()=>{
  assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox').get()?.state,'completed')
 })
 
+test('an old action editor must refresh; malformed monitor snapshots remain invalid',async()=>{
+ const x=await setup(), legacy:Record<string,unknown>={...x.actionBody}
+ delete legacy.checkSnapshots
+ for(const method of ['POST','PATCH'] as const) {
+  const route=method==='POST' ? '/admin/actions' : `/admin/actions/${x.action.id}`
+  const input=method==='POST' ? {...legacy,name:'Second'} : {...legacy,version:1}
+  await assert.rejects(actionApi(request(method,input),x.env,actor,route),(e:unknown)=>e instanceof ActionError && e.status===409 && /refresh/i.test(e.message))
+  await assert.rejects(actionApi(request(method,{...input,checkSnapshots:null}),x.env,actor,route),(e:unknown)=>e instanceof ActionError && e.status===400)
+ }
+ assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM worker_actions').get()?.n,1)
+ assert.equal(x.local.db.prepare('SELECT version FROM worker_actions WHERE id=?').get(x.action.id)?.version,1)
+})
+
 test('functional action edits do not carry pending transitions',async()=>{
  const x=await setup();await queue(x)
  await actionApi(request('PATCH',{...x.actionBody,triggerStatus:'up',version:1}),x.env,actor,`/admin/actions/${x.action.id}`)

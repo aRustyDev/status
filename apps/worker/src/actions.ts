@@ -77,6 +77,9 @@ export async function actionApi(request:Request, env:ActionEnvironment, actor:Ac
       typeof input.enabled!=='boolean' || !['up','degraded','down','all'].includes(String(input.triggerStatus)) || !Array.isArray(input.checkIds) || input.checkIds.length>20 ||
       input.checkIds.some(x=>typeof x!=='string' || !/^[a-f0-9-]{36}$/.test(x)) || new Set(input.checkIds).size!==input.checkIds.length) return fail(400,'Invalid action')
   const checks=input.checkIds as string[]
+  // An older browser may still have an editor open after a deployment. Ask it
+  // to refresh rather than accepting check IDs without their identity fence.
+  if (input.checkSnapshots===undefined) return fail(409,'Monitor choices are out of date. Refresh the page and try again.')
   if (!Array.isArray(input.checkSnapshots) || input.checkSnapshots.length!==checks.length || !input.checkSnapshots.every(snapshot=>validCheckSnapshot(snapshot,checks)) ||
     new Set(input.checkSnapshots.map(snapshot=>(snapshot as CheckSnapshot).id)).size!==checks.length) return fail(400,'Invalid monitor snapshot')
   const endpoint=actionEndpoints(env.ACTION_ENDPOINTS).get(input.endpointId)

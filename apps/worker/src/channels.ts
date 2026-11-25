@@ -86,6 +86,8 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
       input.checkIds.some(x=>typeof x!=='string' || !/^[a-f0-9-]{36}$/.test(x)) || new Set(input.checkIds).size!==input.checkIds.length) return fail(400,'Invalid channel')
   const checks=input.checkIds as string[]
   const snapshots=input.expectedChecks
+  // A stale browser may still have the old editor loaded after deployment.
+  if (snapshots===undefined) return fail(409,'Monitor choices are out of date. Refresh the page and try again.')
   if (!Array.isArray(snapshots) || snapshots.length!==checks.length || snapshots.some((value:unknown)=>{
     if (!value || typeof value!=='object' || Array.isArray(value)) return true
     const snapshot=value as Body

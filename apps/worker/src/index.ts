@@ -560,12 +560,22 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:checkId,version:1},201)
     }
-    const token = id()
+    const token = id(), submittedVersion = version(body)
     // Links identify checks, not their owners. Do not let a move silently
     // retarget an action or channel; guard inside the same transaction as the edit.
-    const replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND (component_id=? OR (NOT EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=http_checks.id) AND NOT EXISTS (SELECT 1 FROM notification_channel_checks WHERE check_id=http_checks.id)))',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,version(body),componentId),[audit(db,user,'update','check',recordId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus},{table:'http_checks',token})],receipt,recordId,Number(body.version)+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
+    let replay: Receipt | null
+    try {
+      replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND (component_id=? OR (NOT EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=http_checks.id) AND NOT EXISTS (SELECT 1 FROM notification_channel_checks WHERE check_id=http_checks.id)))',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,submittedVersion,componentId),[audit(db,user,'update','check',recordId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus},{table:'http_checks',token})],receipt,recordId,submittedVersion+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 409 && error.message === 'This record changed. Reload and try again.') {
+        const linked = await stmt(db, `SELECT 1 AS present FROM http_checks h WHERE h.id=? AND h.config_version=? AND h.component_id<>? AND
+          (EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=h.id) OR EXISTS (SELECT 1 FROM notification_channel_checks WHERE check_id=h.id))`,recordId,submittedVersion,componentId).first()
+        if (linked) throw new HttpError(409,'Unlink notification channels and actions before moving this check to another monitor.')
+      }
+      throw error
+    }
     if (replay) return replayReceipt(db, receipt!, replay)
-    return json({id:recordId,version:Number(body.version)+1})
+    return json({id:recordId,version:submittedVersion+1})
   }
 
   if (resource === 'users' && method === 'PATCH' && recordId && !action) {
