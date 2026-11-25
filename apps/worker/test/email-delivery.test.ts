@@ -116,9 +116,14 @@ test('email failure is not retried and an expired claim is never resent', async 
 test('email jobs that expire after selection cannot be claimed', async () => {
   const x = await fixture(); await x.transition(100, 'down')
   const db = { prepare(sql: string) {
-    if (sql.includes("WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?"))
-      x.local.sqlite.prepare('UPDATE notification_outbox SET created_at=?').run(Date.now()-3_600_001)
-    return x.db.prepare(sql)
+    const statement = x.db.prepare(sql)
+    if (!sql.includes("WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?")) return statement
+    return { bind(...values: unknown[]) {
+      // Age the selected job past the runtime's exact claim cutoff, without
+      // relying on how long elapsed since the cutoff was sampled.
+      x.local.sqlite.prepare('UPDATE notification_outbox SET created_at=?').run(Number(values[3])-1)
+      return statement.bind(...values)
+    } } as D1PreparedStatement
   }, batch: x.db.batch.bind(x.db) } as D1Database
   await flushChannelDeliveries({ ...x.env, DB: db })
   assert.equal(x.calls.length, 0)
