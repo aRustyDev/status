@@ -242,19 +242,22 @@ test('a lost or expired notification lease cannot transmit after slow resolution
 
 test('notification jobs that expire after selection cannot be claimed',async()=>{
   const x=await setup();await queueTimingEvent(x)
-  const db={...x.db,prepare(sql:string){
-    const statement=x.db.prepare(sql)
-    if(!sql.includes("WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?")) return statement
-    return {bind(...values:unknown[]){
-      // The cutoff is sampled after selection, so use that exact value even
-      // if preparing the update takes longer than a millisecond.
-      x.local.db.prepare('UPDATE notification_outbox SET created_at=?').run(Number(values[3])-1)
-      return statement.bind(...values)
-    }} as D1PreparedStatement
-  }} as D1Database
-  await flushChannelDeliveries({...x.env,DB:db})
-  assert.equal(x.calls.length,0)
-  assert.equal((x.local.db.prepare('SELECT state FROM notification_outbox').get() as {state:string}).state,'failed')
+  const realNow=Date.now;let now=realNow(),selected=0
+  x.local.db.prepare('UPDATE notification_outbox SET created_at=?').run(now-3_599_000)
+  try {
+    Date.now=()=>now
+    const db={prepare(sql:string){
+      const statement=x.db.prepare(sql)
+      if(!sql.includes('SELECT o.id,o.channel_id,o.channel_version,o.check_id')) return statement
+      return {bind(...values:unknown[]){statement.bind(...values);return this},async all(){
+        const result=await statement.all();selected=result.results.length;now+=2_000;return result
+      }} as D1PreparedStatement
+    },batch:x.db.batch.bind(x.db)} as D1Database
+    await flushChannelDeliveries({...x.env,DB:db})
+    assert.equal(selected,1)
+    assert.equal(x.calls.length,0)
+    assert.equal((x.local.db.prepare('SELECT state FROM notification_outbox').get() as {state:string}).state,'failed')
+  } finally {Date.now=realNow}
 })
 
 test('a notification does not send if the final lease query consumes its send window',async()=>{
