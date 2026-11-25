@@ -107,3 +107,18 @@ it('ignores a stale reconnect response after a newer account has signed in', asy
   expect(screen.getByText('second@example.com')).toBeVisible()
   expect(screen.getByLabelText('Draft incident')).toHaveValue('')
 })
+
+it.each([
+  ['operator', ['/admin/', '/admin/system-health']],
+  ['admin', ['/admin/']],
+])('keeps System Health unavailable for %s without its role and capability', async (role, supportedRoutes) => {
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path === '/auth/me') return { id: 'identity', email: 'test@example.com', role }
+    if (path === '/capabilities') return { supportedRoutes }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  window.history.replaceState({}, '', '/admin/system-health')
+  render(<App />)
+  expect(await screen.findByText('This feature is unavailable.')).toBeInTheDocument()
+  expect(api.get).not.toHaveBeenCalledWith('/admin/system-health')
+})
