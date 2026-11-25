@@ -56,6 +56,7 @@ function CloudflareMonitorFormModal({ monitor, allTags = [], onClose, onSaved, s
   const profile: CloudflareProfile = {
     isAdmin,
     monitorAuth: !!capabilities.monitorAuth,
+    monitorRequest: !!capabilities.monitorRequest,
     monitorAlerts: isAdmin && !!capabilities.notifications,
     monitorDependencies: isAdmin && !!capabilities.dependencies,
     dependencyMonitors: (dependencyMonitors.data ?? []).filter(item => item.source !== 'gatus'),

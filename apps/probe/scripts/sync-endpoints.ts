@@ -23,8 +23,8 @@ export async function buildSyncSql(board: Config, probe: Config, environment: st
   const entries: { id: string; fingerprint: string }[] = []
   for (const endpoint of probeEndpoints.values()) {
     const boardEndpoint = boardEndpoints.get(endpoint.id)
-    if (!boardEndpoint || JSON.stringify([boardEndpoint.name, boardEndpoint.url, boardEndpoint.binding, boardEndpoint.serviceId, boardEndpoint.revision]) !==
-      JSON.stringify([endpoint.name, endpoint.url, endpoint.binding, endpoint.serviceId, endpoint.revision])) throw new Error('Worker endpoint lists differ')
+    if (!boardEndpoint || JSON.stringify([boardEndpoint.name, boardEndpoint.url, boardEndpoint.binding, boardEndpoint.serviceId, boardEndpoint.revision, boardEndpoint.requestPolicy]) !==
+      JSON.stringify([endpoint.name, endpoint.url, endpoint.binding, endpoint.serviceId, endpoint.revision, endpoint.requestPolicy])) throw new Error('Worker endpoint lists differ')
     if (endpoint.binding) {
       const vpc = (probeEnv.vpc_services ?? []).filter(item => item.binding === endpoint.binding)
       const service = (probeEnv.services ?? []).filter(item => item.binding === endpoint.binding)

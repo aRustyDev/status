@@ -1,6 +1,6 @@
 import { endpointFingerprint, parseEndpoints, type Endpoint } from '../../worker/src/endpoint-config'
 import { evaluateHttpMonitor, isBlockedRedirect, parsePersistedHttpConfig, type HttpMonitorConfig, type HttpMonitorResult } from './http-monitor'
-import { resolveMonitorCredentialSnapshot, type MonitorCredentialSnapshot } from '../../worker/src/vault-resolver'
+import { resolveMonitorCredentialSnapshot, resolveMonitorHeaderSnapshots, type MonitorCredentialSnapshot, type ValueCredentialSnapshot } from '../../worker/src/vault-resolver'
 import { channelEndpoints, enqueueTransition, flushChannelDeliveries } from '../../worker/src/channels-runtime'
 import { emailReady, type EmailChannelEnv } from '../../worker/src/email-channel'
 import { enqueueActionTransition, flushActions } from '../../worker/src/actions-runtime'
@@ -76,39 +76,66 @@ async function probe(endpoint: Endpoint, expectedStatus: number, env: Environmen
 async function evaluateConfigured(check: Check, config: HttpMonitorConfig, env: Environment, approved: ReadonlyMap<string, Endpoint>): Promise<HttpMonitorResult> {
   let authorization: string | undefined
   let credential: MonitorCredentialSnapshot | undefined
+  let headerCredentials: Record<string, ValueCredentialSnapshot> = {}
   let credentialFault = false
   const unavailable = (): HttpMonitorResult => ({ status: 'down', responseMs: null, httpStatus: null, reasons: ['credential_unavailable'], attempts: 1 })
-  if (config.auth) {
+  const hasCredentials = Boolean(config.auth || Object.keys(config.vaultHeaders ?? {}).length)
+  if (hasCredentials) {
     if (env.MONITOR_AUTH_READY !== 'true') return unavailable()
     try {
-    const target = approved.get(check.endpoint_id)
-    if (!target || new URL(target.url).protocol !== 'https:') return unavailable()
-    const credentials = await resolveMonitorCredentialSnapshot(env.DB, env.VAULT_ENCRYPTION_KEY, check.id, check.config_version)
-    if (!credentials || credentials.username.includes(':')) return unavailable()
-    const current = await env.DB.prepare('SELECT endpoint_id, advanced_config FROM http_checks WHERE id=? AND config_version=?').bind(check.id, check.config_version).first<{endpoint_id:string;advanced_config:string | null}>()
-    if (!current || current.endpoint_id !== check.endpoint_id || current.advanced_config !== check.advanced_config) return unavailable()
-    const bytes = new TextEncoder().encode(`${credentials.username}:${credentials.password}`)
-    // Match the configured-header limit before encoding: oversized credentials
-    // are a local configuration fault, not a remote outage or automation event.
-    if (6 + 4 * Math.ceil(bytes.length / 3) > 8192) return unavailable()
-    authorization = `Basic ${btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''))}`
-    credential = credentials
+      const target = approved.get(check.endpoint_id)
+      if (!target || new URL(target.url).protocol !== 'https:') return unavailable()
+      if (config.auth) {
+        const credentials = await resolveMonitorCredentialSnapshot(env.DB, env.VAULT_ENCRYPTION_KEY, check.id, check.config_version)
+        if (!credentials || credentials.username.includes(':')) return unavailable()
+        const bytes = new TextEncoder().encode(`${credentials.username}:${credentials.password}`)
+        if (6 + 4 * Math.ceil(bytes.length / 3) > 8192) return unavailable()
+        authorization = `Basic ${btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''))}`
+        credential = credentials
+      }
+      if (Object.keys(config.vaultHeaders ?? {}).length) {
+        const snapshots = await resolveMonitorHeaderSnapshots(env.DB, env.VAULT_ENCRYPTION_KEY, check.id, check.config_version)
+        if (!snapshots || Object.keys(snapshots).length !== Object.keys(config.vaultHeaders ?? {}).length) return unavailable()
+        const encoder = new TextEncoder()
+        for (const snapshot of Object.values(snapshots)) {
+          const size = encoder.encode(snapshot.value).byteLength
+          if (size > 2048 || Array.from(snapshot.value).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) return unavailable()
+        }
+        headerCredentials = snapshots
+      }
+      const encoder = new TextEncoder()
+      const customValues = [...Object.values(config.headers ?? {}), ...Object.values(headerCredentials).map(snapshot => snapshot.value)]
+      if (customValues.length) {
+        const total = customValues.reduce((sum, value) => sum + encoder.encode(value).byteLength, 0) + (authorization ? encoder.encode(authorization).byteLength : 0)
+        if (total > 8192) return unavailable()
+      }
+      const current = await env.DB.prepare('SELECT endpoint_id, advanced_config FROM http_checks WHERE id=? AND config_version=?').bind(check.id, check.config_version).first<{endpoint_id:string;advanced_config:string | null}>()
+      if (!current || current.endpoint_id !== check.endpoint_id || current.advanced_config !== check.advanced_config) return unavailable()
     } catch { return unavailable() }
   }
   const result = await evaluateHttpMonitor(config, {
     endpoints: approved,
     fetch: async (url, init, endpoint) => {
-      if (authorization) {
-        // Fencing again at the transport boundary prevents a stale saved check
-        // registry update, or secret rotation from sending stale credentials.
+      if (hasCredentials) {
+        // Check every saved credential in the same database snapshot as the
+        // check and destination before each outbound attempt.
         try {
-          const active = await env.DB.prepare(`SELECT c.advanced_config AS advanced_config FROM http_checks c JOIN endpoint_registry r ON r.endpoint_id=c.endpoint_id
-            JOIN vault_secrets v ON v.id=? AND v.vault_id=? AND v.type='userpass' AND v.version=? AND v.nonce=?
-            WHERE c.id=? AND c.config_version=? AND c.endpoint_id=? AND r.fingerprint=?`).bind(credential!.secretId,credential!.vaultId,credential!.version,credential!.nonce,check.id,check.config_version,check.endpoint_id,config.registryFingerprint).first<{advanced_config:string | null}>()
+          const snapshots = Object.values(headerCredentials)
+          const basicJoin = credential ? " JOIN vault_secrets v ON v.id=? AND v.vault_id=? AND v.type='userpass' AND v.version=? AND v.nonce=?" : ''
+          const checks = snapshots.map(() => " AND EXISTS (SELECT 1 FROM vault_secrets s WHERE s.id=? AND s.vault_id=? AND s.type='value' AND s.version=? AND s.nonce=?)").join('')
+          const parameters: (string | number)[] = credential ? [credential.secretId, credential.vaultId, credential.version, credential.nonce] : []
+          parameters.push(check.id, check.config_version, check.endpoint_id, config.registryFingerprint)
+          for (const snapshot of snapshots) parameters.push(snapshot.secretId, snapshot.vaultId, snapshot.version, snapshot.nonce)
+          const active = await env.DB.prepare(`SELECT c.advanced_config AS advanced_config FROM http_checks c JOIN endpoint_registry r ON r.endpoint_id=c.endpoint_id${basicJoin}
+            WHERE c.id=? AND c.config_version=? AND c.endpoint_id=? AND r.fingerprint=?${checks}`).bind(...parameters).first<{advanced_config:string | null}>()
           if (!active || active.advanced_config !== check.advanced_config) throw new Error('Check changed')
+          const headers = new Headers(init.headers)
+          if (authorization) headers.set('authorization', authorization)
+          for (const [name, snapshot] of Object.entries(headerCredentials)) headers.set(name, snapshot.value)
+          init = { ...init, headers }
         } catch { credentialFault = true; throw new Error('Check unavailable') }
-        init = { ...init, headers: { authorization } }
       }
+      if (init.signal?.aborted) throw new Error('Check timed out')
       if (!endpoint.binding) return fetch(url, init)
       const binding = env[endpoint.binding]
       if (!binding || typeof binding !== 'object' || !('fetch' in binding) || typeof binding.fetch !== 'function') throw new Error('Missing VPC Service binding')
@@ -283,7 +310,7 @@ export default {
     if (saved) { try { settings = check!.advanced_config === null ? { timeoutMs: 5000, attempts: 1 } : JSON.parse(check!.advanced_config) } catch { return Response.json({ error: 'Invalid test settings' }, { status: 400 }) } }
     const expectedStatus = saved ? check!.expected_status : Number(input.expectedStatus)
     const config = parsePersistedHttpConfig(settings, endpoint.id, fingerprint, expectedStatus)
-    if (!config || (!saved && config.auth)) return Response.json({ error: 'Invalid test settings' }, { status: 400 })
+    if (!config || (!saved && (config.auth || Object.keys(config.vaultHeaders ?? {}).length))) return Response.json({ error: 'Invalid test settings' }, { status: 400 })
     const startedAt = Date.now()
     const result = saved ? await evaluateConfigured(check!, config, env, approved) : await evaluateHttpMonitor(config, {
       endpoints: approved,

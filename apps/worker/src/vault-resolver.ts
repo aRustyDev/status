@@ -64,6 +64,30 @@ export async function resolveMonitorCredentialSnapshot(db: D1Database, key: stri
   } catch { return null }
 }
 
+/** Resolve Secure Values only from the persisted configuration of this exact check. */
+export async function resolveMonitorHeaderSnapshots(db: D1Database, key: string | undefined, checkId: string, configVersion: number): Promise<Record<string, ValueCredentialSnapshot> | null> {
+  if (!checkId || !Number.isSafeInteger(configVersion) || configVersion < 1) return null
+  try {
+    const row = await db.prepare('SELECT advanced_config FROM http_checks WHERE id=? AND config_version=?')
+      .bind(checkId, configVersion).first<{advanced_config:string | null}>()
+    if (!row?.advanced_config) return null
+    const config: unknown = JSON.parse(row.advanced_config)
+    if (!config || typeof config !== 'object' || Array.isArray(config)) return null
+    const headers = (config as Record<string, unknown>).vaultHeaders
+    if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return null
+    const snapshots: Record<string, ValueCredentialSnapshot> = {}
+    for (const [name, value] of Object.entries(headers)) {
+      const ref = reference(value)
+      if (!ref) return null
+      const decrypted = await decrypt(db, key, ref, 'value')
+      const data = decrypted?.data
+      if (!data || Object.keys(data).some(field => field !== 'value') || typeof data.value !== 'string' || !data.value) return null
+      snapshots[name] = { value: data.value, ...ref, version: decrypted.version, nonce: decrypted.nonce }
+    }
+    return snapshots
+  } catch { return null }
+}
+
 /** String-only convenience for non-transport callers. */
 export async function resolveMonitorCredential(db: D1Database, key: string | undefined, checkId: string, configVersion: number): Promise<MonitorCredential | null> {
   const snapshot = await resolveMonitorCredentialSnapshot(db, key, checkId, configVersion)
