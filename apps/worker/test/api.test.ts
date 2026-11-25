@@ -95,7 +95,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -112,6 +112,7 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0005_gatus_sources.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0007_idempotency.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0008_monitor_tags.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -762,6 +763,7 @@ test('Gatus inventory is read-only, preserves aliases and incidents, and fails c
     try {
       const adminList = await request('/api/v1/bsp/admin/monitors', operatorToken)
       assert.equal((adminList.body as unknown as Array<{uuid:string;source?:string}>).find(item => item.uuid === component)?.source, 'gatus')
+      assert.deepEqual((adminList.body as unknown as Array<{uuid:string;tags:unknown}>).find(item => item.uuid === component)?.tags, [])
       assert.equal(nativeCheckLookups.includes(component), false)
       assert.equal(nativeCheckLookups.includes(suiteComponent), false)
     } finally { env.DB = originalDb }
@@ -781,7 +783,7 @@ test('Gatus inventory is read-only, preserves aliases and incidents, and fails c
     }
     assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}`, operatorToken, 'DELETE', {})).response.status, 403)
     const mutationKey = `${Date.now()}.${crypto.randomUUID()}`
-    assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}`, adminToken, 'PATCH', { name: 'Spoof', version: 1 }, 'https://status.example', mutationKey)).response.status, 403)
+    assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}`, adminToken, 'PATCH', { name: 'Spoof', version: 1, tags: [{ label: 'forbidden', color: '#123456' }] }, 'https://status.example', mutationKey)).response.status, 403)
     assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}/check-now`, operatorToken, 'POST', {})).response.status, 403)
     assert.equal((await request(`/api/v1/admin/components/${component}`, operatorToken, 'DELETE', {})).response.status, 403)
     await assert.rejects(db.prepare('UPDATE components SET name=? WHERE id=?').bind('Spoof', component).run(), /read-only/i)
@@ -1131,4 +1133,35 @@ test('atomic monitor writes enforce roles for manual services and check changes'
     const stale = await request(`${path}/${alias}`, operatorToken, 'PATCH', { ...manual, name: 'Stale update', version: 1 }, 'https://status.example', key())
     assert.equal(stale.response.status, 409)
   } finally { env.ENDPOINTS = '[]' }
+})
+
+test('monitor tags round trip atomically and reject invalid or stale writes', async () => {
+  const key = () => `${Date.now()}.${crypto.randomUUID()}`
+  const path = '/api/v1/bsp/admin/monitors'
+  const tags = [{ label: 'production', color: '#6366f1' }, { label: 'api', color: '#ef4444' }]
+  const created = await request(path, operatorToken, 'POST', { name: 'Tagged service', tags }, 'https://status.example', key())
+  assert.equal(created.response.status, 201)
+  const id = (created.body as unknown as { id: number }).id
+  const find = async (route: string) => ((await request(route, operatorToken)).body as unknown as { id: number; tags: unknown }[]).find(item => item.id === id)
+  assert.deepEqual((await find(path))?.tags, tags)
+  const publicBoard = await request('/api/v1/bsp/public/status', operatorToken)
+  assert.deepEqual((publicBoard.body as unknown as { monitors: {id:number;tags:unknown}[] }).monitors.find(item => item.id === id)?.tags, tags)
+  const changed = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Tagged service', version: 1, tags: [tags[1]] }, 'https://status.example', key())
+  assert.equal(changed.response.status, 200)
+  const stale = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Stale', version: 1, tags: [] }, 'https://status.example', key())
+  assert.equal(stale.response.status, 409)
+  assert.deepEqual((await find(path))?.tags, [tags[1]])
+  const invalids = [[{ label: 'bad', color: 'red' }], [{ label: '', color: '#123456' }], Array.from({ length: 21 }, (_, i) => ({ label: `${i}`, color: '#123456' }))]
+  for (const invalid of invalids) {
+    const rejected = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Rejected', version: 2, tags: invalid }, 'https://status.example', key())
+    assert.equal(rejected.response.status, 400)
+  }
+  const preserved = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Renamed', version: 2 }, 'https://status.example', key())
+  assert.equal(preserved.response.status, 200)
+  assert.deepEqual((await find(path))?.tags, [tags[1]])
+  const cleared = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Renamed', version: 3, tags: [] }, 'https://status.example', key())
+  assert.equal(cleared.response.status, 200)
+  assert.deepEqual((await find(path))?.tags, [])
+  const forbidden = await request(path, viewerToken, 'POST', { name: 'Forbidden', tags }, 'https://status.example', key())
+  assert.equal(forbidden.response.status, 403)
 })

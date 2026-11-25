@@ -59,12 +59,11 @@ function AddTagRow({ onAdd, existingTags = [] }: { onAdd: (t: MonitorTag) => voi
 
   return (
     <div className="flex items-center gap-2 flex-wrap">
-      <div className="relative" style={{ flex: '1 1 120px', minWidth: 0 }}>
+      <div className="relative" style={{ flex: '1 1 120px', minWidth: 0 }} onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setOpen(false) }}>
         <input
           value={label}
           onChange={(e) => { setLabel(e.target.value); setOpen(true) }}
           onFocus={() => setOpen(true)}
-          onBlur={() => setTimeout(() => setOpen(false), 120)}
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add() } }}
           placeholder="Tag label…"
           aria-label="Tag label"
@@ -75,7 +74,8 @@ function AddTagRow({ onAdd, existingTags = [] }: { onAdd: (t: MonitorTag) => voi
             style={{ background: 'var(--m3-surface-container-high)', border: '1px solid var(--m3-outline-variant)', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
             {suggestions.map((t) => (
               <button key={t.label} type="button"
-                onMouseDown={() => selectSuggestion(t)}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => selectSuggestion(t)}
                 className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-surface-container"
                 style={{ color: 'var(--m3-on-surface)' }}
               >

@@ -30,21 +30,22 @@ beforeEach(() => {
   vi.mocked(api.post).mockResolvedValue({})
 })
 
-function renderModal(value: Monitor | null) {
+function renderModal(value: Monitor | null, allTags: { label: string; color: string }[] = []) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true }}><MonitorFormModal monitor={value} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
+  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true }}><MonitorFormModal monitor={value} allTags={allTags} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
 }
 
 it('shows unavailable upstream sidebar sections while keeping Checks usable', async () => {
   const user = userEvent.setup()
   renderModal(monitor)
   const checks = await screen.findByRole('button', { name: 'Checks' })
-  for (const label of ['Auth', 'Request', 'Tags', 'Alerts', 'Actions', 'Depends on', 'Incident', 'Latency']) {
+  for (const label of ['Auth', 'Request', 'Alerts', 'Actions', 'Depends on', 'Incident', 'Latency']) {
     const button = screen.getByRole('button', { name: label })
     expect(button).toBeDisabled()
     expect(button).toHaveAttribute('title', `${label} (unavailable)`)
   }
   expect(checks).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Tags' })).toBeEnabled()
   await user.click(checks)
   expect(screen.getByLabelText('Keyword (optional)')).toBeInTheDocument()
 })
@@ -53,7 +54,7 @@ it('preserves an unchanged legacy check when saving service settings', async () 
   const user = userEvent.setup()
   renderModal(monitor)
   await user.click(await screen.findByRole('button', { name: 'Save Changes' }))
-  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', { name: 'API', manualStatus: 'operational', position: 1, version: 4 }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', { name: 'API', manualStatus: 'operational', position: 1, tags: [], version: 4 }))
 })
 
 it.each([
@@ -72,7 +73,7 @@ it.each([
   await user.click(await screen.findByRole('button', { name: 'Test' }))
   await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors/test', expect.objectContaining({ advancedConfig: expect.objectContaining({ timeoutMs: timeout, attempts: 1 }) }), expect.anything()))
   await user.click(screen.getByRole('button', { name: 'Save Changes' }))
-  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', { name: 'API', manualStatus: 'operational', position: 1, version: 4 }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', { name: 'API', manualStatus: 'operational', position: 1, tags: [], version: 4 }))
 })
 
 it('shows and preserves configured status ranges while editing other check settings', async () => {
@@ -321,4 +322,52 @@ it('waits for fresh checks before initializing an editor with cached data', asyn
   expect(screen.queryByLabelText('Approved destination')).not.toBeInTheDocument()
   await act(async () => { finish([check]) })
   expect(await screen.findByLabelText('Approved destination')).toHaveValue('api')
+})
+
+
+it('adds existing and new tags when creating a monitor', async () => {
+  const user = userEvent.setup()
+  renderModal(null, [{ label: 'production', color: '#ef4444' }])
+  await user.type(await screen.findByLabelText('Name'), 'Tagged service')
+  await user.click(screen.getByRole('button', { name: 'Tags' }))
+  await user.type(screen.getByLabelText('Tag label'), 'prod')
+  await user.tab()
+  expect(screen.getByRole('button', { name: 'production' })).toHaveFocus()
+  await user.keyboard('{Enter}')
+  await user.type(screen.getByLabelText('Tag label'), 'billing')
+  await user.click(screen.getByRole('button', { name: 'Blue' }))
+  await user.click(screen.getByRole('button', { name: 'Add' }))
+  await user.click(screen.getByRole('button', { name: 'Create Monitor' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors', expect.objectContaining({ tags: [{ label: 'production', color: '#ef4444' }, { label: 'billing', color: '#3b82f6' }] })))
+})
+
+it('keeps edited tags and the original version after a save fails and a refresh arrives', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.patch).mockRejectedValueOnce(new Error('This record changed. Reload and try again.'))
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const original = { ...monitor, tags: [{ label: 'old', color: '#ef4444' }] } as Monitor
+  const view = (value: Monitor, statusUnavailable = false) => <QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true }}><MonitorFormModal monitor={value} statusUnavailable={statusUnavailable} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>
+  const rendered = render(view(original))
+  await user.click(await screen.findByRole('button', { name: 'Tags' }))
+  await user.click(screen.getByRole('button', { name: 'Remove tag old' }))
+  await user.type(screen.getByLabelText('Tag label'), 'new')
+  await user.click(screen.getByRole('button', { name: 'Add' }))
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  expect(await screen.findByText('This record changed. Reload and try again.')).toBeInTheDocument()
+  rendered.rerender(view({ ...original, version: 5, tags: [{ label: 'remote', color: '#ef4444' }] } as Monitor, true))
+  rendered.rerender(view({ ...original, version: 5, tags: [{ label: 'remote', color: '#ef4444' }] } as Monitor))
+  expect(screen.getByRole('button', { name: 'Remove tag new' })).toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenLastCalledWith('/admin/monitors/7', expect.objectContaining({ version: 4, tags: [{ label: 'new', color: '#6366f1' }] })))
+})
+
+
+it('keeps an unfinished tag label when switching sidebar sections', async () => {
+  const user = userEvent.setup()
+  renderModal(monitor)
+  await user.click(await screen.findByRole('button', { name: 'Tags' }))
+  await user.type(screen.getByLabelText('Tag label'), 'unfinished')
+  await user.click(screen.getByRole('button', { name: 'Checks' }))
+  await user.click(screen.getByRole('button', { name: 'Tags' }))
+  expect(screen.getByLabelText('Tag label')).toHaveValue('unfinished')
 })

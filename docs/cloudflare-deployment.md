@@ -25,6 +25,11 @@ The probe Worker uses the same environment's D1 database. In both Worker configs
 
 In the Cloudflare monitor editor, the Checks panel supports an optional keyword, header and JSON assertions, a degraded latency threshold, and up to 20 accepted HTTP status ranges. A configured range replaces the single expected status; removing the last range restores it. Test and scheduled checks use the same validation and evaluator. GET and HEAD are supported, but HEAD cannot use keyword or JSON checks. Redirects are not followed, even if their status appears in an accepted range. Only approved destinations can be checked.
 
+> [!WARNING]
+> **Not released yet.** Cloudflare monitor tags require a build from the `main` branch (see [Deployment](deployment.md)).
+
+The editor's Tags panel adds coloured labels to Cloudflare-managed monitors. Start typing to select an existing label and its colour, or add a new label with one of the offered colours. Tags appear on the admin monitor list, where selecting tags filters for monitors carrying all of them. They also appear in the BSP public monitor payload, so do not put confidential information in tag labels. A monitor can have up to 20 tags; labels are 1–40 characters and colours are six-digit hex values. The API accepts tags as `{ "label": "production", "color": "#6366f1" }` objects. Omitting `tags` from an update preserves the existing tags. Gatus-managed monitors remain read-only and return no tags. Subscriber filtering by tag is not supported by the Cloudflare profile.
+
 Add the binding to the selected probe environment with its Cloudflare VPC Service ID:
 
 ```jsonc
@@ -118,7 +123,7 @@ These gateway configurations currently define staging only. Production needs sep
 
 The three API Worker configurations carry the same `ENDPOINTS` and D1 settings as the board and probe. Update all of them together when an approved target changes. The endpoint synchronization generator validates each configured gateway API environment against the probe before emitting SQL. Continue to use the probe drain, registry synchronization, and VPC revision procedures above.
 
-Apply migrations 0005 through 0007 before deploying the updated Workers. The monitoring API needs a `PROBE` service binding to the staging probe for draft tests. Set `MONITOR_MODAL` to `upstream` in the operations API environment to enable the shared monitor editor. Remove that setting and redeploy the operations API to restore the previous editor. Deploy the probe and monitoring API before enabling the editor, and deploy the gateway so monitor test requests reach the monitoring API.
+Apply migrations 0005 through 0008 before deploying the updated Workers. The monitoring API needs a `PROBE` service binding to the staging probe for draft tests. Set `MONITOR_MODAL` to `upstream` in the operations API environment to enable the shared monitor editor. Remove that setting and redeploy the operations API to restore the previous editor. Deploy the probe and monitoring API before enabling the editor, and deploy the gateway so monitor test requests reach the monitoring API.
 
 ## Production deployment and rollback
 
