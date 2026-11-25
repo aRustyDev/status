@@ -1421,3 +1421,49 @@ test('actions capability and routes require explicit readiness and an Access adm
     assert.equal((await request('/api/v1/bsp/admin/actions',adminToken,'POST',{})).response.status,400)
   } finally { delete env.VAULT_ENCRYPTION_KEY; delete env.ACTION_ENDPOINTS; delete env.ACTIONS_READY }
 })
+
+test('atomic monitor check edits increment exactly once and fence stale results', async () => {
+  const key=()=>`${Date.now()}.${crypto.randomUUID()}`
+  const path='/api/v1/bsp/admin/monitors'
+  env.ENDPOINTS=JSON.stringify([{id:'fence-a',name:'A',url:'https://a.example/'},{id:'fence-b',name:'B',url:'https://b.example/'}])
+  try {
+    await db.prepare('UPDATE http_checks SET enabled=0').run()
+    const draft={endpointId:'fence-a',enabled:true,intervalMinutes:1,expectedStatus:200,advancedConfig:null as null | Record<string,unknown>}
+    const created=await request(path,adminToken,'POST',{name:'Version fence fixture',check:draft},'https://status.example',key())
+    assert.equal(created.response.status,201)
+    const alias=(created.body as unknown as {id:number;version:number}).id
+    let componentVersion=1
+    const getCheck=()=>db.prepare("SELECT h.id,h.config_version,h.last_status FROM http_checks h JOIN entity_aliases a ON a.entity_id=h.component_id WHERE a.entity_type='component' AND a.alias=?").bind(alias).first<{id:string;config_version:number;last_status:string | null}>()
+    let current=await getCheck(); assert.ok(current)
+    const checkId=current.id
+    const save=async (changes:Partial<typeof draft>, checkVersion=current!.config_version) => {
+      const body={name:'Version fence fixture',version:componentVersion,check:{...draft,...changes,id:checkId,version:checkVersion}}
+      const result=await request(`${path}/${alias}`,adminToken,'PATCH',body,'https://status.example',key())
+      if(result.response.status===200) { componentVersion++; Object.assign(draft,changes) }
+      return result
+    }
+    const initialVersion=current.config_version
+    await db.prepare("UPDATE http_checks SET last_status='up',last_result_at=1,last_scheduled_at=1 WHERE id=?").bind(checkId).run()
+    assert.equal((await save({advancedConfig:{method:'GET',keyword:'one'}})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,initialVersion+1); assert.equal(current!.last_status,null)
+    const staleResult=await db.prepare(`INSERT OR IGNORE INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status)
+      SELECT id,config_version,100,100,'up' FROM http_checks WHERE id=? AND enabled=1 AND config_version=?`).bind(checkId,initialVersion).run() as {meta:{changes:number}}
+    assert.equal(staleResult.meta.changes,0)
+    const beforeStale=current!.config_version
+    assert.equal((await save({expectedStatus:201},initialVersion)).response.status,409)
+    current=await getCheck(); assert.equal(current!.config_version,beforeStale)
+    assert.equal((await save({advancedConfig:{method:'GET',keyword:'two'},expectedStatus:201})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeStale+1)
+    const beforeEndpoint=current!.config_version
+    assert.equal((await save({endpointId:'fence-b'})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeEndpoint+1)
+    const beforeNull=current!.config_version
+    assert.equal((await save({advancedConfig:null})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeNull+1)
+    const beforeNullOther=current!.config_version
+    assert.equal((await save({intervalMinutes:5})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeNullOther+1)
+    assert.equal((await save({})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeNullOther+1)
+  } finally { env.ENDPOINTS='[]' }
+})
