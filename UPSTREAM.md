@@ -16,7 +16,7 @@ The Cloudflare monitor Alerts panel reuses the incorporated upstream `ChannelsSe
 
 The Cloudflare monitor Depends on panel reuses the incorporated upstream dependency selector. Relationships, scheduled status evaluation and notification suppression are adapted to Workers and D1. Administrators can select Cloudflare-managed monitors as dependencies.
 
-The Cloudflare Actions screen adapts the upstream action list and Vault-selection pattern. Its Node action editor supports arbitrary HTTP templates and direct credentials that the Workers runtime does not expose; the adapted page offers only deployment-approved HTTPS POST actions with write-only Vault tokens and explicit monitor-state triggers.
+The Cloudflare Actions screen adapts the upstream sortable action list, modal shell, controls, and Vault-selection pattern. The Cloudflare editor retains its own request and monitor fields because its API and supported action model differ from the upstream Node editor. Its Node action editor supports arbitrary HTTP templates and direct credentials that the Workers runtime does not expose; the adapted page offers only deployment-approved HTTPS POST actions with write-only Vault tokens and explicit monitor-state triggers.
 
 The Cloudflare monitor Actions panel reuses the upstream `ActionsSection`, adapted to accept Cloudflare UUID action identifiers as well as upstream numeric identifiers. Its action links are saved separately from monitor settings with a version check, and new monitors are saved before links can be configured. Action execution and persistence use the Workers and D1 implementation; Gatus-managed monitors remain read-only.
 

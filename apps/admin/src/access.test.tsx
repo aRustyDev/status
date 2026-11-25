@@ -137,3 +137,18 @@ it.each([
   expect(await screen.findByText('This feature is unavailable.')).toBeInTheDocument()
   expect(api.get).not.toHaveBeenCalledWith('/admin/static-mirror')
 })
+
+it.each([
+  ['operator', ['/admin/', '/admin/actions']],
+  ['admin', ['/admin/']],
+])('keeps action delivery history unavailable for %s without its role and capability', async (role, supportedRoutes) => {
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path === '/auth/me') return { id: 'identity', email: 'test@example.com', role }
+    if (path === '/capabilities') return { supportedRoutes }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  window.history.replaceState({}, '', '/admin/delivery-history?tab=actions')
+  render(<App />)
+  expect(await screen.findByText('This feature is unavailable.')).toBeInTheDocument()
+  expect(api.get).not.toHaveBeenCalledWith('/admin/actions/runs')
+})
