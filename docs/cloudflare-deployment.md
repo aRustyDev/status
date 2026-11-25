@@ -25,6 +25,11 @@ The probe Worker uses the same environment's D1 database. In both Worker configs
 
 In the Cloudflare monitor editor, the Checks panel supports an optional keyword, header and JSON assertions, a degraded latency threshold, and up to 20 accepted HTTP status ranges. A configured range replaces the single expected status; removing the last range restores it. Test and scheduled checks use the same validation and evaluator. GET and HEAD are supported, but HEAD cannot use keyword or JSON checks. Redirects are not followed, even if their status appears in an accepted range. Only approved destinations can be checked.
 
+> [!WARNING]
+> **Not released yet.** Cloudflare monitor tags require a build from the `main` branch (see [Deployment](deployment.md)).
+
+The editor's Tags panel adds coloured labels to Cloudflare-managed monitors. Start typing to select an existing label and its colour, or add a new label with one of the offered colours. Tags appear on the admin monitor list, where selecting tags filters for monitors carrying all of them. They also appear in the BSP public monitor payload, so do not put confidential information in tag labels. A monitor can have up to 20 tags; labels are 1–40 characters and colours are six-digit hex values. The API accepts tags as `{ "label": "production", "color": "#6366f1" }` objects. Omitting `tags` from an update preserves the existing tags. Gatus-managed monitors remain read-only and return no tags. Subscriber filtering by tag is not supported by the Cloudflare profile.
+
 Add the binding to the selected probe environment with its Cloudflare VPC Service ID:
 
 ```jsonc
@@ -70,6 +75,8 @@ For a separately configured standalone production board, replace `staging` with 
 
 After the board is deployed and protected by Access, the intended administrator signs in once. A verified Access identity is created as a viewer. A Cloudflare administrator then queries the selected environment's D1 `users` table for the account's `id`, `issuer`, `subject`, `email`, `role`, and `version`. Confirm the identity and application before updating that exact row to `admin` and incrementing `version`. Use the D1 console or `wrangler d1 execute` with `--remote`, the board config, and the explicit environment. Do not paste tokens or credentials into logs or chat. The promoted user can assign roles in the admin interface after refreshing.
 
+Backup provisioning, retention and isolated recovery verification are described in [Cloudflare D1 backups and recovery](cloudflare-backups.md). The Backups capability stays disabled until its dedicated service is provisioned and verified.
+
 ## Audit history
 
 The administrator-only Audit Log lists application mutations, including monitor, check, incident, maintenance, and role changes. It does not record Cloudflare Access sign-ins or denied requests; use Access logs for those events. Filters and pagination use the operations API, and details are restricted to an allowlist of non-sensitive values. Check events retain the associated monitor UUID and basic scheduling and status settings. Names, incident text, endpoint identifiers, advanced check configuration and credentials are not included in new audit details. Existing records are filtered on read, but their stored values are not rewritten; treat database access and backups accordingly. Deploy both operations and monitoring Workers to apply the new recording rules to both mutation paths.
@@ -91,6 +98,12 @@ The staging rehearsal covered role enforcement, incidents, maintenance transitio
 On November 23, 2026 at 11:58 p.m. Eastern, the shared monitor editor was verified in staging. Draft tests returned HTTP 200 for both approved public and private destinations. An unexpected-status test failed as expected. A disabled verification monitor was created, edited, and reopened with its destination and response check intact. Existing scheduled public and private checks also returned HTTP 200 after the probe deployment. The verification monitor remains in staging with its check disabled. Staging had no Gatus-backed monitors, so Gatus read-only behavior was verified by the local integration suite. Later local draft-preservation and timeout fixes have not yet been verified on staging.
 
 ## Upstream UI staging gateway
+
+### System Health
+
+The administrator-only System Health page adapts the incorporated BetterStatusPage card, badge, and refresh UI. The Node report describes a persistent process and scheduler, so the Cloudflare page retains the presentation but uses a separate Worker report instead of inventing those metrics. See `UPSTREAM.md` and `THIRD_PARTY_LICENSE_BetterStatusPage` for attribution and license terms.
+
+The report checks the operations Worker response and D1, summarizes enabled native checks against the endpoint registry and their freshness, and checks the Gatus snapshot when configured. It does not establish scheduler liveness or report the health of each monitored service. The backup check only verifies that the configured backup service and its R2 binding respond to a read; it does not verify backup integrity or a schedule. Notifications and static fallback remain unavailable until those integrations provide health signals. Disabled checks do not make the overall report degraded; failed dependencies or stale checks do. Access authentication and the administrator role are required, and dependency errors and configuration details are not returned. Because authentication itself uses D1, a D1 outage can prevent the report from being returned at all. Deploy the backup Worker with its private `/health` endpoint before deploying an operations Worker that uses it; an older backup Worker returns 404 and will be reported unavailable until upgraded. Keep the backup Worker private and preserve its configured bindings when deploying it.
 
 The cutover gateway is configured in `apps/gateway/wrangler.jsonc`. Its staging `UI_MODE` selects `legacy` or `upstream` HTML while both `/api/v1/` and `/api/v1/bsp/` remain routed to the internal Workers. The gateway serves the legacy board from the operations Worker and forwards upstream assets to the status and admin UI Workers. Keep both UI Workers deployed during a rollback so existing tabs can load their assets.
 
@@ -116,7 +129,7 @@ These gateway configurations currently define staging only. Production needs sep
 
 The three API Worker configurations carry the same `ENDPOINTS` and D1 settings as the board and probe. Update all of them together when an approved target changes. The endpoint synchronization generator validates each configured gateway API environment against the probe before emitting SQL. Continue to use the probe drain, registry synchronization, and VPC revision procedures above.
 
-Apply migrations 0005 through 0007 before deploying the updated Workers. The monitoring API needs a `PROBE` service binding to the staging probe for draft tests. Set `MONITOR_MODAL` to `upstream` in the operations API environment to enable the shared monitor editor. Remove that setting and redeploy the operations API to restore the previous editor. Deploy the probe and monitoring API before enabling the editor, and deploy the gateway so monitor test requests reach the monitoring API.
+Apply migrations 0005 through 0008 before deploying the updated Workers. The monitoring API needs a `PROBE` service binding to the staging probe for draft tests. Set `MONITOR_MODAL` to `upstream` in the operations API environment to enable the shared monitor editor. Remove that setting and redeploy the operations API to restore the previous editor. Deploy the probe and monitoring API before enabling the editor, and deploy the gateway so monitor test requests reach the monitoring API.
 
 ## Production deployment and rollback
 

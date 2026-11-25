@@ -3,6 +3,7 @@ import { endpointFingerprint, parseEndpoints } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
 import { parsePersistedHttpConfig } from '../../probe/src/http-monitor'
 import { ProbeTestTimeout, requestProbeTest } from './probe-test'
+import { getSystemHealthReport } from './system-health'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
 interface Env {
@@ -15,6 +16,8 @@ interface Env {
   ENDPOINTS: string
   GATUS?: GatusBinding
   GATUS_REQUIRED?: string
+  BACKUPS?: Fetcher
+  BACKUPS_READY?: string
 }
 
 type Role = 'viewer' | 'operator' | 'admin'
@@ -32,6 +35,13 @@ const healthStatuses = ['operational', 'degraded', 'down']
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store' } })
 const bad = (message: string): never => { throw new HttpError(400, message) }
 const id = () => crypto.randomUUID()
+function serializeAdvancedConfig(value: unknown, endpointId: string, expectedStatus: number): string | null {
+  if (value === null) return null
+  if (!parsePersistedHttpConfig(value, endpointId, 'validation', expectedStatus)) return bad('Invalid advanced check settings')
+  const serialized = JSON.stringify(value)
+  if (serialized.length > 32_000) return bad('Invalid advanced check settings')
+  return serialized
+}
 // Reuse jose's issuer-scoped JWKS cache across requests in this isolate. The
 // resolver retains jose's freshness and key-rotation behavior; it never stores
 // request identities or tokens.
@@ -283,8 +293,24 @@ async function listComponents(db: D1Database, incidents: Json[], maintenance: Js
       if (severity[impact] > severity[state]) state = impact
     }
     const underMaintenance = maintenance.some(window => window.state === 'active' && (!(window.componentIds as string[]).length || (window.componentIds as string[]).includes(String(row.id))))
-    return { id: row.id, name: row.name, position: row.position, manualStatus: row.manual_status, status: state, checkStatus, lastCheckedAt: isGatus ? source?.lastCheckedAt ?? null : matches ? row.last_result_at ?? null : null, underMaintenance, version: row.version, ...(isGatus ? { source: 'gatus', group: row.source_group } : {}) }
+    return { id: row.id, name: row.name, position: row.position, manualStatus: row.manual_status, tags: isGatus ? [] : JSON.parse(String(row.tags)), status: state, checkStatus, lastCheckedAt: isGatus ? source?.lastCheckedAt ?? null : matches ? row.last_result_at ?? null : null, underMaintenance, version: row.version, ...(isGatus ? { source: 'gatus', group: row.source_group } : {}) }
   })
+}
+
+function serializeMonitorTags(value: unknown): string {
+  if (!Array.isArray(value) || value.length > 20) return bad('Invalid tags')
+  const labels = new Set<string>()
+  const tags = value.map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return bad('Invalid tag')
+    const tag = item as Json
+    if (typeof tag.label !== 'string' || !tag.label.trim() || tag.label.trim().length > 40 ||
+      typeof tag.color !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(tag.color)) return bad('Invalid tag')
+    const label = tag.label.trim()
+    if (labels.has(label)) return bad('Duplicate tag')
+    labels.add(label)
+    return { label, color: tag.color }
+  })
+  return JSON.stringify(tags)
 }
 
 type Endpoint = { id: string; name?: string }
@@ -473,9 +499,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (current.gatusComponent) throw new HttpError(403, 'Gatus-managed component is read-only')
     if (current.version !== submittedVersion) throw new HttpError(409, 'This record changed. Reload and try again.')
     const candidate = body.advancedConfig
-    if (candidate !== null && !parsePersistedHttpConfig(candidate, current.endpointId, 'validation', current.expectedStatus)) return bad('Invalid advanced check settings')
-    const serialized = candidate === null ? null : JSON.stringify(candidate)
-    if (serialized !== null && serialized.length > 32000) return bad('Invalid advanced check settings')
+    const serialized = serializeAdvancedConfig(candidate, current.endpointId, current.expectedStatus)
     let unchanged = serialized === null && current.advancedConfig === null
     if (serialized !== null && current.advancedConfig !== null) {
       try { unchanged = stableJson(candidate) === stableJson(JSON.parse(current.advancedConfig)) } catch { unchanged = false }
@@ -535,6 +559,10 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   const db = env.DB
   const method = request.method
   const route = path.slice('/api/v1/bsp'.length)
+  if (route === '/admin/system-health' && method === 'GET') {
+    requireRole(user, 'admin')
+    return json(await getSystemHealthReport(env))
+  }
   if (route === '/admin/audit-log' && method === 'GET') {
     requireRole(user, 'admin')
     return auditPage(db, request)
@@ -625,7 +653,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
         position: component.position,
         intervalSecs: check ? check.interval_minutes * 60 : null,
         config: { url: check ? endpoints.get(check.endpoint_id)?.name ?? '' : '' },
-        tags: [],
+        tags: component.tags,
         group: component.source === 'gatus' ? component.group : null,
         activity: { maintenance: component.underMaintenance, windows: [], incident: null },
         health: {
@@ -655,7 +683,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const endpointId = string(body.endpointId, 'endpointId', 100)
     if (!approvedEndpoints(env).some(endpoint => endpoint.id === endpointId)) return bad('Unknown approved endpoint')
     if (!Number.isInteger(body.expectedStatus) || Number(body.expectedStatus) < 100 || Number(body.expectedStatus) > 599) return bad('Invalid expectedStatus')
-    if (body.advancedConfig !== null && !parsePersistedHttpConfig(body.advancedConfig, endpointId, 'validation', Number(body.expectedStatus))) return bad('Invalid advanced check settings')
+    serializeAdvancedConfig(body.advancedConfig, endpointId, Number(body.expectedStatus))
     if (!env.PROBE) throw new HttpError(503, 'Monitor testing is unavailable')
     try { return await requestProbeTest(env.PROBE, { endpointId, expectedStatus: body.expectedStatus, advancedConfig: body.advancedConfig }, request.signal) }
     catch (error) { if (error instanceof ProbeTestTimeout) throw new HttpError(504, 'Monitor test timed out'); throw error }
@@ -668,6 +696,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const manualStatus = choice(body.manualStatus ?? 'operational', 'manualStatus', healthStatuses)
     const position = body.position === undefined ? 0 : timestamp(body.position, 'position')
     const creating = method === 'POST'
+    const tags = body.tags === undefined ? (creating ? '[]' : null) : serializeMonitorTags(body.tags)
     const componentId = creating ? id() : uuidId('component', route.split('/').at(-1))
     if (!creating && await stmt(db, 'SELECT component_id FROM gatus_sources WHERE component_id=?', componentId).first()) throw new HttpError(403, 'Gatus-managed component is read-only')
     const componentVersion = creating ? 0 : version(body)
@@ -685,9 +714,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       if (typeof input.enabled !== 'boolean' || (input.intervalMinutes !== 1 && input.intervalMinutes !== 5)) return bad('Invalid check settings')
       if (!Number.isInteger(input.expectedStatus) || Number(input.expectedStatus) < 100 || Number(input.expectedStatus) > 599) return bad('Invalid expectedStatus')
       const advanced = input.advancedConfig ?? null
-      if (advanced !== null && !parsePersistedHttpConfig(advanced, endpointId, 'validation', Number(input.expectedStatus))) return bad('Invalid advanced check settings')
-      const serialized = advanced === null ? null : JSON.stringify(advanced)
-      if (serialized && serialized.length > 32000) return bad('Invalid advanced check settings')
+      const serialized = serializeAdvancedConfig(advanced, endpointId, Number(input.expectedStatus))
       current = creating ? null : await stmt(db, 'SELECT * FROM http_checks WHERE component_id=?', componentId).first<StoredCheck>()
       if (current && (input.id !== current.id || input.version !== current.config_version)) throw new HttpError(409, 'This check changed. Reload and try again.')
       if (!current && (input.id !== undefined || input.version !== undefined)) throw new HttpError(409, 'This check changed. Reload and try again.')
@@ -700,8 +727,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       db.prepare('DELETE FROM mutation_receipts WHERE rowid IN (SELECT rowid FROM mutation_receipts WHERE expires_at<=? LIMIT 100)').bind(Date.now()),
       receiptClaim(db, receipt, token),
     ]
-    if (creating) operations.push(stmt(db, 'INSERT INTO components (id,name,position,manual_status,updated_at,mutation_key) VALUES (?,?,?,?,?,?)', componentId, name, position, manualStatus, Date.now(), token))
-    else operations.push(stmt(db, `UPDATE components SET name=?,manual_status=?,position=?,updated_at=?,version=version+1,mutation_key=? WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=components.id)${checkGuard}`, name, manualStatus, position, Date.now(), token, componentId, componentVersion, ...guardValues))
+    if (creating) operations.push(stmt(db, 'INSERT INTO components (id,name,position,manual_status,updated_at,mutation_key,tags) VALUES (?,?,?,?,?,?,?)', componentId, name, position, manualStatus, Date.now(), token, tags))
+    else operations.push(stmt(db, `UPDATE components SET name=?,manual_status=?,position=?,updated_at=?,version=version+1,mutation_key=?,tags=COALESCE(?,tags) WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=components.id)${checkGuard}`, name, manualStatus, position, Date.now(), token, tags, componentId, componentVersion, ...guardValues))
     if (checkData && checkData.changed) {
       if (!current) operations.push(stmt(db, `INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,advanced_config) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.id, componentId, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, componentId, token))
       else operations.push(stmt(db, `UPDATE http_checks SET endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,advanced_config=?, config_version=config_version + CASE WHEN advanced_config IS ? THEN 1 ELSE 0 END,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, checkData.advancedConfig, token, current.id, current.config_version, componentId, token))
@@ -720,7 +747,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     return json({ id: saved.result_alias, version: saved.result_version }, saved.status)
   }
   if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now() })
-  if (route === '/capabilities' && method === 'GET') return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log'], subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+  if (route === '/capabilities' && method === 'GET') return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : [])], subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
   if (method === 'GET' && route === '/public/access') return json({ private: true, signedIn: true, email: user.email, role: user.role, passwordChangeRequired: false, branding: null })
@@ -835,6 +862,26 @@ export default {
       const url = new URL(request.url)
       const user = await authenticate(request, env)
       if (!['GET','HEAD','OPTIONS'].includes(request.method) && request.headers.get('origin') !== url.origin) throw new HttpError(403,'Invalid request origin')
+      if (url.pathname === '/api/v1/bsp/admin/backups' || /^\/api\/v1\/bsp\/admin\/backups\/[a-f0-9]{64}\/(verify|download)$/.test(url.pathname)) {
+        requireRole(user, 'admin')
+        if (!env.BACKUPS || env.BACKUPS_READY !== 'true') throw new HttpError(503, 'Backups are unavailable')
+        const path = url.pathname.slice('/api/v1/bsp/admin'.length)
+        const headers = new Headers()
+        let backupId = ''
+        if (request.method === 'POST' && path === '/backups') {
+          const intent = await receiptContext(request, user)
+          if (!intent || Object.keys(intent.body).length) return bad('An idempotent empty backup request is required')
+          const bytes = new TextEncoder().encode(`${user.id}\n${intent.key}`)
+          backupId = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(value => value.toString(16).padStart(2, '0')).join('')
+          headers.set('x-backup-id', backupId)
+          headers.set('x-backup-created-at', intent.key.slice(0, 13))
+        } else if (request.method !== 'GET') throw new HttpError(405, 'Method not allowed')
+        const result = await env.BACKUPS.fetch(new Request(`https://backup.internal${path}${request.method === 'GET' ? url.search : ''}`, { method: request.method, headers }))
+        if (backupId && result.status === 202) {
+          await stmt(env.DB, 'INSERT OR IGNORE INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES (?,?,?,?,?,?,?)', `backup-${backupId}`, user.email, 'create', 'backup', backupId, Date.now(), '{}').run()
+        }
+        return result
+      }
       if (!['GET','HEAD','OPTIONS'].includes(request.method) && request.headers.has('Idempotency-Key')) {
         const normalized = url.pathname.replace(/^\/api\/v1\/bsp\//, '/api/v1/')
         const resource = /^\/api\/v1\/admin\/([^/]+)/.exec(normalized)?.[1]

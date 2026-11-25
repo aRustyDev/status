@@ -101,9 +101,9 @@ const DETAILS_MIN = 160
 const FILTER_LABEL = 'font-mono text-[10px] uppercase tracking-widest'
 
 const entities: AuditEntities = {
-  labels: { component: 'Monitor', check: 'Check', incident: 'Incident', maintenance: 'Maintenance', user: 'User' },
-  icons: { component: 'monitor_heart', check: 'check_circle', incident: 'warning', maintenance: 'construction', user: 'person' },
-  groups: [{ label: 'Status', types: ['component', 'check', 'incident', 'maintenance'] }, { label: 'Administration', types: ['user'] }],
+  labels: { component: 'Monitor', check: 'Check', incident: 'Incident', maintenance: 'Maintenance', user: 'User', backup: 'Backup' },
+  icons: { component: 'monitor_heart', check: 'check_circle', incident: 'warning', maintenance: 'construction', user: 'person', backup: 'backup' },
+  groups: [{ label: 'Status', types: ['component', 'check', 'incident', 'maintenance'] }, { label: 'Administration', types: ['user', 'backup'] }],
 }
 
 export default function AuditLogPage() {

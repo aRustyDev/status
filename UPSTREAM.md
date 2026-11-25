@@ -4,4 +4,6 @@ This repository incorporates source from [Better Status Page](https://github.com
 
 The upstream source is licensed under the MIT License. Its copyright notice and license are preserved in `THIRD_PARTY_LICENSE_BetterStatusPage`.
 
+The Cloudflare monitor editor reuses the incorporated upstream `TagsSection` and sidebar for coloured labels and existing-tag suggestions. Monitor tag storage and API handling are adapted to the Workers and D1 architecture; Gatus-managed monitors remain read-only, and tag-based subscriptions are not supported by this profile.
+
 The scheduled HTTP-check design was informed by [cf-workers-status-page](https://github.com/eidam/cf-workers-status-page), including its use of Workers Cron Triggers and HTTP response checks. This fork implements its own probe and D1 persistence; it does not incorporate that project's source code.

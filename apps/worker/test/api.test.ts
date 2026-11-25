@@ -5,6 +5,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 import worker from '../src/index.ts'
+import { getSystemHealthReport } from '../src/system-health.ts'
+import probeWorker from '../../probe/src/index.ts'
 import { endpointFingerprint } from '../src/endpoint-config.ts'
 import { syncGatusCatalog } from '../src/gatus-catalog.ts'
 import { gatusSourceId, type GatusCatalogEntry } from '../src/gatus.ts'
@@ -68,7 +70,7 @@ let db: TestDatabase = sqlite
 let miniflare: Miniflare | undefined
 const issuer = 'https://test.cloudflareaccess.com'
 const audience = 'status-test'
-const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> } } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
+const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
 const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
@@ -94,7 +96,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -111,6 +113,7 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0005_gatus_sources.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0007_idempotency.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0008_monitor_tags.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -141,6 +144,132 @@ test('Access identity, roles and same-origin mutations are enforced', async () =
   assert.equal((await request('/api/v1/admin/users', operatorToken)).response.status, 403)
   assert.equal((await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'API' }, 'https://evil.example')).response.status, 403)
   assert.equal((await request('/api/v1/admin/users', adminToken)).response.status, 200)
+})
+
+test('system health is administrator-only and reports observed dependency state', async () => {
+  const path = '/api/v1/bsp/admin/system-health'
+  assert.equal((await request(path)).response.status, 401)
+  assert.equal((await request(path, viewerToken)).response.status, 403)
+  assert.equal((await request(path, operatorToken)).response.status, 403)
+  const initial = await request(path, adminToken)
+  assert.equal(initial.response.status, 200)
+  assert.equal(initial.response.headers.get('cache-control'), 'no-store')
+  const report = initial.body as unknown as { status: string; database: { status: string }; monitoring: { status: string }; backups: { status: string }; notifications: { status: string }; staticMirror: { status: string } }
+  assert.equal(report.status, 'healthy')
+  assert.equal(report.database.status, 'ok')
+  assert.equal(report.monitoring.status, 'disabled')
+  assert.equal(report.backups.status, 'disabled')
+  env.BACKUPS_READY = 'true'
+  try {
+    const missing = (await request(path, adminToken)).body as unknown as { status: string; backups: { status: string } }
+    assert.equal(missing.status, 'degraded')
+    assert.equal(missing.backups.status, 'error')
+  } finally { delete env.BACKUPS_READY }
+  assert.equal(report.notifications.status, 'disabled')
+  assert.equal(report.staticMirror.status, 'disabled')
+  env.GATUS_REQUIRED = 'true'
+  try {
+    const missing = (await request(path, adminToken)).body as unknown as { status: string; gatus: { status: string } }
+    assert.equal(missing.status, 'degraded')
+    assert.equal(missing.gatus.status, 'error')
+  } finally { delete env.GATUS_REQUIRED }
+
+  await db.prepare("INSERT INTO components (id, name, position, manual_status, updated_at) VALUES ('health-gatus', 'Gatus fixture', 0, 'operational', 0)").run()
+  await db.prepare("INSERT INTO gatus_sources (source_id,component_id,kind,source_key,source_name,source_group,stale_after_seconds,advisory) VALUES ('health-source','health-gatus','endpoint','health-key','Health Gatus','',180,0)").run()
+  try {
+    const status = { key: 'health-key', name: 'Health Gatus', group: '', results: [{ success: true, timestamp: new Date().toISOString(), duration: 1000 }] }
+    env.GATUS = { fetch: async incoming => Response.json(new URL(incoming.url).pathname.includes('/endpoints/') ? [status] : []) }
+    assert.equal(((await request(path, adminToken)).body as unknown as {gatus:{status:string}}).gatus.status, 'ok')
+    status.results = []
+    assert.equal(((await request(path, adminToken)).body as unknown as {gatus:{status:string}}).gatus.status, 'attention')
+    env.GATUS = { fetch: async () => { throw new Error('private gatus failure') } }
+    const unavailable = (await request(path, adminToken)).body as unknown as {gatus:{status:string}}
+    assert.equal(unavailable.gatus.status, 'error')
+    assert.doesNotMatch(JSON.stringify(unavailable), /private gatus failure/)
+  } finally {
+    delete env.GATUS
+    await db.prepare("DELETE FROM gatus_sources WHERE source_id='health-source'").run()
+    await db.prepare("DELETE FROM components WHERE id='health-gatus'").run()
+  }
+  const endpoint = { id: 'health-endpoint', name: 'Health fixture', url: 'https://example.com/' }
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  await db.prepare('INSERT INTO endpoint_registry (endpoint_id, fingerprint) VALUES (?, ?)').bind(endpoint.id, await endpointFingerprint(endpoint)).run()
+  await db.prepare("INSERT INTO components (id, name, position, manual_status, updated_at) VALUES ('health-component', 'Health fixture', 0, 'operational', 0)").run()
+  await db.prepare("INSERT INTO http_checks (id, component_id, endpoint_id, enabled, interval_minutes, expected_status, last_result_at) VALUES ('health-check', 'health-component', 'health-endpoint', 1, 1, 200, ?)").bind(Date.now()).run()
+  try {
+    const fresh = (await request(path, adminToken)).body as unknown as { status: string; monitoring: { status: string; configuredMonitors: number; overdueMonitors: number } }
+    assert.equal(fresh.status, 'healthy')
+    assert.deepEqual([fresh.monitoring.status, fresh.monitoring.configuredMonitors, fresh.monitoring.overdueMonitors], ['ok', 1, 0])
+    env.ENDPOINTS = JSON.stringify([{ ...endpoint, url: 'https://other.example/' }])
+    const mismatch = (await request(path, adminToken)).body as unknown as typeof fresh
+    assert.deepEqual([mismatch.status, mismatch.monitoring.status, mismatch.monitoring.overdueMonitors], ['degraded', 'attention', 1])
+    env.ENDPOINTS = JSON.stringify([endpoint])
+    await db.prepare("UPDATE http_checks SET last_result_at=0 WHERE id='health-check'").run()
+    const stale = (await request(path, adminToken)).body as unknown as typeof fresh
+    assert.equal(stale.status, 'degraded')
+    assert.deepEqual([stale.monitoring.status, stale.monitoring.overdueMonitors], ['attention', 1])
+    env.BACKUPS_READY = 'true'
+    env.BACKUPS = { fetch: async () => { throw new Error('secret backup credentials') } }
+    const failed = (await request(path, adminToken)).body as unknown as { status: string; backups: { status: string } }
+    assert.equal(failed.status, 'degraded')
+    assert.equal(failed.backups.status, 'error')
+    assert.doesNotMatch(JSON.stringify(failed), /secret backup credentials/)
+    env.BACKUPS = { fetch: async incoming => {
+      assert.equal(new URL(incoming.url).pathname, '/health')
+      return Response.json({ status: 'ok' })
+    } }
+    assert.equal(((await request(path, adminToken)).body as unknown as { backups: { status: string } }).backups.status, 'ok')
+  } finally {
+    delete env.BACKUPS; delete env.BACKUPS_READY; env.ENDPOINTS = '[]'
+    await db.prepare('DELETE FROM endpoint_registry WHERE endpoint_id=?').bind(endpoint.id).run()
+    await db.prepare("DELETE FROM http_checks WHERE id='health-check'").run()
+    await db.prepare("DELETE FROM components WHERE id='health-component'").run()
+  }
+})
+
+test('system health redacts unavailable database errors', async () => {
+  const failed = { prepare() { throw new Error('sensitive database detail') } }
+  const report = await getSystemHealthReport({ DB: failed as unknown as D1Database, ENDPOINTS: '[]' })
+  assert.equal(report.status, 'degraded')
+  assert.equal(report.database.status, 'error')
+  assert.equal(report.monitoring.status, 'error')
+  assert.doesNotMatch(JSON.stringify(report), /sensitive database detail/)
+})
+
+test('backup service stays capability-gated, administrator-only and idempotent', async () => {
+  const path = '/api/v1/bsp/admin/backups'
+  assert.equal((await request(path, adminToken)).response.status, 503)
+  const ids: string[] = []
+  const queries: string[] = []
+  env.BACKUPS_READY = 'true'
+  env.BACKUPS = { fetch: async incoming => {
+    if (incoming.method === 'POST') { ids.push(incoming.headers.get('x-backup-id') ?? ''); return Response.json({ id: ids.at(-1) }, { status: 202 }) }
+    queries.push(new URL(incoming.url).search)
+    return Response.json({ backups: [], nextCursor: null })
+  } }
+  try {
+    const capabilities = (await request('/api/v1/bsp/capabilities', adminToken)).body as unknown as {supportedRoutes:string[]}
+    assert.ok(capabilities.supportedRoutes.includes('/admin/backups'))
+    assert.equal((await request(path, viewerToken)).response.status, 403)
+    assert.equal((await request(path, operatorToken)).response.status, 403)
+    for (const action of ['verify', 'download']) {
+      const itemPath = `${path}/${'a'.repeat(64)}/${action}`
+      assert.equal((await request(itemPath, viewerToken)).response.status, 403)
+      assert.equal((await request(itemPath, operatorToken)).response.status, 403)
+      assert.equal((await request(itemPath, adminToken)).response.status, 200)
+    }
+    assert.equal((await request(path, adminToken)).response.status, 200)
+    assert.equal((await request(`${path}?cursor=next-page`, adminToken)).response.status, 200)
+    assert.equal(queries.at(-1), '?cursor=next-page')
+    assert.equal((await request(path, adminToken, 'POST', {})).response.status, 400)
+    const key = `${Date.now()}.${crypto.randomUUID()}`
+    assert.equal((await request(path, adminToken, 'POST', {}, 'https://evil.example', key)).response.status, 403)
+    assert.equal((await request(path, adminToken, 'POST', {}, 'https://status.example', key)).response.status, 202)
+    assert.equal((await request(path, adminToken, 'POST', {}, 'https://status.example', key)).response.status, 202)
+    assert.match(ids[0], /^[a-f0-9]{64}$/); assert.equal(ids[0], ids[1])
+    const events = await db.prepare("SELECT action FROM audit_events WHERE entity_type='backup' AND entity_id=?").bind(ids[0]).all<{action:string}>()
+    assert.deepEqual(events.results.map(row => row.action), ['create'])
+  } finally { delete env.BACKUPS; delete env.BACKUPS_READY }
 })
 
 test('audit log is admin-only, paginated, filtered and redacts legacy sensitive details', async () => {
@@ -731,6 +860,7 @@ test('Gatus inventory is read-only, preserves aliases and incidents, and fails c
     try {
       const adminList = await request('/api/v1/bsp/admin/monitors', operatorToken)
       assert.equal((adminList.body as unknown as Array<{uuid:string;source?:string}>).find(item => item.uuid === component)?.source, 'gatus')
+      assert.deepEqual((adminList.body as unknown as Array<{uuid:string;tags:unknown}>).find(item => item.uuid === component)?.tags, [])
       assert.equal(nativeCheckLookups.includes(component), false)
       assert.equal(nativeCheckLookups.includes(suiteComponent), false)
     } finally { env.DB = originalDb }
@@ -750,7 +880,7 @@ test('Gatus inventory is read-only, preserves aliases and incidents, and fails c
     }
     assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}`, operatorToken, 'DELETE', {})).response.status, 403)
     const mutationKey = `${Date.now()}.${crypto.randomUUID()}`
-    assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}`, adminToken, 'PATCH', { name: 'Spoof', version: 1 }, 'https://status.example', mutationKey)).response.status, 403)
+    assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}`, adminToken, 'PATCH', { name: 'Spoof', version: 1, tags: [{ label: 'forbidden', color: '#123456' }] }, 'https://status.example', mutationKey)).response.status, 403)
     assert.equal((await request(`/api/v1/bsp/admin/monitors/${monitor.id}/check-now`, operatorToken, 'POST', {})).response.status, 403)
     assert.equal((await request(`/api/v1/admin/components/${component}`, operatorToken, 'DELETE', {})).response.status, 403)
     await assert.rejects(db.prepare('UPDATE components SET name=? WHERE id=?').bind('Spoof', component).run(), /read-only/i)
@@ -955,6 +1085,55 @@ test('draft monitor tests require an admin and forward only approved destination
   } finally { delete env.PROBE; env.ENDPOINTS = '[]' }
 })
 
+test('monitor test and both save paths enforce the same advanced settings size limit', async () => {
+  const endpoint = { id: 'size-target', name: 'Size target', url: 'https://example.com' }
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  let probeCalls = 0
+  env.PROBE = { async fetch() { probeCalls++; return Response.json({ overall: 'ok', steps: [], totalMs: 1 }) } }
+  const configWithName = (length: number) => ({ assertions: [{ type: 'header', name: 'x'.repeat(length), op: 'not-exists' }] })
+  const overhead = JSON.stringify(configWithName(0)).length
+  const boundary = configWithName(32_000 - overhead)
+  const oversized = configWithName(32_001 - overhead)
+  const testPath = '/api/v1/bsp/admin/monitors/test'
+  const key = () => `${Date.now()}.${crypto.randomUUID()}`
+  try {
+    assert.equal(JSON.stringify(boundary).length, 32_000)
+    assert.equal(JSON.stringify(oversized).length, 32_001)
+    const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Size check target' })
+    const created = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: false, intervalMinutes: 1, expectedStatus: 200 })
+    const advancedPath = `/api/v1/bsp/admin/checks/${created.body.id}/advanced`
+    const testConfig = (advancedConfig: unknown) => request(testPath, adminToken, 'POST', { endpointId: endpoint.id, expectedStatus: 200, advancedConfig })
+    const createMonitor = (advancedConfig: unknown) => request('/api/v1/bsp/admin/monitors', adminToken, 'POST', { name: 'Size monitor', check: { endpointId: endpoint.id, enabled: false, intervalMinutes: 1, expectedStatus: 200, advancedConfig } }, 'https://status.example', key())
+    assert.equal((await testConfig(boundary)).response.status, 200)
+    assert.equal((await request(advancedPath, adminToken, 'PUT', { version: 1, advancedConfig: boundary })).response.status, 200)
+    assert.equal((await createMonitor(boundary)).response.status, 201)
+    assert.equal((await testConfig(oversized)).response.status, 400)
+    assert.equal((await request(advancedPath, adminToken, 'PUT', { version: 2, advancedConfig: oversized })).response.status, 400)
+    assert.equal((await createMonitor(oversized)).response.status, 400)
+    assert.equal(probeCalls, 1)
+  } finally { delete env.PROBE; env.ENDPOINTS = '[]' }
+})
+
+test('a saved multibyte advanced check can be tested through the real probe binding', async () => {
+  const endpoint = { id: 'unicode-target', name: 'Unicode target', url: 'https://unicode.example.test/health' }
+  const value = '界'.repeat(1000)
+  const config = { assertions: Array.from({ length: 20 }, () => ({ type: 'json', path: '$.value', op: 'equals', value, onFail: 'down' })) }
+  const previousFetch = globalThis.fetch
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  await db.prepare('INSERT INTO endpoint_registry(endpoint_id,fingerprint) VALUES (?,?)').bind(endpoint.id, await endpointFingerprint(endpoint)).run()
+  env.PROBE = { fetch: request => probeWorker.fetch(request, env as never) }
+  globalThis.fetch = async (input, init) => String(input) === endpoint.url ? Response.json({ value }) : previousFetch(input, init)
+  try {
+    const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Unicode checks' })
+    const created = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: true, intervalMinutes: 1, expectedStatus: 200 })
+    const saved = await request(`/api/v1/bsp/admin/checks/${created.body.id}/advanced`, adminToken, 'PUT', { version: 1, advancedConfig: config })
+    assert.equal(saved.response.status, 200)
+    const tested = await request('/api/v1/bsp/admin/monitors/test', adminToken, 'POST', { endpointId: endpoint.id, expectedStatus: 200, advancedConfig: config })
+    assert.equal(tested.response.status, 200)
+    assert.equal((tested.body as unknown as { overall: string }).overall, 'ok')
+  } finally { globalThis.fetch = previousFetch; delete env.PROBE; env.ENDPOINTS = '[]' }
+})
+
 test('atomic monitor writes preserve checks and reject stale versions', async () => {
   const actor = await db.prepare("SELECT id, version FROM users WHERE subject='admin-id'").first<{id:string;version:number}>()
   assert.ok(actor)
@@ -1051,4 +1230,35 @@ test('atomic monitor writes enforce roles for manual services and check changes'
     const stale = await request(`${path}/${alias}`, operatorToken, 'PATCH', { ...manual, name: 'Stale update', version: 1 }, 'https://status.example', key())
     assert.equal(stale.response.status, 409)
   } finally { env.ENDPOINTS = '[]' }
+})
+
+test('monitor tags round trip atomically and reject invalid or stale writes', async () => {
+  const key = () => `${Date.now()}.${crypto.randomUUID()}`
+  const path = '/api/v1/bsp/admin/monitors'
+  const tags = [{ label: 'production', color: '#6366f1' }, { label: 'api', color: '#ef4444' }]
+  const created = await request(path, operatorToken, 'POST', { name: 'Tagged service', tags }, 'https://status.example', key())
+  assert.equal(created.response.status, 201)
+  const id = (created.body as unknown as { id: number }).id
+  const find = async (route: string) => ((await request(route, operatorToken)).body as unknown as { id: number; tags: unknown }[]).find(item => item.id === id)
+  assert.deepEqual((await find(path))?.tags, tags)
+  const publicBoard = await request('/api/v1/bsp/public/status', operatorToken)
+  assert.deepEqual((publicBoard.body as unknown as { monitors: {id:number;tags:unknown}[] }).monitors.find(item => item.id === id)?.tags, tags)
+  const changed = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Tagged service', version: 1, tags: [tags[1]] }, 'https://status.example', key())
+  assert.equal(changed.response.status, 200)
+  const stale = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Stale', version: 1, tags: [] }, 'https://status.example', key())
+  assert.equal(stale.response.status, 409)
+  assert.deepEqual((await find(path))?.tags, [tags[1]])
+  const invalids = [[{ label: 'bad', color: 'red' }], [{ label: '', color: '#123456' }], Array.from({ length: 21 }, (_, i) => ({ label: `${i}`, color: '#123456' }))]
+  for (const invalid of invalids) {
+    const rejected = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Rejected', version: 2, tags: invalid }, 'https://status.example', key())
+    assert.equal(rejected.response.status, 400)
+  }
+  const preserved = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Renamed', version: 2 }, 'https://status.example', key())
+  assert.equal(preserved.response.status, 200)
+  assert.deepEqual((await find(path))?.tags, [tags[1]])
+  const cleared = await request(`${path}/${id}`, operatorToken, 'PATCH', { name: 'Renamed', version: 3, tags: [] }, 'https://status.example', key())
+  assert.equal(cleared.response.status, 200)
+  assert.deepEqual((await find(path))?.tags, [])
+  const forbidden = await request(path, viewerToken, 'POST', { name: 'Forbidden', tags }, 'https://status.example', key())
+  assert.equal(forbidden.response.status, 403)
 })

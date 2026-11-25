@@ -1,6 +1,6 @@
 import { useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import type { Monitor, MonitorType } from '@bsp/shared'
+import type { Monitor, MonitorTag, MonitorType } from '@bsp/shared'
 import { Alert, getCurrentUser, Modal, ModalFooter } from '@better-forge/ui'
 import { api } from '../../api/client'
 import { useCapabilities } from '../../capabilities'
@@ -15,7 +15,7 @@ type Props = {
   monitor: Monitor | null
   initialType?: MonitorType | undefined
   statusUnavailable?: boolean | undefined
-  allTags?: unknown[]
+  allTags?: MonitorTag[]
   allGroups?: string[]
   onClose: () => void
   onSaved: () => void
@@ -26,7 +26,7 @@ export default function MonitorFormModal(props: Props) {
   return capabilities.monitorModal ? <CloudflareMonitorFormModal {...props} /> : <LegacyMonitorFormModal {...props} />
 }
 
-function CloudflareMonitorFormModal({ monitor, onClose, onSaved, statusUnavailable = false }: Props) {
+function CloudflareMonitorFormModal({ monitor, allTags = [], onClose, onSaved, statusUnavailable = false }: Props) {
   const component = monitor as Component | null
   const initialComponent = useRef(component).current
   const isAdmin = getCurrentUser()?.role === 'admin'
@@ -70,5 +70,5 @@ function CloudflareMonitorFormModal({ monitor, onClose, onSaved, statusUnavailab
     },
     test: draft => api.post('/admin/monitors/test', draft, { timeoutMs: 15_000 }),
   }
-  return <UpstreamMonitorFormModal monitor={monitor} cloudflare={profile} onClose={onClose} onSaved={onSaved} />
+  return <UpstreamMonitorFormModal monitor={monitor} allTags={allTags} cloudflare={profile} onClose={onClose} onSaved={onSaved} />
 }

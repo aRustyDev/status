@@ -11,10 +11,26 @@ const packages = {
   ui: ['0.4.0', 'sha512-fmWXxELM1fUUDRd6U6CJpUL8QkcU/99QK4pO1JKNcPLroLWxAib+9MOmTTCai//k7LpCI8l8nd4rzRwM+qccrQ=='],
 };
 const registry = 'https://registry.npmjs.org';
+// A registry response is untrusted. Bound buffering even when npm has no size limit.
+const MAX_ATTESTATION_BYTES = 4 * 1024 * 1024;
 const targets = new Map(Object.entries(packages).map(([name, [version, integrity]]) => [
   `${registry}/-/npm/v1/attestations/@better-forge%2f${name}@${version}`,
   { name, version, integrity },
 ]));
+
+async function readBounded(body) {
+  const chunks = [];
+  let length = 0;
+  if (!body) return Buffer.alloc(0);
+  const iterable = Buffer.isBuffer(body) ? [body] : body;
+  for await (const chunk of iterable) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    length += bytes.length;
+    if (length > MAX_ATTESTATION_BYTES) throw Error('Attestation response exceeds size limit');
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks, length);
+}
 
 function validateBundle(data, info) {
   if (!Array.isArray(data.attestations) || data.attestations.length !== 2) throw Error('Unexpected recovered attestation count');
@@ -42,10 +58,14 @@ function wrapFetch(original, options = {}) {
       const liveOpts = { ...args[1], cache: null, preferOnline: true, preferOffline: false, offline: false, strictSSL: true };
       const res = await Reflect.apply(target, receiver, [args[0], liveOpts]);
       if (res.status !== 200) return res;
-      // Consume the response once. Reading a clone while the original stream is
-      // unconsumed can stall the stream tee on a large, valid attestation.
-      const body = await res.text();
-      if (body !== 'OK\r\n') return { json: async () => JSON.parse(body) };
+      // minipass-fetch's clone tees into two streams and pauses the source if
+      // either is unread. Awaiting only the clone can deadlock before EOF.
+      // Consume once and reconstruct a response for npm when it was not the
+      // broken endpoint sentinel, so npm still parses and verifies the bytes.
+      const body = await readBounded(res.body);
+      if (!body.equals(Buffer.from('OK\r\n'))) return new res.constructor(body, {
+        status: res.status, statusText: res.statusText, headers: res.headers, url: res.url,
+      });
       const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
       const locked = lock.packages[`node_modules/@better-forge/${info.name}`];
       if (!locked || locked.version !== info.version || locked.integrity !== info.integrity) throw Error('Attestation recovery does not match lockfile');

@@ -6,6 +6,22 @@ describe('mutation request intent', () => {
   beforeEach(() => { sessionStorage.clear(); setMutationActor('test-user') })
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 
+  it('sends an actor-bound backup key and reuses it after an ambiguous response', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ error: 'Timeout' }, { status: 504 }))
+      .mockResolvedValueOnce(Response.json({ id: 'backup' }, { status: 202 }))
+      .mockResolvedValueOnce(Response.json({ id: 'next-backup' }, { status: 202 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(api.post('/admin/backups', {})).rejects.toThrow(/may have completed/)
+    await expect(api.post('/admin/backups', {})).resolves.toEqual({ id: 'backup' })
+    await api.post('/admin/backups', {})
+    const headers = fetchMock.mock.calls.map(call => call[1].headers as Record<string, string>)
+    expect(headers[0]!['Idempotency-Actor']).toBe('test-user')
+    expect(headers[0]!['Idempotency-Key']).toMatch(/^\d{13}\.[0-9a-f-]{36}$/)
+    expect(headers[1]!['Idempotency-Key']).toBe(headers[0]!['Idempotency-Key'])
+    expect(headers[2]!['Idempotency-Key']).not.toBe(headers[0]!['Idempotency-Key'])
+  })
+
   it('keeps the same key after expiry and an ambiguous response, then clears it after a confirmed result', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(Response.json({ error: 'Expired' }, { status: 401 }))
