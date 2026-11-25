@@ -41,6 +41,7 @@ describe('Vault', () => {
   it('rotates with the current version and reports failures without echoing secret data', async () => {
     const user = setup()
     await user.click(await screen.findByRole('button', { name: 'Operations' }))
+    expect(screen.getByText(/Available integrations depend on deployment settings/)).toBeInTheDocument()
     await user.click(await screen.findByRole('button', { name: 'Rotate Token' }))
     const dialog = screen.getByRole('dialog')
     await user.type(within(dialog).getByLabelText('Value'), 'replacement')

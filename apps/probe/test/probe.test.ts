@@ -502,7 +502,7 @@ test('saved Basic Vault credentials are resolved only for the configured check a
   await putCredential(credential)
   const advanced = { method:'GET', timeoutMs:5000, attempts:1, auth:{type:'basic',basic:{vault:{vaultId:1,secretId:2}}} }
   sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify(advanced), 'check-0')
-  const runtime = { ...env, VAULT_ENCRYPTION_KEY:keyHex }
+  const runtime = { ...env, VAULT_ENCRYPTION_KEY:keyHex, MONITOR_AUTH_READY:'true' }
   const checkVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
   const seen: string[] = []
   globalThis.fetch = async (_url, init) => {
@@ -544,6 +544,28 @@ test('saved Basic Vault credentials are resolved only for the configured check a
   sqlite.close()
 })
 
+test('monitor auth readiness gates saved tests and scheduled probes before credential access', async () => {
+  for (const readiness of [undefined, 'false']) {
+    const { sqlite, now, env } = fixture()
+    sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({auth:{type:'basic',basic:{vault:{vaultId:1,secretId:2}}}}),'check-0')
+    const checkVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+    let credentialReads = 0, networkCalls = 0
+    const guardedDb = { ...env.DB, prepare(sql: string) {
+      if (sql.includes('vault_')) { credentialReads++; throw new Error('Unexpected credential access') }
+      return env.DB.prepare(sql)
+    } }
+    globalThis.fetch = async () => { networkCalls++; return new Response() }
+    const runtime = { ...env, DB: guardedDb, MONITOR_AUTH_READY: readiness, VAULT_ENCRYPTION_KEY:'ab'.repeat(32) }
+    const result = await worker.fetch(new Request('https://probe.internal/test', {method:'POST',body:JSON.stringify({checkId:'check-0',checkVersion})}), runtime as never)
+    assert.match(await result.text(), /credential_unavailable/)
+    await runChecks(now, runtime as never)
+    assert.equal(credentialReads, 0)
+    assert.equal(networkCalls, 0)
+    assert.equal(sqlite.prepare('SELECT transition_suppressed FROM http_checks WHERE id=?').get('check-0')?.transition_suppressed, 1)
+    sqlite.close()
+  }
+})
+
 test('credentialed checks reject redirects and stale or non-HTTPS targets without disclosure', async () => {
   const { sqlite, env, sync } = fixture()
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0008_vault.sql', import.meta.url), 'utf8'))
@@ -560,7 +582,7 @@ test('credentialed checks reject redirects and stale or non-HTTPS targets withou
   let calls = 0
   globalThis.fetch = async (_url, init) => { calls++; assert.equal(init?.redirect,'manual'); return new Response(null,{status:302,headers:{location:'https://unapproved.example/'}}) }
   const req = () => new Request('https://probe.internal/test',{method:'POST',body:JSON.stringify({checkId:'check-0',checkVersion:Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)})})
-  const runtime = { ...env, VAULT_ENCRYPTION_KEY:keyHex }
+  const runtime = { ...env, VAULT_ENCRYPTION_KEY:keyHex, MONITOR_AUTH_READY:'true' }
   const redirect = await worker.fetch(req(),runtime as never)
   const text = await redirect.text()
   assert.match(text,/redirect_blocked/)
@@ -604,7 +626,7 @@ test('scheduler sends degraded transitions to configured channels and actions', 
   const secret=await (await vaultApi(req({name:'fixture',type:'value',value:'synthetic-token'}),env.DB as never,key,actor,`/admin/vaults/${vault.id}/secrets`)).json() as {id:number}
   const destinations=JSON.stringify([{id:'sink',name:'Fixture',url:'https://sink.internal/',binding:'SINK',serviceId:'sink-worker'}])
   const bodies: unknown[]=[]
-  const runtime={...env,VAULT_ENCRYPTION_KEY:key,CHANNELS_READY:'true',CHANNEL_ENDPOINTS:destinations,ACTIONS_READY:'true',ACTION_ENDPOINTS:destinations,SINK:{fetch:async (_url:string,init:RequestInit)=>{bodies.push(JSON.parse(String(init.body))); return new Response(null,{status:200})}}}
+  const runtime={...env,VAULT_ENCRYPTION_KEY:key,MONITOR_AUTH_READY:'true',CHANNELS_READY:'true',CHANNEL_ENDPOINTS:destinations,ACTIONS_READY:'true',ACTION_ENDPOINTS:destinations,SINK:{fetch:async (_url:string,init:RequestInit)=>{bodies.push(JSON.parse(String(init.body))); return new Response(null,{status:200})}}}
   const common={endpointId:'sink',vaultId:vault.id,secretId:secret.id,enabled:true,checkIds:[checkId]}
   assert.equal((await channelApi(req({...common,name:'Channel'}),runtime as never,actor,'/admin/notifications/channels')).status,201)
   assert.equal((await actionApi(req({...common,name:'Action',triggerStatus:'degraded'}),runtime as never,actor,'/admin/actions')).status,201)

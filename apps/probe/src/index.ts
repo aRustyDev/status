@@ -13,7 +13,7 @@ type Check = {
   last_scheduled_at: number | null
   advanced_config: string | null
 }
-type Environment = { DB: D1Database; ENDPOINTS: string; VAULT_ENCRYPTION_KEY?: string; [binding: string]: unknown }
+type Environment = { DB: D1Database; ENDPOINTS: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; [binding: string]: unknown }
 type Result = { status: 'up' | 'down'; effectiveStatus: 'up' | 'down' | 'degraded'; httpStatus: number | null; latencyMs: number; completedAt: number; credentialUnavailable?: boolean }
 
 // Cloudflare Workers VPC connection errors documented at
@@ -72,6 +72,7 @@ async function evaluateConfigured(check: Check, config: HttpMonitorConfig, env: 
   let credentialFault = false
   const unavailable = (): HttpMonitorResult => ({ status: 'down', responseMs: null, httpStatus: null, reasons: ['credential_unavailable'], attempts: 1 })
   if (config.auth) {
+    if (env.MONITOR_AUTH_READY !== 'true') return unavailable()
     try {
     const target = approved.get(check.endpoint_id)
     if (!target || new URL(target.url).protocol !== 'https:') return unavailable()
