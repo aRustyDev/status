@@ -57,7 +57,7 @@ export async function getSystemHealthReport(env: HealthEnvironment, now = Date.n
     try {
       const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Timed out')) }, 3000) })
       const reachable = (async () => {
-        const response = await env.BACKUPS!.fetch(new Request('https://backup.internal/backups', { signal: controller.signal }))
+        const response = await env.BACKUPS!.fetch(new Request('https://backup.internal/health', { signal: controller.signal }))
         if (response.body) await response.body.cancel()
         return response.ok
       })()

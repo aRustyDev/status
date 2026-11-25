@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../api/client'
@@ -16,6 +16,13 @@ const report = {
   notifications: { status: 'disabled' as const },
   backups: { status: 'ok' as const },
   staticMirror: { status: 'disabled' as const },
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((onResolve, onReject) => { resolve = onResolve; reject = onReject })
+  return { promise, resolve, reject }
 }
 
 describe('SystemHealthPage', () => {
@@ -50,5 +57,43 @@ describe('SystemHealthPage', () => {
     expect(await screen.findByText('Health unavailable')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: /try again/i }))
     expect(await screen.findByText('BetterStatusPage is healthy')).toBeInTheDocument()
+  })
+
+  it('keeps the newer report when an earlier request finishes last', async () => {
+    const user = userEvent.setup()
+    const earlier = deferred<typeof report>()
+    vi.mocked(api.get).mockReturnValueOnce(earlier.promise).mockResolvedValueOnce({ ...report, status: 'degraded' })
+    render(<SystemHealthPage />)
+
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByText('BetterStatusPage needs attention')).toBeInTheDocument()
+    await act(async () => { earlier.resolve(report); await earlier.promise })
+    expect(screen.getByText('BetterStatusPage needs attention')).toBeInTheDocument()
+    expect(screen.queryByText('BetterStatusPage is healthy')).not.toBeInTheDocument()
+  })
+
+  it('does not let an earlier failure replace a newer successful report', async () => {
+    const user = userEvent.setup()
+    const earlier = deferred<typeof report>()
+    vi.mocked(api.get).mockReturnValueOnce(earlier.promise).mockResolvedValueOnce(report)
+    render(<SystemHealthPage />)
+
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByText('BetterStatusPage is healthy')).toBeInTheDocument()
+    await act(async () => { earlier.reject(new Error('Old request failed')); await earlier.promise.catch(() => {}) })
+    expect(screen.queryByText('Old request failed')).not.toBeInTheDocument()
+  })
+
+  it('stops polling and ignores pending results after unmount', async () => {
+    vi.useFakeTimers()
+    try {
+      const pending = deferred<typeof report>()
+      vi.mocked(api.get).mockReturnValueOnce(pending.promise)
+      const view = render(<SystemHealthPage />)
+      view.unmount()
+      await act(async () => { pending.resolve(report); await pending.promise; vi.advanceTimersByTime(30_000) })
+      expect(api.get).toHaveBeenCalledTimes(1)
+      expect(screen.queryByText('BetterStatusPage is healthy')).not.toBeInTheDocument()
+    } finally { vi.useRealTimers() }
   })
 })

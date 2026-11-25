@@ -213,7 +213,10 @@ test('system health is administrator-only and reports observed dependency state'
     assert.equal(failed.status, 'degraded')
     assert.equal(failed.backups.status, 'error')
     assert.doesNotMatch(JSON.stringify(failed), /secret backup credentials/)
-    env.BACKUPS = { fetch: async () => Response.json({ backups: [] }) }
+    env.BACKUPS = { fetch: async incoming => {
+      assert.equal(new URL(incoming.url).pathname, '/health')
+      return Response.json({ status: 'ok' })
+    } }
     assert.equal(((await request(path, adminToken)).body as unknown as { backups: { status: string } }).backups.status, 'ok')
   } finally {
     delete env.BACKUPS; delete env.BACKUPS_READY; env.ENDPOINTS = '[]'

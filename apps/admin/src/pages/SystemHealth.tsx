@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import { Alert, ErrorState, LoadingState, PageContainer, PageHeader, formatDateTime } from '@better-forge/ui'
 
@@ -56,16 +56,24 @@ export default function SystemHealthPage() {
   const [report, setReport] = useState<SystemHealthReport | null>(null)
   const [error, setError] = useState('')
   const [refreshing, setRefreshing] = useState(false)
+  const requestSequence = useRef(0)
   const load = useCallback(async (manual = false) => {
+    const sequence = ++requestSequence.current
     if (manual) setRefreshing(true)
-    try { setReport(await api.get<SystemHealthReport>('/admin/system-health')); setError('') }
-    catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)) }
-    finally { if (manual) setRefreshing(false) }
+    try {
+      const next = await api.get<SystemHealthReport>('/admin/system-health')
+      if (sequence === requestSequence.current) { setReport(next); setError('') }
+    } catch (cause) {
+      if (sequence === requestSequence.current) setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      if (sequence === requestSequence.current) setRefreshing(false)
+    }
   }, [])
   useEffect(() => {
+    const sequence = requestSequence
     void load()
     const interval = window.setInterval(() => { void load() }, 15_000)
-    return () => window.clearInterval(interval)
+    return () => { window.clearInterval(interval); sequence.current++ }
   }, [load])
   const header = <PageHeader title="System Health" subtitle="Internal health of this Cloudflare deployment." actions={
     <button type="button" disabled={refreshing} onClick={() => { void load(true) }} className="btn btn-primary">

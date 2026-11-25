@@ -34,6 +34,7 @@ test('R2-backed backup integrity verification runs in workerd', async () => {
   }, bundle: true, format: 'esm', platform: 'browser', conditions: ['workerd', 'worker', 'browser'], write: false })
   const mf = new Miniflare(convertV4MiniflareOptions({ modules: true, script: bundle.outputFiles[0].text, r2Buckets: ['BACKUP_BUCKET'] }))
   try {
+    assert.equal((await mf.dispatchFetch('https://backup.internal/health')).status, 200)
     assert.equal((await mf.dispatchFetch('https://backup.internal/export')).status, 200)
     assert.equal((await mf.dispatchFetch(`https://backup.internal/backups/${'a'.repeat(64)}/verify`)).status, 200)
     assert.equal((await mf.dispatchFetch('https://backup.internal/seed')).status, 200)
