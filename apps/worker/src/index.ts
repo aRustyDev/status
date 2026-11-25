@@ -7,11 +7,13 @@ import { getSystemHealthReport } from './system-health'
 import { vaultApi, vaultKeyReady, VaultError } from './vault'
 import { channelApi, ChannelError } from './channels'
 import { channelEndpoints, type ChannelEnvironment } from './channels-runtime'
+import { emailChannelFingerprint, emailDestinations, emailReady, type EmailChannelEnv } from './email-channel'
+import { resolveChannelCredential } from './vault-resolver'
 import { actionApi, ActionError } from './actions'
 import { actionEndpoints, type ActionEnvironment } from './actions-runtime'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
-interface Env {
+interface Env extends EmailChannelEnv {
   DB: D1Database
   VAULT_ENCRYPTION_KEY?: string
   MONITOR_AUTH_READY?: string
@@ -29,6 +31,10 @@ interface Env {
   GATUS_REQUIRED?: string
   BACKUPS?: Fetcher
   BACKUPS_READY?: string
+}
+
+async function notificationsReady(env: Env): Promise<boolean> {
+  return env.CHANNELS_READY === 'true' && (emailReady(env) || (channelEndpoints(env.CHANNEL_ENDPOINTS).size > 0 && await vaultKeyReady(env.DB, env.VAULT_ENCRYPTION_KEY)))
 }
 
 type Role = 'viewer' | 'operator' | 'admin'
@@ -598,9 +604,34 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       throw new HttpError(500, 'Action operation failed')
     }
   }
+  if (route === '/admin/monitor-alert-channels' && method === 'GET') {
+    requireRole(user, 'admin')
+    if (!await notificationsReady(env)) throw new HttpError(503, 'Notifications are unavailable')
+    const channels = await db.prepare(`SELECT c.id,c.name,c.channel_type AS type,c.enabled,c.version,c.endpoint_id,c.endpoint_fingerprint,
+      c.recipient_id,c.email_fingerprint,vs.id AS secret_present FROM notification_channels c
+      LEFT JOIN vault_secrets vs ON vs.id=c.secret_id AND vs.vault_id=c.vault_id AND vs.type='value' ORDER BY c.name,c.id`)
+      .all<{id:string;name:string;type:'email'|'webhook';enabled:number;endpoint_id:string;endpoint_fingerprint:string;recipient_id:string|null;email_fingerprint:string|null;secret_present:number|null;version:number}>()
+    const webhookReady = channelEndpoints(env.CHANNEL_ENDPOINTS)
+    const vaultAvailable = webhookReady.size > 0 && await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
+    const recipients = emailDestinations(env.EMAIL_DESTINATIONS)
+    return json(await Promise.all(channels.results.map(async channel => {
+      let available = false
+      if (channel.type === 'email' && emailReady(env) && env.EMAIL_FROM && channel.recipient_id) {
+        const recipient = recipients.get(channel.recipient_id)
+        available = !!recipient && await emailChannelFingerprint(env.EMAIL_FROM, recipient.address) === channel.email_fingerprint
+      } else if (channel.type === 'webhook' && vaultAvailable && channel.secret_present !== null) {
+        const endpoint = webhookReady.get(channel.endpoint_id)
+        if (endpoint && await endpointFingerprint(endpoint) === channel.endpoint_fingerprint) {
+          const token = await resolveChannelCredential(db, env.VAULT_ENCRYPTION_KEY, channel.id, channel.version)
+          available = !!token && token.length <= 4096 && /^[A-Za-z0-9._~+/-]+=*$/.test(token)
+        }
+      }
+      return { id: channel.id, name: channel.name, type: channel.type, enabled: Boolean(channel.enabled), available }
+    })))
+  }
   if (route === '/admin/notifications' || route.startsWith('/admin/notifications/')) {
     requireRole(user, 'admin')
-    if (env.CHANNELS_READY !== 'true' || !channelEndpoints(env.CHANNEL_ENDPOINTS).size || !await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Notifications are unavailable')
+    if (!await notificationsReady(env)) throw new HttpError(503, 'Notifications are unavailable')
     try { return await channelApi(request, env as unknown as ChannelEnvironment, user, route) }
     catch (error) {
       if (error instanceof ChannelError || error instanceof ReceiptError) throw error
@@ -684,6 +715,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const components = await listComponents(db, activeIncidents, windows, env)
     await refreshAliases()
     const endpoints = admin ? parseEndpoints(env.ENDPOINTS) : new Map()
+    const alertLinks = admin && user.role === 'admin'
+      ? (await db.prepare('SELECT component_id,channel_id FROM monitor_notification_channels ORDER BY channel_id').all<{component_id:string;channel_id:string}>()).results : []
     const now = Date.now()
     return Promise.all(components.map(async component => {
       const check = admin && component.source !== 'gatus' ? await stmt(db, 'SELECT endpoint_id, interval_minutes FROM http_checks WHERE component_id=?', component.id)
@@ -710,6 +743,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
         intervalSecs: check ? check.interval_minutes * 60 : null,
         config: { url: check ? endpoints.get(check.endpoint_id)?.name ?? '' : '' },
         tags: component.tags,
+        ...(admin && user.role === 'admin' ? { channelIds: alertLinks.filter(link => link.component_id === component.id).map(link => link.channel_id) } : {}),
         group: component.source === 'gatus' ? component.group : null,
         activity: { maintenance: component.underMaintenance, windows: [], incident: null },
         health: {
@@ -768,6 +802,20 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     if (!creating && await stmt(db, 'SELECT component_id FROM gatus_sources WHERE component_id=?', componentId).first()) throw new HttpError(403, 'Gatus-managed component is read-only')
     const componentVersion = creating ? 0 : version(body)
     const token = id()
+    let channelIds: string[] | undefined
+    let expectedChannelIds: string[] | undefined
+    const channelArray = (value: unknown): string[] => {
+      if (!Array.isArray(value) || value.length > 20 || value.some(item => typeof item !== 'string' || !/^[a-f0-9-]{36}$/.test(item)) || new Set(value).size !== value.length) return bad('Invalid alert channels')
+      return value as string[]
+    }
+    if (body.channelIds !== undefined) {
+      requireRole(user, 'admin')
+      if (!await notificationsReady(env)) throw new HttpError(503, 'Notifications are unavailable')
+      channelIds = channelArray(body.channelIds)
+      if (creating) {
+        if (body.expectedChannelIds !== undefined) return bad('Invalid alert channels')
+      } else expectedChannelIds = channelArray(body.expectedChannelIds)
+    } else if (body.expectedChannelIds !== undefined) return bad('Invalid alert channels')
     const check = body.check
     type StoredCheck = { id: string; endpoint_id: string; enabled: number; interval_minutes: number; expected_status: number; config_version: number; advanced_config: string | null }
     let current: StoredCheck | null = null
@@ -791,16 +839,28 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     }
     const checkGuard = checkData ? current ? ' AND EXISTS (SELECT 1 FROM http_checks WHERE id=? AND config_version=?)' : ' AND NOT EXISTS (SELECT 1 FROM http_checks WHERE component_id=?)' : ''
     const guardValues = checkData ? current ? [current.id, current.config_version] : [componentId] : []
+    const selectedJson = channelIds === undefined ? null : JSON.stringify(channelIds)
+    const expectedJson = expectedChannelIds === undefined ? null : JSON.stringify(expectedChannelIds)
+    const channelGuard = channelIds === undefined ? '' : ` AND EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?)
+      AND (SELECT COUNT(*) FROM notification_channels WHERE id IN (SELECT value FROM json_each(?)))=?`
+    const channelGuardValues = channelIds === undefined ? [] : [user.id, user.version, selectedJson, channelIds.length]
+    const snapshotGuard = expectedChannelIds === undefined ? '' : ` AND NOT EXISTS (SELECT 1 FROM monitor_notification_channels WHERE component_id=components.id AND channel_id NOT IN (SELECT value FROM json_each(?)))
+      AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE value NOT IN (SELECT channel_id FROM monitor_notification_channels WHERE component_id=components.id))`
+    const snapshotValues = expectedChannelIds === undefined ? [] : [expectedJson, expectedJson]
     const operations: D1PreparedStatement[] = [
       db.prepare('DELETE FROM mutation_receipts WHERE rowid IN (SELECT rowid FROM mutation_receipts WHERE expires_at<=? LIMIT 100)').bind(Date.now()),
       receiptClaim(db, receipt, token),
     ]
-    if (creating) operations.push(stmt(db, 'INSERT INTO components (id,name,position,manual_status,updated_at,mutation_key,tags) VALUES (?,?,?,?,?,?,?)', componentId, name, position, manualStatus, Date.now(), token, tags))
-    else operations.push(stmt(db, `UPDATE components SET name=?,manual_status=?,position=?,updated_at=?,version=version+1,mutation_key=?,tags=COALESCE(?,tags) WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=components.id)${checkGuard}`, name, manualStatus, position, Date.now(), token, tags, componentId, componentVersion, ...guardValues))
+    if (creating) operations.push(stmt(db, `INSERT INTO components (id,name,position,manual_status,updated_at,mutation_key,tags) SELECT ?,?,?,?,?,?,? WHERE 1=1${channelGuard}`, componentId, name, position, manualStatus, Date.now(), token, tags, ...channelGuardValues))
+    else operations.push(stmt(db, `UPDATE components SET name=?,manual_status=?,position=?,updated_at=?,version=version+1,mutation_key=?,tags=COALESCE(?,tags) WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=components.id)${checkGuard}${channelGuard}${snapshotGuard}`, name, manualStatus, position, Date.now(), token, tags, componentId, componentVersion, ...guardValues, ...channelGuardValues, ...snapshotValues))
     if (checkData && checkData.changed) {
       if (!current) operations.push(stmt(db, `INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,advanced_config) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.id, componentId, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, componentId, token))
       else operations.push(stmt(db, `UPDATE http_checks SET endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,advanced_config=?, config_version=config_version + CASE WHEN advanced_config IS ? THEN 1 ELSE 0 END,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, checkData.advancedConfig, token, current.id, current.config_version, componentId, token))
       operations.push(audit(db, user, current ? 'update' : 'create', 'check', checkData.id, { componentId, enabled: checkData.enabled, intervalMinutes: checkData.intervalMinutes, expectedStatus: checkData.expectedStatus }, { table: 'components', id: componentId, token }))
+    }
+    if (channelIds !== undefined) {
+      operations.push(stmt(db, `DELETE FROM monitor_notification_channels WHERE component_id=? AND channel_id NOT IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, componentId, selectedJson, componentId, token))
+      operations.push(stmt(db, `INSERT OR IGNORE INTO monitor_notification_channels (component_id,channel_id) SELECT ?,value FROM json_each(?) WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, componentId, selectedJson, componentId, token))
     }
     operations.push(audit(db, user, creating ? 'create' : 'update', 'component', componentId, { name, status: manualStatus, position }, { table: 'components', token }))
     operations.push(receiptFinish(db, receipt, token, creating ? 201 : 200, componentId, componentVersion + 1, 'SELECT 1 FROM components WHERE id=? AND mutation_key=?', [componentId, token], 'component'))
@@ -817,7 +877,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now() })
   if (route === '/capabilities' && method === 'GET') {
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
-    const notificationsAvailable = vaultAvailable && env.CHANNELS_READY === 'true' && channelEndpoints(env.CHANNEL_ENDPOINTS).size > 0
+    const notificationsAvailable = await notificationsReady(env)
     const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
     return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }

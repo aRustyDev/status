@@ -24,11 +24,12 @@ const destinations=JSON.stringify([{id:'approved',name:'Approved action',url:'ht
 const request=(method:string,body?:unknown)=>new Request('https://status.example.test',{method,headers:{'content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})})
 async function setup(){
  const local=new DB()
- for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_actions.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+ for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_actions.sql','0009_channels.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
  local.db.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
  local.db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Service',0)").run()
  local.db.prepare("INSERT INTO endpoint_registry VALUES ('check','approved')").run()
  local.db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at) VALUES (?,'component','check',1,1,200,'up',1)").run(checkId)
+ local.db.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'up')").run(checkId)
  const db=local as unknown as D1Database, calls:{url:string;init:RequestInit}[]=[]
  let status=204
  const env={DB:db,ACTIONS_READY:'true',ACTION_ENDPOINTS:destinations,VAULT_ENCRYPTION_KEY:key,ACTION:{fetch:async(url:string,init:RequestInit)=>{calls.push({url,init});return status===204?new Response(null,{status}):new Response('private response',{status})}}} satisfies ActionEnvironment
@@ -40,9 +41,13 @@ async function setup(){
 }
 async function queue(x:Awaited<ReturnType<typeof setup>>,status:'up'|'down'|'degraded'='down',time=100){
  const binary=status==='up'?'up':'down'
+ // Each standalone queue call models a fresh transition from a prior up baseline.
+ x.local.db.prepare("UPDATE automation_transition_state SET status='up' WHERE check_id=?").run(checkId)
  await x.db.batch([
   x.db.prepare('INSERT OR IGNORE INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,?,?,?,?,500,4)').bind(checkId,time,time,binary,status),
   enqueueActionTransition(x.db,checkId,1,'approved',time,status),
+  x.db.prepare('UPDATE http_checks SET last_status=?,last_effective_status=?,last_scheduled_at=?,last_effective_scheduled_at=?,last_result_at=? WHERE id=? AND EXISTS (SELECT 1 FROM http_check_results WHERE check_id=? AND config_version=1 AND scheduled_at=? AND effective_status=?)').bind(binary,status,time,time,time,checkId,checkId,time,status),
+  x.db.prepare("UPDATE automation_transition_state SET status=?,generation=generation+1 WHERE check_id=? AND EXISTS (SELECT 1 FROM http_checks WHERE id=? AND last_scheduled_at=?)").bind(status,checkId,checkId,time),
  ])
 }
 
@@ -132,7 +137,7 @@ test('Workerd D1 concurrently dispatches a transition at most once', {skip:!proc
  const runtime=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response()}}',d1Databases:['DB']}))
  try {
   const db=await runtime.getD1Database('DB') as D1Database
-  for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_actions.sql']) {
+  for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_actions.sql','0009_channels.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) {
    const sql=readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8').replace(/^\s*--[^\n]*$/gm,'')
    const parts=sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/),statements=parts.shift()!.split(';').map(s=>s.trim()).filter(Boolean)
    statements.push(...parts.map(s=>s.trim()).filter(Boolean));await db.batch(statements.map(s=>db.prepare(s)))
@@ -142,6 +147,7 @@ test('Workerd D1 concurrently dispatches a transition at most once', {skip:!proc
    db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Service',0)"),
    db.prepare("INSERT INTO endpoint_registry VALUES ('check','approved')"),
    db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at) VALUES (?,'component','check',1,1,200,'up',1)").bind(checkId),
+      db.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'up')").bind(checkId),
   ])
   let calls=0
   const env={DB:db,ACTIONS_READY:'true',ACTION_ENDPOINTS:destinations,VAULT_ENCRYPTION_KEY:key,ACTION:{fetch:async()=>{calls++;return new Response(null,{status:204})}}} satisfies ActionEnvironment
@@ -151,7 +157,8 @@ test('Workerd D1 concurrently dispatches a transition at most once', {skip:!proc
   async function save(){return db.batch([
    db.prepare("INSERT OR IGNORE INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,100,100,'down','down',500,4)").bind(checkId),
    enqueueActionTransition(db,checkId,1,'approved',100,'down'),
-   db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100 WHERE id=? AND (last_scheduled_at IS NULL OR last_scheduled_at<100)").bind(checkId),
+   db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100,last_result_at=100 WHERE id=? AND (last_scheduled_at IS NULL OR last_scheduled_at<100)").bind(checkId),
+   db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=? AND status<>'down'").bind(checkId),
   ])}
   await Promise.all([save(),save()]);await Promise.all([flushActions(env),flushActions(env)])
   assert.equal(calls,1)
@@ -173,4 +180,200 @@ test('the first healthy observation after a credential fault cannot enqueue a fa
  await x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,100,100,'up','up',200,4)").bind(checkId).run()
  await enqueueActionTransition(x.db,checkId,1,'approved',100,'up').run()
  assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM worker_action_outbox').get() as {n:number}).n,0)
+})
+
+test('pending actions wait for post-maintenance observation and do not expire during long windows',async()=>{
+ const x=await setup(), now=Date.now(), scheduled=now-7_200_000
+ await queue(x,'down',scheduled)
+ x.local.db.prepare("UPDATE worker_action_outbox SET created_at=?").run(scheduled)
+ x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now-120_000,now+60_000,now,now)
+ await flushActions(x.env);assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'pending')
+ x.local.db.prepare("UPDATE maintenance SET ends_at=? WHERE id='m'").run(now-1)
+ await flushActions(x.env);assert.equal(x.calls.length,0)
+ x.local.db.prepare('UPDATE http_checks SET last_scheduled_at=?,last_result_at=? WHERE id=?').run(now,now,checkId)
+ await flushActions(x.env);assert.equal(x.calls.length,1)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'completed')
+})
+
+test('post-window recovery supersedes an unclaimed outage action',async()=>{
+ const x=await setup(), now=Date.now(), scheduled=now-180_000
+ await queue(x,'down',scheduled)
+ x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now-120_000,now-60_000,now,now)
+ x.local.db.prepare("UPDATE http_checks SET last_status='up',last_effective_status='up',last_scheduled_at=?,last_effective_scheduled_at=?,last_result_at=? WHERE id=?").run(now,now,now,checkId)
+ await flushActions(x.env);assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'unavailable')
+})
+
+test('a window starting after an action claim defers it before network transmission',async()=>{
+ const x=await setup(), now=Date.now();await queue(x)
+ let inserted=false
+ const db={prepare(sql:string) {
+  if(!inserted && sql.includes('SELECT 1 FROM worker_action_outbox o JOIN http_checks')) {
+   inserted=true;x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now-1000,now+60_000,now,now)
+  }
+  return x.db.prepare(sql)
+ }} as D1Database
+ await flushActions({...x.env,DB:db})
+ assert.equal(x.calls.length,0)
+ assert.deepEqual({...x.local.db.prepare('SELECT state,claimed_at FROM worker_action_outbox').get()},{state:'pending',claimed_at:null})
+})
+
+test('a credential fault after maintenance holds a pending action until a valid observation',async()=>{
+ const x=await setup(), now=Date.now(), scheduled=now-180_000
+ await queue(x,'down',scheduled)
+ x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now-120_000,now-60_000,now,now)
+ x.local.db.prepare("UPDATE http_checks SET last_status='down',last_effective_status='down',last_scheduled_at=?,last_effective_scheduled_at=?,transition_suppressed=1 WHERE id=?").run(now,now,checkId)
+ await flushActions(x.env);assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'pending')
+ x.local.db.prepare('UPDATE http_checks SET transition_suppressed=0,last_scheduled_at=?,last_effective_scheduled_at=?,last_result_at=? WHERE id=?').run(now+1,now+1,now+1,checkId)
+ await flushActions(x.env);assert.equal(x.calls.length,1)
+})
+
+test('a credential fault after an action claim defers it before transmission',async()=>{
+ const x=await setup();await queue(x)
+ let marked=false
+ const db={prepare(sql:string) {
+  if(!marked && sql.includes('SELECT 1 FROM worker_action_outbox o JOIN http_checks')) {
+   marked=true;x.local.db.prepare('UPDATE http_checks SET transition_suppressed=1 WHERE id=?').run(checkId)
+  }
+  return x.db.prepare(sql)
+ }} as D1Database
+ await flushActions({...x.env,DB:db})
+ assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'pending')
+})
+
+test('an old action cannot run after down-up-down transitions during unavailable delivery',async()=>{
+ const x=await setup();await queue(x,'down',100)
+ x.local.db.prepare("UPDATE automation_transition_state SET status='up',generation=generation+1 WHERE check_id=?").run(checkId)
+ x.local.db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=?").run(checkId)
+ x.local.db.prepare("UPDATE http_checks SET last_status='down',last_effective_status='down',last_scheduled_at=300,last_effective_scheduled_at=300,last_result_at=300 WHERE id=?").run(checkId)
+ await flushActions(x.env)
+ assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'unavailable')
+})
+
+test('action enqueue uses actual completion time at maintenance boundaries',async()=>{
+ const x=await setup()
+ x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',100,200,1,1)").run()
+ await x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,90,150,'down','down',500,4)").bind(checkId).run()
+ await enqueueActionTransition(x.db,checkId,1,'approved',90,'down',150).run()
+ assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM worker_action_outbox').get() as {n:number}).n,0)
+ await x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,120,210,'down','down',500,4)").bind(checkId).run()
+ await enqueueActionTransition(x.db,checkId,1,'approved',120,'down',210).run()
+ assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM worker_action_outbox').get() as {n:number}).n,1)
+})
+
+test('first valid outage after a credential fault compares against the last valid baseline',async()=>{
+ const x=await setup()
+ x.local.db.prepare("UPDATE http_checks SET last_status='down',transition_suppressed=1 WHERE id=?").run(checkId)
+ await x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,100,100,'down','down',500,4)").bind(checkId).run()
+ await enqueueActionTransition(x.db,checkId,1,'approved',100,'down').run()
+ assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM worker_action_outbox').get() as {n:number}).n,1)
+})
+
+test('transition-state migration excludes results from overlapping maintenance windows',()=>{
+ for(const targeted of [false,true]) {
+  const db=new DatabaseSync(':memory:')
+  for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0006_advanced_http.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql']) db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+  const now=Date.now()
+  db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Service',0)").run()
+  db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at,last_result_at) VALUES (?,'component','check',1,1,200,'down',?,?)").run(checkId,now-10_000,now-10_000)
+  db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,?,?,'up',200,1)").run(checkId,now-180_000,now-180_000)
+  db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,?,?,'down',500,1)").run(checkId,now-90_000,now-90_000)
+  db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,?,?,'down',500,1)").run(checkId,now-10_000,now-10_000)
+  db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m1','earlier',?,?,?,?),('m2','active',?,?,?,?)").run(now-120_000,now-60_000,now,now,now-30_000,now+60_000,now,now)
+  if(targeted) {db.prepare("INSERT INTO maintenance_components VALUES ('m1','component'),('m2','component')").run()}
+  db.exec(readFileSync(new URL('../migrations/0010_notification_transition_state.sql',import.meta.url),'utf8'))
+  assert.equal(db.prepare('SELECT status FROM automation_transition_state WHERE check_id=?').get(checkId)?.status,'up')
+  db.close()
+ }
+})
+
+test('a transition after the action claim prevents a stale action before transmission',async()=>{
+ const x=await setup();await queue(x)
+ let changed=false
+ const db={prepare(sql:string) {
+  if(!changed && sql.includes('SELECT 1 FROM worker_action_outbox o JOIN http_checks') && sql.includes('JOIN vault_secrets v')) {
+   changed=true;x.local.db.prepare("UPDATE automation_transition_state SET generation=generation+1,status='up' WHERE check_id=?").run(checkId)
+  }
+  return x.db.prepare(sql)
+ }} as D1Database
+ await flushActions({...x.env,DB:db});assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'pending')
+ await flushActions(x.env);assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'unavailable')
+})
+
+test('generation migration fails old pending work closed while preserving claimed action uncertainty',()=>{
+ const db=new DatabaseSync(':memory:')
+ for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0006_advanced_http.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql']) db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+ db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Service',0)").run()
+ db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at,last_result_at) VALUES (?,'component','check',1,1,200,'down',100,100)").run(checkId)
+ db.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at) VALUES ('c','Channel','endpoint','fingerprint',1,1,1,0,0)").run()
+ db.prepare("INSERT INTO worker_actions (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,trigger_status,created_at,updated_at) VALUES ('a','Action','endpoint','fingerprint',1,1,1,'all',0,0)").run()
+ db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,state,attempts,created_at,updated_at) VALUES ('n1','c',1,?,1,100,'down','pending',0,0,0),('n2','c',1,?,1,101,'up','sending',1,0,0)").run(checkId,checkId)
+ db.prepare("INSERT INTO worker_action_outbox (id,action_id,action_version,check_id,check_version,scheduled_at,status,state,created_at,updated_at) VALUES ('a1','a',1,?,1,100,'down','pending',0,0),('a2','a',1,?,1,101,'up','executing',0,0)").run(checkId,checkId)
+ db.exec(readFileSync(new URL('../migrations/0010_notification_transition_state.sql',import.meta.url),'utf8'))
+ assert.deepEqual(db.prepare('SELECT state FROM notification_outbox ORDER BY id').all().map(row=>row.state),['failed','failed'])
+ assert.deepEqual(db.prepare('SELECT state FROM worker_action_outbox ORDER BY id').all().map(row=>row.state),['unavailable','uncertain'])
+ db.close()
+})
+
+test('maintenance beginning during action preflight holds an in-window status change',async()=>{
+ const x=await setup(), now=Date.now();await queue(x,'down',now-120_000)
+ let inserted=false
+ const db={prepare(sql:string) {
+  if(!inserted && sql.includes('SELECT 1 AS present FROM worker_actions a JOIN')) {
+   inserted=true;x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now-1000,now+60_000,now,now)
+   x.local.db.prepare("UPDATE http_checks SET last_status='up',last_effective_status='up',last_scheduled_at=?,last_effective_scheduled_at=?,last_result_at=? WHERE id=?").run(now,now,now,checkId)
+  }
+  return x.db.prepare(sql)
+ }} as D1Database
+ await flushActions({...x.env,DB:db});assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'pending')
+})
+
+test('action preflight refuses credentials rotated or deleted after resolution',async()=>{
+ for(const change of ['rotate','delete','replace'] as const) {
+  const x=await setup();await queue(x)
+  let changed=false
+  const db={prepare(sql:string) {
+   if(!changed && sql.includes('SELECT 1 FROM worker_action_outbox o JOIN http_checks') && sql.includes('JOIN vault_secrets v')) {
+    changed=true
+    if(change==='delete') x.local.db.prepare('DELETE FROM vault_secrets WHERE id=?').run(x.secret.id)
+    else if(change==='rotate') x.local.db.prepare('UPDATE vault_secrets SET version=version+1 WHERE id=?').run(x.secret.id)
+    else x.local.db.prepare("UPDATE vault_secrets SET nonce='replacement' WHERE id=?").run(x.secret.id)
+   }
+   return x.db.prepare(sql)
+  }} as D1Database
+  await flushActions({...x.env,DB:db})
+  assert.equal(x.calls.length,0,change)
+  assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'pending',change)
+ }
+})
+
+test('migration leaves the baseline unknown after repeated credential faults',()=>{
+ const db=new DatabaseSync(':memory:')
+ for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0006_advanced_http.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql']) db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+ db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Service',0)").run()
+ db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at,last_result_at,transition_suppressed) VALUES (?,'component','check',1,1,200,'down',300,300,1)").run(checkId)
+ db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'up',200,1),(?,1,200,200,'down',NULL,0),(?,1,300,300,'down',NULL,0)").run(checkId,checkId,checkId)
+ db.exec(readFileSync(new URL('../migrations/0010_notification_transition_state.sql',import.meta.url),'utf8'))
+ assert.equal(db.prepare('SELECT status FROM automation_transition_state WHERE check_id=?').get(checkId),undefined)
+ db.close()
+})
+
+test('credential fault beginning during action preflight defers before invalidating old status',async()=>{
+ const x=await setup();await queue(x,'down',Date.now()-120_000)
+ let changed=false
+ const db={prepare(sql:string) {
+  if(!changed && sql.includes('SELECT 1 AS present FROM worker_actions a JOIN')) {
+   changed=true;x.local.db.prepare("UPDATE http_checks SET last_status='up',last_effective_status='up',last_scheduled_at=?,last_effective_scheduled_at=?,last_result_at=?,transition_suppressed=1 WHERE id=?").run(Date.now(),Date.now(),Date.now(),checkId)
+  }
+  return x.db.prepare(sql)
+ }} as D1Database
+ await flushActions({...x.env,DB:db});assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'pending')
 })
