@@ -986,6 +986,35 @@ test('draft monitor tests require an admin and forward only approved destination
   } finally { delete env.PROBE; env.ENDPOINTS = '[]' }
 })
 
+test('monitor test and both save paths enforce the same advanced settings size limit', async () => {
+  const endpoint = { id: 'size-target', name: 'Size target', url: 'https://example.com' }
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  let probeCalls = 0
+  env.PROBE = { async fetch() { probeCalls++; return Response.json({ overall: 'ok', steps: [], totalMs: 1 }) } }
+  const configWithName = (length: number) => ({ assertions: [{ type: 'header', name: 'x'.repeat(length), op: 'not-exists' }] })
+  const overhead = JSON.stringify(configWithName(0)).length
+  const boundary = configWithName(32_000 - overhead)
+  const oversized = configWithName(32_001 - overhead)
+  const testPath = '/api/v1/bsp/admin/monitors/test'
+  const key = () => `${Date.now()}.${crypto.randomUUID()}`
+  try {
+    assert.equal(JSON.stringify(boundary).length, 32_000)
+    assert.equal(JSON.stringify(oversized).length, 32_001)
+    const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Size check target' })
+    const created = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: false, intervalMinutes: 1, expectedStatus: 200 })
+    const advancedPath = `/api/v1/bsp/admin/checks/${created.body.id}/advanced`
+    const testConfig = (advancedConfig: unknown) => request(testPath, adminToken, 'POST', { endpointId: endpoint.id, expectedStatus: 200, advancedConfig })
+    const createMonitor = (advancedConfig: unknown) => request('/api/v1/bsp/admin/monitors', adminToken, 'POST', { name: 'Size monitor', check: { endpointId: endpoint.id, enabled: false, intervalMinutes: 1, expectedStatus: 200, advancedConfig } }, 'https://status.example', key())
+    assert.equal((await testConfig(boundary)).response.status, 200)
+    assert.equal((await request(advancedPath, adminToken, 'PUT', { version: 1, advancedConfig: boundary })).response.status, 200)
+    assert.equal((await createMonitor(boundary)).response.status, 201)
+    assert.equal((await testConfig(oversized)).response.status, 400)
+    assert.equal((await request(advancedPath, adminToken, 'PUT', { version: 2, advancedConfig: oversized })).response.status, 400)
+    assert.equal((await createMonitor(oversized)).response.status, 400)
+    assert.equal(probeCalls, 1)
+  } finally { delete env.PROBE; env.ENDPOINTS = '[]' }
+})
+
 test('a saved multibyte advanced check can be tested through the real probe binding', async () => {
   const endpoint = { id: 'unicode-target', name: 'Unicode target', url: 'https://unicode.example.test/health' }
   const value = '界'.repeat(1000)
