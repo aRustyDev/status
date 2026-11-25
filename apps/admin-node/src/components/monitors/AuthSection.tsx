@@ -18,13 +18,13 @@ export function readAuth(config: Record<string, unknown>): HttpsAuth {
 }
 
 /** HTTPS authentication settings: the scheme switcher plus the credentials each scheme needs. */
-export function AuthSection({ auth, onChange, vaultPicker }: { auth: HttpsAuth; onChange: (auth: HttpsAuth) => void; vaultPicker: VaultPickerProps }) {
+export function AuthSection({ auth, onChange, vaultPicker, cloudflare = false, vaultError = false }: { auth: HttpsAuth; onChange: (auth: HttpsAuth) => void; vaultPicker: VaultPickerProps; cloudflare?: boolean; vaultError?: boolean }) {
   const authType = auth.type ?? 'none'
   const basic  = auth.basic  as Section
   const oauth2 = auth.oauth2 as Section
   const cas    = auth.cas    as Section
 
-  function setAuthType(t: HttpsAuthType) { onChange({ ...auth, type: t }) }
+  function setAuthType(t: HttpsAuthType) { onChange(cloudflare ? (t === 'basic' ? { type: 'basic', basic: { vault: { vaultId: 0, secretId: 0 } } } as unknown as HttpsAuth : { type: 'none' }) : { ...auth, type: t }) }
   function updateBasic(patch: Record<string, unknown>)  { onChange({ ...auth, basic:  { ...(auth.basic  ?? {}), ...patch } } as HttpsAuth) }
   function updateOAuth2(patch: Record<string, unknown>) { onChange({ ...auth, oauth2: { ...(auth.oauth2 ?? {}), ...patch } } as HttpsAuth) }
   function updateCAS(patch: Record<string, unknown>)    { onChange({ ...auth, cas:    { ...(auth.cas    ?? {}), ...patch } } as HttpsAuth) }
@@ -35,14 +35,14 @@ export function AuthSection({ auth, onChange, vaultPicker }: { auth: HttpsAuth; 
     <div className="space-y-4">
       <div className="flex rounded-lg p-1 gap-1" style={{ background: 'var(--m3-surface-container)', border: '1px solid var(--m3-outline-variant)' }}>
         {AUTH_TYPES.map((at) => (
-          <button key={at.value} type="button" onClick={() => setAuthType(at.value)}
+          <button key={at.value} type="button" disabled={cloudflare && !['none', 'basic'].includes(at.value)} title={cloudflare && !['none', 'basic'].includes(at.value) ? `${at.label} (unavailable)` : at.label} onClick={() => setAuthType(at.value)}
             className={`flex-1 text-xs font-medium py-1.5 rounded-md transition-all ${authType === at.value ? 'selection-active' : ''}`}
             style={authType === at.value
               ? { background: 'var(--m3-primary-fixed)', color: 'var(--m3-primary)', border: '1px solid color-mix(in srgb, var(--m3-primary) 25%, transparent)' }
               : { color: 'var(--m3-secondary)', border: '1px solid transparent' }
             }
           >
-            {at.label}
+            {at.label}{cloudflare && !['none', 'basic'].includes(at.value) ? ' (unavailable)' : ''}
           </button>
         ))}
       </div>
@@ -51,7 +51,19 @@ export function AuthSection({ auth, onChange, vaultPicker }: { auth: HttpsAuth; 
         <p className="text-xs" style={{ color: 'var(--m3-secondary)' }}>No authentication configured.</p>
       )}
 
-      {authType === 'basic' && (
+      {authType === 'basic' && cloudflare && (() => {
+        const ref = basic?.['vault'] as VaultRef | undefined
+        const select = (vaultId: number, secretId: number) => onChange({ type: 'basic', basic: { vault: { vaultId, secretId } } } as unknown as HttpsAuth)
+        return <div className="space-y-3">
+          <p className="text-xs">Choose a User / Password Vault secret. Direct credentials, OAuth2 and CAS are unavailable.</p>
+          {vaultError && <p role="alert">Could not load Vault secrets. Close and reopen the editor to retry.</p>}
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Vault"><select className="input-sig" value={ref?.vaultId || ''} onChange={e => { const id = Number(e.target.value); if (id) vaultPicker.onLoadSecrets(id); select(id, 0) }}><option value="">— select vault —</option>{vaultPicker.vaults.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</select></Field>
+            <Field label="Secret"><select className="input-sig" value={ref?.secretId || ''} disabled={!ref?.vaultId} onChange={e => select(ref?.vaultId ?? 0, Number(e.target.value))}><option value="">— select secret —</option>{(ref?.vaultId ? vaultPicker.secretsByVault[ref.vaultId] ?? [] : []).filter(s => s.type === 'userpass').map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></Field>
+          </div>
+        </div>
+      })()}
+      {authType === 'basic' && !cloudflare && (
         <CredentialSection {...vaultPicker} vault={basic?.['vault'] as VaultRef | undefined} onVaultChange={(v) => updateBasic(v ? { vault: v, username: undefined, password: undefined } : { vault: v })} mappingFields={JSON_MAPPING_FIELDS.basic}>
           <div className="grid grid-cols-2 gap-3">
             <Field label="Username"><input value={text(basic, 'username')} onChange={(e) => updateBasic({ username: e.target.value })} className="input-sig" autoComplete="off" /></Field>

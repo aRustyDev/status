@@ -30,9 +30,9 @@ beforeEach(() => {
   vi.mocked(api.post).mockResolvedValue({})
 })
 
-function renderModal(value: Monitor | null, allTags: { label: string; color: string }[] = []) {
+function renderModal(value: Monitor | null, allTags: { label: string; color: string }[] = [], monitorAuth = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true }}><MonitorFormModal monitor={value} allTags={allTags} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
+  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, monitorAuth }}><MonitorFormModal monitor={value} allTags={allTags} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
 }
 
 it('shows unavailable upstream sidebar sections while keeping Checks usable', async () => {
@@ -400,4 +400,27 @@ it('enforces Cloudflare tag label and count limits before adding', async () => {
   await user.click(add)
   await user.click(screen.getByRole('button', { name: 'Save Changes' }))
   await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ tags: [...originalTags.slice(1), { label: 'x'.repeat(40), color: '#6366f1' }, { label: 'extra', color: '#6366f1' }] })))
+})
+
+it('enables only Vault Basic auth when the runtime capability is ready and saves references', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [check]
+    if (path === '/admin/endpoints') return [{ id:'api', name:'Approved API' }]
+    if (path === '/admin/monitors/7/history') return { results:[], retentionDays:14 }
+    if (path === '/admin/vaults') return [{ id:12, name:'Operations' }]
+    if (path === '/admin/vaults/12/secrets') return [{ id:20, name:'service-login', type:'userpass' }, { id:21, name:'token', type:'value' }]
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor,[],true)
+  await user.click(await screen.findByRole('button', { name:'Auth' }))
+  expect(screen.getByRole('button', { name:'OAuth2 (unavailable)' })).toBeDisabled()
+  expect(screen.getByRole('button', { name:'CAS (unavailable)' })).toBeDisabled()
+  await user.click(screen.getByRole('button', { name:'Basic' }))
+  await user.selectOptions(await screen.findByLabelText('Vault'), '12')
+  await screen.findByRole('option', { name:'service-login' })
+  expect(screen.queryByRole('option', { name:'token' })).not.toBeInTheDocument()
+  await user.selectOptions(screen.getByLabelText('Secret'), '20')
+  await user.click(screen.getByRole('button', { name:'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7',expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.objectContaining({auth:{type:'basic',basic:{vault:{vaultId:12,secretId:20}}}}) }) })))
 })

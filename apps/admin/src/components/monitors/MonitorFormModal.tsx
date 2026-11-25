@@ -27,6 +27,7 @@ export default function MonitorFormModal(props: Props) {
 }
 
 function CloudflareMonitorFormModal({ monitor, allTags = [], onClose, onSaved, statusUnavailable = false }: Props) {
+  const capabilities = useCapabilities()
   const component = monitor as Component | null
   const initialComponent = useRef(component).current
   const isAdmin = getCurrentUser()?.role === 'admin'
@@ -49,6 +50,9 @@ function CloudflareMonitorFormModal({ monitor, allTags = [], onClose, onSaved, s
 
   const profile: CloudflareProfile = {
     isAdmin,
+    monitorAuth: !!capabilities.monitorAuth,
+    listVaults: () => api.get('/admin/vaults'),
+    listVaultSecrets: vaultId => api.get(`/admin/vaults/${vaultId}/secrets`),
     statusUnavailable: statusUnavailable || settingsUnavailable,
     settingsUnavailable,
     retrySettings: settingsUnavailable ? () => { void Promise.all([checks.refetch(), endpoints.refetch()]) } : undefined,

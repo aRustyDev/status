@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { endpointFingerprint, parseEndpoints, type Endpoint } from '../../worker/src/endpoint-config'
 
-type Config = { env?: Record<string, { vars?: { ENDPOINTS?: string }; d1_databases?: { binding: string; database_id: string }[]; vpc_services?: { binding: string; service_id: string }[] }> }
+type Config = { env?: Record<string, { vars?: { ENDPOINTS?: string }; d1_databases?: { binding: string; database_id: string }[]; vpc_services?: { binding: string; service_id: string }[]; services?: { binding: string; service: string; environment?: string; entrypoint?: string }[] }> }
 
 function sqlString(value: string): string { return `'${value.replaceAll("'", "''")}'` }
 
@@ -26,8 +26,9 @@ export async function buildSyncSql(board: Config, probe: Config, environment: st
     if (!boardEndpoint || JSON.stringify([boardEndpoint.name, boardEndpoint.url, boardEndpoint.binding, boardEndpoint.serviceId, boardEndpoint.revision]) !==
       JSON.stringify([endpoint.name, endpoint.url, endpoint.binding, endpoint.serviceId, endpoint.revision])) throw new Error('Worker endpoint lists differ')
     if (endpoint.binding) {
-      const binding = probeEnv.vpc_services?.find(item => item.binding === endpoint.binding)
-      if (!binding || binding.service_id !== endpoint.serviceId) throw new Error('Endpoint VPC service ID does not match its binding')
+      const vpc = (probeEnv.vpc_services ?? []).filter(item => item.binding === endpoint.binding)
+      const service = (probeEnv.services ?? []).filter(item => item.binding === endpoint.binding)
+      if (vpc.length + service.length !== 1 || (vpc[0] ? vpc[0].service_id !== endpoint.serviceId : service[0]?.service !== endpoint.serviceId || service[0]?.environment !== undefined || service[0]?.entrypoint !== undefined)) throw new Error('Endpoint VPC service ID or Worker service does not match its binding')
     }
     entries.push({ id: endpoint.id, fingerprint: await endpointFingerprint(endpoint as Endpoint) })
   }

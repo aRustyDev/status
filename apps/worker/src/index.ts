@@ -1,15 +1,24 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose'
 import { endpointFingerprint, parseEndpoints } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
-import { parsePersistedHttpConfig } from '../../probe/src/http-monitor'
+import { parsePersistedHttpConfig, parseVaultBasicAuth } from '../../probe/src/http-monitor'
 import { ProbeTestTimeout, requestProbeTest } from './probe-test'
 import { getSystemHealthReport } from './system-health'
 import { vaultApi, vaultKeyReady, VaultError } from './vault'
+import { channelApi, ChannelError } from './channels'
+import { channelEndpoints, type ChannelEnvironment } from './channels-runtime'
+import { actionApi, ActionError } from './actions'
+import { actionEndpoints, type ActionEnvironment } from './actions-runtime'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
 interface Env {
   DB: D1Database
   VAULT_ENCRYPTION_KEY?: string
+  MONITOR_AUTH_READY?: string
+  CHANNEL_ENDPOINTS?: string
+  CHANNELS_READY?: string
+  ACTION_ENDPOINTS?: string
+  ACTIONS_READY?: string
   ASSETS: Fetcher
   PROBE?: Fetcher
   MONITOR_MODAL?: string
@@ -43,6 +52,19 @@ function serializeAdvancedConfig(value: unknown, endpointId: string, expectedSta
   const serialized = JSON.stringify(value)
   if (serialized.length > 32_000) return bad('Invalid advanced check settings')
   return serialized
+}
+/** Only administrators can attach an existing user/password secret to an HTTPS check. */
+async function validateMonitorAuth(env: Env, value: unknown, endpointId: string): Promise<void> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return
+  const auth = (value as Record<string, unknown>).auth
+  if (auth === undefined) return
+  const parsed = parseVaultBasicAuth(auth)
+  if (!parsed) return bad('Invalid monitor authentication')
+  if (env.MONITOR_AUTH_READY !== 'true') throw new HttpError(503, 'Monitor authentication is unavailable')
+  const endpoint = parseEndpoints(env.ENDPOINTS).get(endpointId)
+  if (!endpoint || new URL(endpoint.url).protocol !== 'https:') return bad('Monitor authentication requires an approved HTTPS destination')
+  const ref = parsed.basic.vault
+  if (!await stmt(env.DB, "SELECT id FROM vault_secrets WHERE id=? AND vault_id=? AND type='userpass'", ref.secretId, ref.vaultId).first()) return bad('Select an available user/password secret')
 }
 // Reuse jose's issuer-scoped JWKS cache across requests in this isolate. The
 // resolver retains jose's freshness and key-rotation behavior; it never stores
@@ -502,6 +524,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (current.version !== submittedVersion) throw new HttpError(409, 'This record changed. Reload and try again.')
     const candidate = body.advancedConfig
     const serialized = serializeAdvancedConfig(candidate, current.endpointId, current.expectedStatus)
+    await validateMonitorAuth(env, candidate, current.endpointId)
     let unchanged = serialized === null && current.advancedConfig === null
     if (serialized !== null && current.advancedConfig !== null) {
       try { unchanged = stableJson(candidate) === stableJson(JSON.parse(current.advancedConfig)) } catch { unchanged = false }
@@ -564,6 +587,26 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   if (route === '/admin/system-health' && method === 'GET') {
     requireRole(user, 'admin')
     return json(await getSystemHealthReport(env))
+  }
+  if (route === '/admin/actions' || route.startsWith('/admin/actions/')) {
+    requireRole(user, 'admin')
+    if (env.ACTIONS_READY !== 'true' || !actionEndpoints(env.ACTION_ENDPOINTS).size || !await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Actions are unavailable')
+    try { return await actionApi(request, env as unknown as ActionEnvironment, user, route) }
+    catch (error) {
+      if (error instanceof ActionError || error instanceof ReceiptError) throw error
+      if (error instanceof Error && error.message.includes('NOT NULL constraint failed: audit_events.details')) throw new HttpError(403, 'Identity changed; refresh and try again')
+      throw new HttpError(500, 'Action operation failed')
+    }
+  }
+  if (route === '/admin/notifications' || route.startsWith('/admin/notifications/')) {
+    requireRole(user, 'admin')
+    if (env.CHANNELS_READY !== 'true' || !channelEndpoints(env.CHANNEL_ENDPOINTS).size || !await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Notifications are unavailable')
+    try { return await channelApi(request, env as unknown as ChannelEnvironment, user, route) }
+    catch (error) {
+      if (error instanceof ChannelError || error instanceof ReceiptError) throw error
+      if (error instanceof Error && error.message.includes('NOT NULL constraint failed: audit_events.details')) throw new HttpError(403, 'Identity changed; refresh and try again')
+      throw new HttpError(500, 'Notification operation failed')
+    }
   }
   if (route === '/admin/vaults' || route.startsWith('/admin/vaults/')) {
     requireRole(user, 'admin')
@@ -697,8 +740,19 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     if (!approvedEndpoints(env).some(endpoint => endpoint.id === endpointId)) return bad('Unknown approved endpoint')
     if (!Number.isInteger(body.expectedStatus) || Number(body.expectedStatus) < 100 || Number(body.expectedStatus) > 599) return bad('Invalid expectedStatus')
     serializeAdvancedConfig(body.advancedConfig, endpointId, Number(body.expectedStatus))
+    const config = body.advancedConfig as Record<string, unknown> | null
+    let payload: unknown = { endpointId, expectedStatus: body.expectedStatus, advancedConfig: body.advancedConfig }
+    if (config?.auth !== undefined) {
+      await validateMonitorAuth(env, config, endpointId)
+      if (typeof body.checkId !== 'string' || !Number.isSafeInteger(body.checkVersion)) return bad('Save authentication settings before testing')
+      const saved = await stmt(db, 'SELECT endpoint_id,expected_status,advanced_config FROM http_checks WHERE id=? AND config_version=?', body.checkId, body.checkVersion).first<{endpoint_id:string;expected_status:number;advanced_config:string | null}>()
+      let same = false
+      try { same = !!saved && saved.endpoint_id === endpointId && saved.expected_status === body.expectedStatus && saved.advanced_config !== null && stableJson(JSON.parse(saved.advanced_config)) === stableJson(config) } catch { /* invalid stored configuration */ }
+      if (!same) throw new HttpError(409, 'Save authentication settings before testing')
+      payload = { checkId: body.checkId, checkVersion: body.checkVersion }
+    }
     if (!env.PROBE) throw new HttpError(503, 'Monitor testing is unavailable')
-    try { return await requestProbeTest(env.PROBE, { endpointId, expectedStatus: body.expectedStatus, advancedConfig: body.advancedConfig }, request.signal) }
+    try { return await requestProbeTest(env.PROBE, payload, request.signal) }
     catch (error) { if (error instanceof ProbeTestTimeout) throw new HttpError(504, 'Monitor test timed out'); throw error }
   }
   if ((route === '/admin/monitors' && method === 'POST') || (/^\/admin\/monitors\/[^/]+$/.test(route) && method === 'PATCH')) {
@@ -728,6 +782,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       if (!Number.isInteger(input.expectedStatus) || Number(input.expectedStatus) < 100 || Number(input.expectedStatus) > 599) return bad('Invalid expectedStatus')
       const advanced = input.advancedConfig ?? null
       const serialized = serializeAdvancedConfig(advanced, endpointId, Number(input.expectedStatus))
+      await validateMonitorAuth(env, advanced, endpointId)
       current = creating ? null : await stmt(db, 'SELECT * FROM http_checks WHERE component_id=?', componentId).first<StoredCheck>()
       if (current && (input.id !== current.id || input.version !== current.config_version)) throw new HttpError(409, 'This check changed. Reload and try again.')
       if (!current && (input.id !== undefined || input.version !== undefined)) throw new HttpError(409, 'This check changed. Reload and try again.')
@@ -762,7 +817,9 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now() })
   if (route === '/capabilities' && method === 'GET') {
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
-    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : [])], vault: vaultAvailable, subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+    const notificationsAvailable = vaultAvailable && env.CHANNELS_READY === 'true' && channelEndpoints(env.CHANNEL_ENDPOINTS).size > 0
+    const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
@@ -925,6 +982,8 @@ export default {
       const fallback = new URL('/',url)
       return env.ASSETS.fetch(new Request(fallback,request))
     } catch (error) {
+      if (error instanceof ActionError) return json({error:error.message},error.status)
+      if (error instanceof ChannelError) return json({error:error.message},error.status)
       if (error instanceof VaultError) return json({error:error.message},error.status)
       if (error instanceof ReceiptError) return json({error:error.message,...(error.code ? {code:error.code} : {})},error.status)
       if (error instanceof HttpError) return json({error:error.message},error.status)

@@ -71,7 +71,7 @@ let db: TestDatabase = sqlite
 let miniflare: Miniflare | undefined
 const issuer = 'https://test.cloudflareaccess.com'
 const audience = 'status-test'
-const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string; VAULT_ENCRYPTION_KEY?: string } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
+const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; CHANNELS_READY?: string; CHANNEL_ENDPOINTS?: string; ACTIONS_READY?: string; ACTION_ENDPOINTS?: string } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
 const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
@@ -97,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -116,6 +116,9 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0007_idempotency.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0008_monitor_tags.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0008_vault.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0009_monitor_auth.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0009_channels.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0009_actions.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -1340,4 +1343,81 @@ test('local vault authorizes admins, encrypts values, rotates and deletes withou
     assert.equal((await request(`${base}/${vault.id}/secrets`,adminToken)).response.status,404)
   } finally { delete env.VAULT_ENCRYPTION_KEY }
   assert.equal((await request(base,adminToken)).response.status,503)
+})
+
+test('monitor Vault Basic auth accepts only saved, authorized HTTPS references and tests the saved version', async () => {
+  const key = () => `${Date.now()}.${crypto.randomUUID()}`
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  env.MONITOR_AUTH_READY = 'true'
+  env.ENDPOINTS = JSON.stringify([{ id:'basic-target', name:'Approved', url:'https://basic.example/' }, { id:'insecure-target', name:'Insecure', url:'http://private.internal/', binding:'PRIVATE',serviceId:'private-service' }])
+  const base = '/api/v1/bsp/admin/vaults'
+  try {
+    const vault = await request(base,adminToken,'POST',{name:'monitor basic fixture'})
+    assert.equal(vault.response.status,201)
+    const vaultId = (vault.body as unknown as {id:number}).id
+    const secret = await request(`${base}/${vaultId}/secrets`,adminToken,'POST',{name:'monitor auth',type:'userpass',userpass:{username:'synthetic',password:'noncredential-value'}})
+    const secretId = (secret.body as unknown as {id:number}).id
+    assert.equal(secret.response.status,201)
+    const advanced = {method:'GET',timeoutMs:5000,attempts:1,auth:{type:'basic',basic:{vault:{vaultId,secretId}}}}
+    const body = {name:'Basic check fixture',check:{endpointId:'basic-target',enabled:false,intervalMinutes:1,expectedStatus:200,advancedConfig:advanced}}
+    assert.equal((await request('/api/v1/bsp/admin/monitors',operatorToken,'POST',body,'https://status.example',key())).response.status,403)
+    const invalid = structuredClone(body); (invalid.check.advancedConfig.auth.basic as Record<string,unknown>).password = 'must-not-store'
+    assert.equal((await request('/api/v1/bsp/admin/monitors',adminToken,'POST',invalid,'https://status.example',key())).response.status,400)
+    const insecure = structuredClone(body); insecure.check.endpointId = 'insecure-target'
+    assert.equal((await request('/api/v1/bsp/admin/monitors',adminToken,'POST',insecure,'https://status.example',key())).response.status,400)
+    const created = await request('/api/v1/bsp/admin/monitors',adminToken,'POST',body,'https://status.example',key())
+    assert.equal(created.response.status,201)
+    const alias = (created.body as unknown as {id:number}).id
+    const check = await db.prepare("SELECT h.id,h.config_version,h.advanced_config FROM http_checks h JOIN entity_aliases a ON a.entity_id=h.component_id WHERE a.entity_type='component' AND a.alias=?").bind(alias).first<{id:string;config_version:number;advanced_config:string}>()
+    assert.ok(check)
+    assert.deepEqual(JSON.parse(check.advanced_config),advanced)
+    assert.doesNotMatch(JSON.stringify((await request('/api/v1/bsp/admin/checks',adminToken)).body),/noncredential-value/)
+    const audits=await db.prepare("SELECT details FROM audit_events WHERE entity_type='check' AND entity_id=?").bind(check.id).all<{details:string}>()
+    assert.doesNotMatch(JSON.stringify(audits),/noncredential-value|synthetic/)
+    let forwarded: unknown
+    env.PROBE = { fetch: async r => { forwarded = await r.json(); return Response.json({overall:'ok',steps:[],totalMs:1}) } }
+    const test = {endpointId:'basic-target',expectedStatus:200,advancedConfig:advanced,checkId:check.id,checkVersion:check.config_version}
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',viewerToken,'POST',test)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...test,checkVersion:check.config_version+1})).response.status,409)
+    const passed = await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',test)
+    assert.equal(passed.response.status,200)
+    assert.deepEqual(forwarded,{checkId:check.id,checkVersion:check.config_version})
+    assert.doesNotMatch(JSON.stringify(forwarded),/vaultId|secretId|noncredential/)
+    await assert.rejects(db.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').bind(JSON.stringify({auth:{type:'basic',basic:{username:'not-allowed'}}}),check.id).run())
+  } finally { delete env.PROBE; delete env.VAULT_ENCRYPTION_KEY; delete env.MONITOR_AUTH_READY; env.ENDPOINTS='[]' }
+})
+
+test('notifications capability and routes require explicit readiness and an Access administrator', async () => {
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  env.CHANNEL_ENDPOINTS = JSON.stringify([{id:'sink',name:'Approved sink',url:'https://sink.example/'}])
+  try {
+    const capabilities = () => request('/api/v1/bsp/capabilities',adminToken)
+    assert.equal((await capabilities()).body.notifications,false)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',adminToken)).response.status,503)
+    env.CHANNELS_READY = 'true'
+    assert.equal((await capabilities()).body.notifications,true)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',viewerToken)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',operatorToken)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{},'https://cross-origin.example')).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',adminToken)).response.status,200)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{})).response.status,400)
+  } finally { delete env.VAULT_ENCRYPTION_KEY; delete env.CHANNEL_ENDPOINTS; delete env.CHANNELS_READY }
+})
+
+
+test('actions capability and routes require explicit readiness and an Access administrator', async () => {
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  env.ACTION_ENDPOINTS = JSON.stringify([{id:'sink',name:'Approved action',url:'https://sink.example/'}])
+  try {
+    const capabilities = () => request('/api/v1/bsp/capabilities',adminToken)
+    assert.equal((await capabilities()).body.actions,false)
+    assert.equal((await request('/api/v1/bsp/admin/actions',adminToken)).response.status,503)
+    env.ACTIONS_READY = 'true'
+    assert.equal((await capabilities()).body.actions,true)
+    assert.equal((await request('/api/v1/bsp/admin/actions',viewerToken)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/actions',operatorToken)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/actions',adminToken,'POST',{},'https://cross-origin.example')).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/actions',adminToken)).response.status,200)
+    assert.equal((await request('/api/v1/bsp/admin/actions',adminToken,'POST',{})).response.status,400)
+  } finally { delete env.VAULT_ENCRYPTION_KEY; delete env.ACTION_ENDPOINTS; delete env.ACTIONS_READY }
 })

@@ -15,6 +15,7 @@ function fixture(count = 1) {
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0002_checks.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0003_endpoint_registry.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0009_monitor_auth.sql', import.meta.url), 'utf8'))
   const now = 1_800_000_000_000
   const endpoints = []
   for (let i = 0; i < count; i++) {
@@ -36,7 +37,7 @@ function fixture(count = 1) {
       async all() { return { results: sqlite.prepare(sql).all(...params) } },
       async first() { return sqlite.prepare(sql).get(...params) ?? null },
       runSync() { return sqlite.prepare(sql).run(...params) },
-      async run() { return this.runSync() },
+      async run() { const result = this.runSync(); return { meta: { changes: Number(result.changes) } } },
     }
   }
   const db = {
@@ -327,6 +328,18 @@ test('reviewed sync validates both workers, the D1 target and private VPC bindin
   await assert.rejects(buildSyncSql(config, mismatched, 'staging'), /endpoint lists differ/)
 })
 
+test('reviewed sync validates Worker service bindings by exact service name', async () => {
+  const endpoint = { id:'test', name:'Synthetic', url:'https://test.internal/', binding:'SYNTHETIC', serviceId:'status-synthetic-staging' }
+  const config = { env:{ staging:{ vars:{ ENDPOINTS:JSON.stringify([endpoint]) }, d1_databases:[{binding:'DB',database_id:'db-1'}], services:[{binding:'SYNTHETIC',service:'status-synthetic-staging'}] } } }
+  assert.match(await buildSyncSql(config,config,'staging'),/INSERT INTO endpoint_registry/)
+  const mismatch = structuredClone(config); mismatch.env.staging.services[0]!.service = 'other'
+  await assert.rejects(buildSyncSql(config,mismatch,'staging'),/does not match/)
+  const namedEntrypoint = { env:{ staging:{ ...config.env.staging, services:[{binding:'SYNTHETIC',service:'status-synthetic-staging',entrypoint:'Other'}] } } }
+  await assert.rejects(buildSyncSql(config,namedEntrypoint,'staging'),/does not match/)
+  const ambiguous = { env:{ staging:{ ...config.env.staging, vpc_services:[{binding:'SYNTHETIC',service_id:'status-synthetic-staging'}] } } }
+  await assert.rejects(buildSyncSql(config,ambiguous,'staging'),/does not match/)
+})
+
 test('registry sync preserves unchanged checks and invalidates changed or removed endpoints', async () => {
   const { sqlite, now } = fixture()
   sqlite.prepare("UPDATE http_checks SET last_status='up',last_result_at=?,last_scheduled_at=? WHERE id='check-0'").run(now, now)
@@ -469,4 +482,190 @@ test('scheduled checks reject a total timeout budget over ten seconds before net
   assert.equal(calls, 0)
   assert.equal(sqlite.prepare('SELECT COUNT(*) AS count FROM http_check_results').get()?.count, 0)
   sqlite.close()
+})
+
+test('saved Basic Vault credentials are resolved only for the configured check and never enter results', async () => {
+  const { sqlite, now, env } = fixture()
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0008_vault.sql', import.meta.url), 'utf8'))
+  const keyHex = 'ab'.repeat(32)
+  const { vaultKeyReady } = await import('../../worker/src/vault.ts')
+  assert.equal(await vaultKeyReady(env.DB as never, keyHex), true)
+  sqlite.prepare('INSERT INTO vaults(id,name,created_at,updated_at) VALUES (1,?,?,?)').run('fixture', now, now)
+  const credential = { username: 'user-λ', password: 'synthetic-password-1' }
+  async function putCredential(data: typeof credential) {
+    const key = await crypto.subtle.importKey('raw', new Uint8Array(32).fill(0xab), 'AES-GCM', false, ['encrypt'])
+    const nonce = crypto.getRandomValues(new Uint8Array(12))
+    const bytes = await crypto.subtle.encrypt({ name:'AES-GCM', iv:nonce, additionalData:new TextEncoder().encode('status-vault-v1:1:2:userpass') }, key, new TextEncoder().encode(JSON.stringify(data)))
+    const b64 = (v: Uint8Array) => btoa(Array.from(v, b => String.fromCharCode(b)).join(''))
+    sqlite.prepare(`INSERT INTO vault_secrets(id,vault_id,name,type,ciphertext,nonce,created_at,updated_at) VALUES (2,1,'fixture','userpass',?,?,?,?) ON CONFLICT(id) DO UPDATE SET ciphertext=excluded.ciphertext,nonce=excluded.nonce`).run(b64(new Uint8Array(bytes)),b64(nonce),now,now)
+  }
+  await putCredential(credential)
+  const advanced = { method:'GET', timeoutMs:5000, attempts:1, auth:{type:'basic',basic:{vault:{vaultId:1,secretId:2}}} }
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify(advanced), 'check-0')
+  const runtime = { ...env, VAULT_ENCRYPTION_KEY:keyHex }
+  const checkVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+  const seen: string[] = []
+  globalThis.fetch = async (_url, init) => {
+    assert.equal(init?.redirect, 'manual')
+    seen.push(new Headers(init?.headers).get('authorization') ?? '')
+    return new Response('not returned in results', { status: 200 })
+  }
+  const req = (input: unknown) => new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify(input) })
+  const result = await worker.fetch(req({checkId:'check-0',checkVersion}), runtime as never)
+  const body = await result.text()
+  assert.equal(result.status,200)
+  assert.match(body,/HTTP check passed/)
+  assert.doesNotMatch(body,/synthetic-password|user-λ|not returned/)
+  await runChecks(now,runtime as never)
+  assert.equal(seen.length,2)
+  const expected = `Basic ${btoa(Array.from(new TextEncoder().encode(`${credential.username}:${credential.password}`), b => String.fromCharCode(b)).join(''))}`
+  assert.equal(seen[0], expected)
+  assert.equal(seen[1], expected)
+  assert.equal((await worker.fetch(req({endpointId:'endpoint-0',expectedStatus:200,advancedConfig:advanced}),runtime as never)).status,400)
+  assert.equal((await worker.fetch(req({checkId:'check-0',checkVersion:checkVersion+1}),runtime as never)).status,409)
+  assert.equal(seen.length,2)
+  await putCredential({ username:'rotated', password:'synthetic-password-2' })
+  await worker.fetch(req({checkId:'check-0',checkVersion}),runtime as never)
+  assert.notEqual(seen[2],seen[1])
+  sqlite.prepare('DELETE FROM vault_secrets WHERE id=2').run()
+  const missing = await worker.fetch(req({checkId:'check-0',checkVersion}),runtime as never)
+  assert.match(await missing.text(),/credential_unavailable/)
+  assert.equal(seen.length,3)
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  try {
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+    await runChecks(now + 60_000,runtime as never)
+  } finally { console.warn = originalWarn }
+  assert.deepEqual(warnings.map(value => JSON.parse(value)), [{event:'probe_credential_unavailable',checkId:'check-0'}])
+  assert.doesNotMatch(warnings.join(' '),/synthetic-password|user-λ|example\.com/)
+  assert.equal(sqlite.prepare('SELECT last_status FROM http_checks WHERE id=?').get('check-0')?.last_status,'down')
+  assert.equal(seen.length,3)
+  sqlite.close()
+})
+
+test('credentialed checks reject redirects and stale or non-HTTPS targets without disclosure', async () => {
+  const { sqlite, env, sync } = fixture()
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0008_vault.sql', import.meta.url), 'utf8'))
+  const { vaultKeyReady } = await import('../../worker/src/vault.ts')
+  const keyHex = 'ab'.repeat(32)
+  assert.equal(await vaultKeyReady(env.DB as never,keyHex),true)
+  sqlite.prepare('INSERT INTO vaults(id,name,created_at,updated_at) VALUES (1,?,?,?)').run('fixture',0,0)
+  const key = await crypto.subtle.importKey('raw',new Uint8Array(32).fill(0xab),'AES-GCM',false,['encrypt'])
+  const nonce = crypto.getRandomValues(new Uint8Array(12))
+  const encrypted = await crypto.subtle.encrypt({name:'AES-GCM',iv:nonce,additionalData:new TextEncoder().encode('status-vault-v1:1:2:userpass')},key,new TextEncoder().encode(JSON.stringify({username:'user',password:'fixture-secret'})))
+  const b64 = (v:Uint8Array) => btoa(Array.from(v,b=>String.fromCharCode(b)).join(''))
+  sqlite.prepare("INSERT INTO vault_secrets(id,vault_id,name,type,ciphertext,nonce,created_at,updated_at) VALUES (2,1,'fixture','userpass',?,?,0,0)").run(b64(new Uint8Array(encrypted)),b64(nonce))
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({auth:{type:'basic',basic:{vault:{vaultId:1,secretId:2}}}}),'check-0')
+  let calls = 0
+  globalThis.fetch = async (_url, init) => { calls++; assert.equal(init?.redirect,'manual'); return new Response(null,{status:302,headers:{location:'https://unapproved.example/'}}) }
+  const req = () => new Request('https://probe.internal/test',{method:'POST',body:JSON.stringify({checkId:'check-0',checkVersion:Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)})})
+  const runtime = { ...env, VAULT_ENCRYPTION_KEY:keyHex }
+  const redirect = await worker.fetch(req(),runtime as never)
+  const text = await redirect.text()
+  assert.match(text,/redirect_blocked/)
+  assert.doesNotMatch(text,/fixture-secret|unapproved/)
+  assert.equal(calls,1)
+  let race = true
+  const fencedDb = { ...env.DB, prepare(sql: string) {
+    if (race && sql.includes('SELECT c.advanced_config AS advanced_config')) {
+      race = false
+      sqlite.prepare('UPDATE http_checks SET config_version=config_version+1 WHERE id=?').run('check-0')
+    }
+    return env.DB.prepare(sql)
+  } }
+  const changed = await worker.fetch(req(), { ...runtime, DB:fencedDb } as never)
+  assert.match(await changed.text(),/credential_unavailable/)
+  assert.equal(calls,1)
+  sqlite.prepare('DELETE FROM endpoint_registry').run()
+  assert.equal((await worker.fetch(req(),runtime as never)).status,409)
+  assert.equal(calls,1)
+  const privateEndpoint = {id:'endpoint-0',name:'Private',url:'http://private.example/',binding:'PRIVATE',serviceId:'service'}
+  sync([privateEndpoint])
+  const privateEnv = { ...runtime, ENDPOINTS:JSON.stringify([privateEndpoint]), PRIVATE:{ fetch: async () => { calls++; return new Response() } } }
+  const notHttps = await worker.fetch(req(),privateEnv as never)
+  assert.match(await notHttps.text(),/credential_unavailable/)
+  assert.equal(calls,1)
+  sqlite.close()
+})
+
+test('scheduler sends degraded transitions to configured channels and actions', async () => {
+  const {sqlite,now,env} = fixture()
+  for (const file of ['0005_gatus_sources.sql','0008_vault.sql','0009_channels.sql','0009_actions.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`,import.meta.url),'utf8'))
+  sqlite.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
+  const checkId = '00000000-0000-4000-8000-000000000001'
+  sqlite.prepare('UPDATE http_checks SET id=?,advanced_config=? WHERE id=?').run(checkId,JSON.stringify({keyword:'ready'}),'check-0')
+  const actor={id:'admin',email:'admin@example.test',version:1}, key='ab'.repeat(32)
+  const req=(body:unknown)=>new Request('https://status.example/',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
+  const {vaultApi}=await import('../../worker/src/vault.ts')
+  const {channelApi}=await import('../../worker/src/channels.ts')
+  const {actionApi}=await import('../../worker/src/actions.ts')
+  const vault=await (await vaultApi(req({name:'fixture'}),env.DB as never,key,actor,'/admin/vaults')).json() as {id:number}
+  const secret=await (await vaultApi(req({name:'fixture',type:'value',value:'synthetic-token'}),env.DB as never,key,actor,`/admin/vaults/${vault.id}/secrets`)).json() as {id:number}
+  const destinations=JSON.stringify([{id:'sink',name:'Fixture',url:'https://sink.internal/',binding:'SINK',serviceId:'sink-worker'}])
+  const bodies: unknown[]=[]
+  const runtime={...env,VAULT_ENCRYPTION_KEY:key,CHANNELS_READY:'true',CHANNEL_ENDPOINTS:destinations,ACTIONS_READY:'true',ACTION_ENDPOINTS:destinations,SINK:{fetch:async (_url:string,init:RequestInit)=>{bodies.push(JSON.parse(String(init.body))); return new Response(null,{status:200})}}}
+  const common={endpointId:'sink',vaultId:vault.id,secretId:secret.id,enabled:true,checkIds:[checkId]}
+  assert.equal((await channelApi(req({...common,name:'Channel'}),runtime as never,actor,'/admin/notifications/channels')).status,201)
+  assert.equal((await actionApi(req({...common,name:'Action',triggerStatus:'degraded'}),runtime as never,actor,'/admin/actions')).status,201)
+  globalThis.fetch = async () => new Response('ready',{status:200})
+  await runChecks(now,runtime as never)
+  globalThis.fetch = async () => new Response('absent',{status:200})
+  await runChecks(now+60_000,runtime as never)
+  assert.equal(bodies.length,2)
+  assert.deepEqual(bodies.map(body => (body as {status:string}).status),['degraded','degraded'])
+  assert.doesNotMatch(JSON.stringify(bodies),/synthetic-token/)
+
+  // A resolver failure is an internal fault, not an event suitable for automation.
+  // Its first healthy observation establishes a fresh baseline without a false recovery.
+  const login=await (await vaultApi(req({name:'login',type:'userpass',userpass:{username:'fixture',password:'synthetic-password'}}),env.DB as never,key,actor,`/admin/vaults/${vault.id}/secrets`)).json() as {id:number}
+  sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({keyword:'ready',auth:{type:'basic',basic:{vault:{vaultId:vault.id,secretId:login.id}}}}),checkId)
+  sqlite.prepare("UPDATE http_checks SET last_status='up',last_effective_status='up',last_scheduled_at=?,last_effective_scheduled_at=? WHERE id=?").run(now+60_000,now+60_000,checkId)
+  let monitoredCalls=0
+  globalThis.fetch = async () => { monitoredCalls++; return new Response('ready',{status:200}) }
+  await runChecks(now+120_000,{...runtime,VAULT_ENCRYPTION_KEY:'cd'.repeat(32)} as never)
+  assert.equal(monitoredCalls,0)
+  assert.equal(bodies.length,2)
+  assert.deepEqual({...sqlite.prepare('SELECT last_status,transition_suppressed FROM http_checks WHERE id=?').get(checkId)},{last_status:'down',transition_suppressed:1})
+  await runChecks(now+180_000,runtime as never)
+  assert.equal(monitoredCalls,1)
+  assert.equal(bodies.length,2)
+  assert.deepEqual({...sqlite.prepare('SELECT last_status,transition_suppressed FROM http_checks WHERE id=?').get(checkId)},{last_status:'up',transition_suppressed:0})
+  globalThis.fetch = async () => { monitoredCalls++; return new Response('absent',{status:200}) }
+  await runChecks(now+240_000,runtime as never)
+  assert.equal(bodies.length,4)
+  assert.deepEqual(bodies.slice(2).map(body => (body as {status:string}).status),['degraded','degraded'])
+
+  const failingDb={...env.DB,prepare(sql:string) {
+    if (sql.includes('SELECT c.advanced_config AS advanced_config')) throw new Error('internal database details')
+    return env.DB.prepare(sql)
+  }}
+  const before=monitoredCalls, warnings:string[]=[]
+  const originalWarn=console.warn
+  try {
+    console.warn=(...args:unknown[]) => { warnings.push(args.map(String).join(' ')) }
+    await runChecks(now+300_000,{...runtime,DB:failingDb} as never)
+  } finally { console.warn=originalWarn }
+  assert.deepEqual(warnings.map(value => JSON.parse(value)),[{event:'probe_credential_unavailable',checkId}])
+  assert.doesNotMatch(warnings.join(' '),/internal database details|synthetic-password|synthetic-token/)
+  assert.equal(monitoredCalls,before)
+  assert.equal(bodies.length,4)
+  assert.equal(sqlite.prepare('SELECT transition_suppressed FROM http_checks WHERE id=?').get(checkId)?.transition_suppressed,1)
+  globalThis.fetch = async () => { monitoredCalls++; return new Response('ready',{status:200}) }
+  await runChecks(now+360_000,runtime as never)
+  assert.equal(bodies.length,4)
+  assert.equal(sqlite.prepare('SELECT transition_suppressed FROM http_checks WHERE id=?').get(checkId)?.transition_suppressed,0)
+  sqlite.close()
+})
+
+test('enabled delivery without its schema rolls back the check result rather than dropping the transition', async () => {
+  for (const kind of ['channel','action'] as const) {
+    const {sqlite,now,env}=fixture()
+    globalThis.fetch=async()=>new Response(null,{status:200})
+    const configured=kind==='channel' ? {CHANNELS_READY:'true',CHANNEL_ENDPOINTS:'[]'} : {ACTIONS_READY:'true',ACTION_ENDPOINTS:'[]'}
+    await assert.rejects(runChecks(now,{...env,...configured} as never),/no such table/)
+    assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM http_check_results').get()?.n,0)
+    assert.equal(sqlite.prepare('SELECT last_status FROM http_checks WHERE id=?').get('check-0')?.last_status,null)
+    sqlite.close()
+  }
 })

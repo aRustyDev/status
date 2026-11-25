@@ -12,8 +12,23 @@ export type HttpAssertion =
   | { type: 'header'; name: string; op: 'exists' | 'not-exists' | 'equals' | 'not-equals' | 'contains'; value?: string; onFail?: 'down' | 'degraded' }
   | { type: 'json'; path: string; op: 'exists' | 'equals' | 'not-equals' | 'contains' | 'lt' | 'gt'; value?: string | number; onFail?: 'down' | 'degraded' }
 export type StatusRange = { min: number; max: number }
+export type VaultBasicAuth = { type: 'basic'; basic: { vault: { vaultId: number; secretId: number } } }
+
+/** Only Vault references are persisted; credential values are never configuration. */
+export function parseVaultBasicAuth(value: unknown): VaultBasicAuth | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const a = value as Record<string, unknown>
+  if (Object.keys(a).some(k => !['type', 'basic'].includes(k)) || a.type !== 'basic' || !a.basic || typeof a.basic !== 'object' || Array.isArray(a.basic)) return null
+  const b = a.basic as Record<string, unknown>
+  if (Object.keys(b).some(k => k !== 'vault') || !b.vault || typeof b.vault !== 'object' || Array.isArray(b.vault)) return null
+  const v = b.vault as Record<string, unknown>
+  if (Object.keys(v).some(k => !['vaultId', 'secretId'].includes(k)) || !Number.isSafeInteger(v.vaultId) || Number(v.vaultId) < 1 || !Number.isSafeInteger(v.secretId) || Number(v.secretId) < 1) return null
+  return { type: 'basic', basic: { vault: { vaultId: Number(v.vaultId), secretId: Number(v.secretId) } } }
+}
+
 export type HttpMonitorConfig = {
   endpointId: string
+  auth?: VaultBasicAuth
   /** Fingerprint of this endpoint from the deployment-controlled D1 registry. */
   registryFingerprint: string
   /** Valid methods are case-insensitive; sent in upper case. */
@@ -47,7 +62,7 @@ const MAX_BODY = 1024 * 1024
 const MAX_REQUEST_BODY = 64 * 1024
 const MAX_ASSERTIONS = 20
 const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/
-const CONFIG_FIELDS = new Set(['endpointId', 'registryFingerprint', 'method', 'expectedStatus', 'acceptedStatusRanges', 'headers', 'body', 'keyword', 'assertions', 'degradedAboveMs', 'timeoutMs', 'attempts'])
+const CONFIG_FIELDS = new Set(['endpointId', 'registryFingerprint', 'method', 'expectedStatus', 'acceptedStatusRanges', 'headers', 'body', 'keyword', 'assertions', 'degradedAboveMs', 'timeoutMs', 'attempts', 'auth'])
 const FORBIDDEN_HEADERS = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'upgrade', 'proxy-authorization'])
 const CODES = { invalid: 'invalid_configuration', unapproved: 'unapproved_destination', stale: 'destination_fingerprint_mismatch', network: 'request_failed', timeout: 'request_timeout' } as const
 
@@ -63,6 +78,7 @@ export function isBlockedRedirect(response: Response): boolean {
 }
 function validate(config: HttpMonitorConfig): boolean {
   if (!config || typeof config !== 'object' || Array.isArray(config) || Object.keys(config).some(key => !CONFIG_FIELDS.has(key)) || typeof config.endpointId !== 'string' || !config.endpointId || typeof config.registryFingerprint !== 'string') return false
+  if (config.auth !== undefined && !parseVaultBasicAuth(config.auth)) return false
   if (config.method !== undefined && (typeof config.method !== 'string' || !['GET', 'POST', 'HEAD'].includes(config.method.toUpperCase()))) return false
   if (config.expectedStatus !== undefined && !validStatus(config.expectedStatus)) return false
   if (config.expectedStatus !== undefined && config.acceptedStatusRanges !== undefined) return false
@@ -107,7 +123,7 @@ function validAssertion(assertion: HttpAssertion): boolean {
 export function parsePersistedHttpConfig(value: unknown, endpointId: string, registryFingerprint: string, expectedStatus: number): HttpMonitorConfig | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const config = value as Record<string, unknown>
-  const allowed = ['method', 'acceptedStatusRanges', 'keyword', 'assertions', 'timeoutMs', 'attempts', 'degradedAboveMs']
+  const allowed = ['method', 'acceptedStatusRanges', 'keyword', 'assertions', 'timeoutMs', 'attempts', 'degradedAboveMs', 'auth']
   if (Object.keys(config).some(key => !allowed.includes(key))) return null
   if (config.method !== undefined && (typeof config.method !== 'string' || !['GET', 'HEAD'].includes(config.method.toUpperCase()))) return null
   if (Array.isArray(config.acceptedStatusRanges) && config.acceptedStatusRanges.some(range => !range || typeof range !== 'object' || Array.isArray(range) || Object.keys(range).some(key => !['min', 'max'].includes(key)))) return null
