@@ -141,6 +141,35 @@ test('fails closed on an unavailable export and malformed backup identifiers', a
   await assert.rejects(finishExport(env,id,'checkpoint'), error => error instanceof Error && error.message === 'D1 export is unavailable')
 })
 
+test('rejects missing or malformed manifests and never serves an incomplete export', async () => {
+  const { env, bucket } = fixture()
+  await bucket.put(`exports/${id}.sql`, 'SELECT 1;')
+  assert.equal((await backupService(request(`/backups/${id}/verify`), env)).status, 404)
+  assert.equal((await backupService(request(`/backups/${id}/download`), env)).status, 404)
+
+  await bucket.put(`exports/${id}.json`, JSON.stringify({ id, createdAt: Date.now(), size: 9, sha256: 'invalid' }))
+  assert.equal((await backupService(request(`/backups/${id}/verify`), env)).status, 404)
+  assert.equal((await backupService(request(`/backups/${id}/download`), env)).status, 404)
+})
+
+test('reports failed and unavailable workflows without presenting a completed backup', async () => {
+  const { env, bucket } = fixture()
+  const failedId = 'b'.repeat(64)
+  const unavailableId = 'c'.repeat(64)
+  const reverse = String(9_999_999_999_999 - Number(createdAt)).padStart(13, '0')
+  await bucket.put(`jobs/${reverse}-${failedId}.json`, '{}')
+  await bucket.put(`jobs/${reverse}-${unavailableId}.json`, '{}')
+  env.BACKUP_WORKFLOW = {
+    get: async (jobId: string) => {
+      if (jobId === unavailableId) throw new Error('workflow service unavailable')
+      return { status: async () => ({ status: 'errored' }) }
+    },
+  } as unknown as BackupEnv['BACKUP_WORKFLOW']
+  const result = await (await backupService(request('/backups'), env)).json() as { backups: Array<{ id: string; state: string }> }
+  assert.deepEqual(result.backups.map(row => [row.id, row.state]), [[failedId, 'failed'], [unavailableId, 'unavailable']])
+  assert.equal((await backupService(request(`/backups/${failedId}/download`), env)).status, 404)
+})
+
 test('does not follow redirects from the signed export URL', async () => {
   const { env } = fixture()
   globalThis.fetch = async (input, init) => {
