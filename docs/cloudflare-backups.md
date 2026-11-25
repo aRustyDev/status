@@ -14,15 +14,24 @@ Backups contain application data, including identities and unpublished incidents
 
 ## Isolated recovery test
 
-Never test restoration against the active staging or production database. Create a new, explicitly named D1 database with no application or probe bindings and confirm its account, ID and empty state. The following commands are examples: substitute the verified database name and the protected local SQL path, and do not include secrets in command arguments.
+Never test restoration against the active staging or production database. Create a new, explicitly named D1 database with no application or probe bindings. Record its account ID, database name and database ID independently, and confirm that it is empty. The commands below are examples: substitute the verified database name and protected local SQL path, and do not include secrets in command arguments.
+
+Before running the import, select the intended Cloudflare account and use the same Wrangler profile, configuration and environment for both the preflight and import. Inspect the effective configuration: its `account_id`, if set, takes precedence over `CLOUDFLARE_ACCOUNT_ID` and must match the recorded account ID. Otherwise set `CLOUDFLARE_ACCOUNT_ID` to the verified ID and check its value. `whoami` lists accessible accounts and does not by itself prove which one is selected. Inspect the account and database information:
 
 ```sh
-npx wrangler d1 create status-backup-restore-test
+npx wrangler whoami
 npx wrangler d1 info status-backup-restore-test
+```
+
+**Stop before importing.** A human must separately compare and explicitly confirm the selected account ID and the database ID and name returned by `d1 info` against the independently recorded isolated target. Abort on any mismatch or uncertainty; never use a live database as the test target. Keep the same account, profile, configuration, environment and database name for the import. Wrangler's import prompt only warns about availability; it does not confirm the target identity and may be skipped in noninteractive execution.
+
+Only after that confirmation, import and check the isolated database:
+
+```sh
 npx wrangler d1 execute status-backup-restore-test --remote --file /secure/path/status-backup.sql
 npx wrangler d1 execute status-backup-restore-test --remote --command "PRAGMA quick_check"
 ```
 
-`d1 execute --file` imports into the named target. Confirm its identity at the interactive prompt; never use a live database as the test target. Check the integrity result, schema migrations, and representative row counts against the source snapshot. Keep this database isolated: imported schedules and check settings must not be connected to a running probe. Treat the SQL file and test database as sensitive and use the organization's approved retention and disposal process.
+`d1 execute --file` imports into the named target. Check the integrity result, schema migrations, and representative row counts against the source snapshot. Keep this database isolated: imported schedules and check settings must not be connected to a running probe. Treat the SQL file and test database as sensitive and use the organization's approved retention and disposal process.
 
-For real recovery, stop and drain writers and probes, verify and record the target identity and existing Time Travel bookmark, and follow the organization's approved recovery process. Import/restore can overwrite data and cancel or disrupt live work; use explicit human confirmation at the destructive operation. D1 Time Travel restores in place and cannot currently clone a database to an isolated target. See [D1 import/export](https://developers.cloudflare.com/d1/best-practices/import-export-data/) and [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/).
+For real recovery, stop and drain writers and probes, verify and record the intended account ID, database ID, name and existing Time Travel bookmark, and follow the organization's approved recovery process. Before the destructive operation, a human must separately compare and explicitly confirm the selected account ID and the target database ID and name against those records, using the same account, profile, configuration and environment as the operation. Abort on mismatch or uncertainty; do not rely on Wrangler's generic prompt or noninteractive execution as confirmation. Import/restore can overwrite data and cancel or disrupt live work. D1 Time Travel restores in place and cannot currently clone a database to an isolated target. See [D1 import/export](https://developers.cloudflare.com/d1/best-practices/import-export-data/) and [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/).
