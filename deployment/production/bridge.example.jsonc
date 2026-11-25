@@ -1,0 +1,26 @@
+{
+  "account_id": "REPLACE_ACCOUNT_ID",
+  "compatibility_date": "2026-11-25",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": false
+    }
+  },
+  "name": "REPLACE_BRIDGE_WORKER_NAME",
+  "main": "../../apps/gateway/private-bridge/worker.ts",
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "REPLACE_ACCESS_TEAM_DOMAIN",
+    "ACCESS_AUD": "REPLACE_PRIVATE_ACCESS_AUDIENCE",
+    "PRIVATE_ORIGIN": "http://REPLACE_PRIVATE_HOST.woven"
+  },
+  "services": [
+    {
+      "binding": "FALLBACK",
+      "service": "REPLACE_FALLBACK_WORKER_NAME"
+    }
+  ],
+  "routes": []
+}

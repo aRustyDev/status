@@ -1,0 +1,32 @@
+{
+  "account_id": "REPLACE_ACCOUNT_ID",
+  "compatibility_date": "2026-11-23",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": false
+    }
+  },
+  "name": "REPLACE_PROBE_WORKER_NAME",
+  "main": "../../apps/probe/src/index.ts",
+  "triggers": {
+    "crons": []
+  },
+  "vars": {
+    "ENDPOINTS": "[]",
+    "CHANNELS_READY": "false",
+    "ACTIONS_READY": "false",
+    "MONITOR_AUTH_READY": "false"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "status-board-production",
+      "database_id": "REPLACE_PRODUCTION_D1_ID",
+      "migrations_dir": "../../apps/worker/migrations"
+    }
+  ],
+  "vpc_services": []
+}
