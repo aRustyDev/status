@@ -286,7 +286,7 @@ async function listMaintenance(db: D1Database, admin: boolean): Promise<Json[]> 
 }
 async function listComponents(db: D1Database, incidents: Json[], maintenance: Json[], env: Env): Promise<Json[]> {
   const rows = await db.prepare(`SELECT c.*, h.endpoint_id, h.enabled AS check_enabled, h.last_status, h.last_effective_status, h.last_effective_scheduled_at, h.last_scheduled_at, h.last_result_at,
-    h.interval_minutes, r.fingerprint AS registered_fingerprint, g.source_id, g.kind AS source_kind,
+    h.interval_minutes, h.dependency_affected, h.dependency_causes, h.dependency_scheduled_at, r.fingerprint AS registered_fingerprint, g.source_id, g.kind AS source_kind,
     g.source_key, g.source_name, g.source_group, g.stale_after_seconds, g.advisory
     FROM components c LEFT JOIN http_checks h ON h.component_id=c.id
     LEFT JOIN endpoint_registry r ON r.endpoint_id=h.endpoint_id
@@ -304,7 +304,7 @@ async function listComponents(db: D1Database, incidents: Json[], maintenance: Js
   const gatusById = new Map(gatus?.monitors.map(monitor => [monitor.sourceId, monitor]) ?? [])
   const configured = parseEndpoints(env.ENDPOINTS)
   const fingerprints = new Map(await Promise.all([...configured].map(async ([id, endpoint]) => [id, await endpointFingerprint(endpoint)] as const)))
-  const severity: Record<string, number> = { operational: 0, unknown: 1, degraded: 2, down: 3 }
+  const severity: Record<string, number> = { operational: 0, unknown: 1, affected: 1.5, degraded: 2, down: 3 }
   return rows.results.map(row => {
     let state = String(row.manual_status)
     let checkStatus: string | null = null
@@ -318,7 +318,7 @@ async function listComponents(db: D1Database, incidents: Json[], maintenance: Js
     if (row.check_enabled) {
       const stale = !matches || !row.last_result_at || Date.now() - Number(row.last_result_at) > Number(row.interval_minutes) * 180_000
       const effective = row.last_effective_scheduled_at != null && row.last_effective_scheduled_at === row.last_scheduled_at ? row.last_effective_status ?? row.last_status : row.last_status
-      checkStatus = stale ? 'unknown' : effective === 'up' ? 'operational' : effective === 'degraded' ? 'degraded' : 'down'
+      checkStatus = stale ? 'unknown' : row.dependency_affected && row.dependency_scheduled_at === row.last_scheduled_at ? 'affected' : effective === 'up' ? 'operational' : effective === 'degraded' ? 'degraded' : 'down'
       if (severity[checkStatus] > severity[state]) state = checkStatus
     }
     for (const incident of incidents) {
@@ -327,7 +327,7 @@ async function listComponents(db: D1Database, incidents: Json[], maintenance: Js
       if (severity[impact] > severity[state]) state = impact
     }
     const underMaintenance = maintenance.some(window => window.state === 'active' && (!(window.componentIds as string[]).length || (window.componentIds as string[]).includes(String(row.id))))
-    return { id: row.id, name: row.name, position: row.position, manualStatus: row.manual_status, tags: isGatus ? [] : JSON.parse(String(row.tags)), status: state, checkStatus, lastCheckedAt: isGatus ? source?.lastCheckedAt ?? null : matches ? row.last_result_at ?? null : null, underMaintenance, version: row.version, ...(isGatus ? { source: 'gatus', group: row.source_group } : {}) }
+    return { id: row.id, name: row.name, position: row.position, manualStatus: row.manual_status, tags: isGatus ? [] : JSON.parse(String(row.tags)), status: state, checkStatus, lastCheckedAt: isGatus ? source?.lastCheckedAt ?? null : matches ? row.last_result_at ?? null : null, underMaintenance, version: row.version, ...(checkStatus === 'affected' ? { dependencyCauses: JSON.parse(String(row.dependency_causes)) } : {}), ...(isGatus ? { source: 'gatus', group: row.source_group } : {}) }
   })
 }
 
@@ -733,6 +733,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const endpoints = admin ? parseEndpoints(env.ENDPOINTS) : new Map()
     const alertLinks = admin && user.role === 'admin'
       ? (await db.prepare('SELECT component_id,channel_id FROM monitor_notification_channels ORDER BY channel_id').all<{component_id:string;channel_id:string}>()).results : []
+    const dependencyLinks = admin && user.role === 'admin'
+      ? (await db.prepare('SELECT dependent_id,depends_on_id FROM monitor_dependencies ORDER BY depends_on_id').all<{dependent_id:string;depends_on_id:string}>()).results : []
     const now = Date.now()
     return Promise.all(components.map(async component => {
       const check = admin && component.source !== 'gatus' ? await stmt(db, 'SELECT endpoint_id, interval_minutes FROM http_checks WHERE component_id=?', component.id)
@@ -760,6 +762,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
         config: { url: check ? endpoints.get(check.endpoint_id)?.name ?? '' : '' },
         tags: component.tags,
         ...(admin && user.role === 'admin' ? { channelIds: alertLinks.filter(link => link.component_id === component.id).map(link => link.channel_id) } : {}),
+        ...(component.status === 'affected' ? { dependencyCauses: component.dependencyCauses } : {}),
+        ...(admin && user.role === 'admin' ? { dependsOnIds: dependencyLinks.filter(link => link.dependent_id === component.id).map(link => numberId('component', link.depends_on_id)) } : {}),
         group: component.source === 'gatus' ? component.group : null,
         activity: { maintenance: component.underMaintenance, windows: [], incident: null },
         health: {
@@ -839,6 +843,13 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
         if (body.expectedChannelIds !== undefined) return bad('Invalid alert channels')
       } else expectedChannelIds = channelArray(body.expectedChannelIds)
     } else if (body.expectedChannelIds !== undefined) return bad('Invalid alert channels')
+    let dependencyIds: string[] | undefined
+    if (body.dependsOnIds !== undefined) {
+      requireRole(user, 'admin')
+      if (!Array.isArray(body.dependsOnIds) || body.dependsOnIds.length > 100 || body.dependsOnIds.some(value => !Number.isSafeInteger(value) || Number(value) < 1) || new Set(body.dependsOnIds).size !== body.dependsOnIds.length) return bad('Invalid dependencies')
+      dependencyIds = body.dependsOnIds.map(value => uuidId('component', value))
+      if (dependencyIds.includes(componentId)) return bad('A monitor cannot depend on itself')
+    }
     const check = body.check
     type StoredCheck = { id: string; endpoint_id: string; enabled: number; interval_minutes: number; expected_status: number; config_version: number; advanced_config: string | null }
     let current: StoredCheck | null = null
@@ -867,6 +878,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const channelGuard = channelIds === undefined ? '' : ` AND EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?)
       AND (SELECT COUNT(*) FROM notification_channels WHERE id IN (SELECT value FROM json_each(?)))=?`
     const channelGuardValues = channelIds === undefined ? [] : [user.id, user.version, selectedJson, channelIds.length]
+    const dependencyGuard = dependencyIds === undefined ? '' : ` AND EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?)`
+    const dependencyGuardValues = dependencyIds === undefined ? [] : [user.id, user.version]
     const snapshotGuard = expectedChannelIds === undefined ? '' : ` AND NOT EXISTS (SELECT 1 FROM monitor_notification_channels WHERE component_id=components.id AND channel_id NOT IN (SELECT value FROM json_each(?)))
       AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE value NOT IN (SELECT channel_id FROM monitor_notification_channels WHERE component_id=components.id))`
     const snapshotValues = expectedChannelIds === undefined ? [] : [expectedJson, expectedJson]
@@ -874,8 +887,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       db.prepare('DELETE FROM mutation_receipts WHERE rowid IN (SELECT rowid FROM mutation_receipts WHERE expires_at<=? LIMIT 100)').bind(Date.now()),
       receiptClaim(db, receipt, token),
     ]
-    if (creating) operations.push(stmt(db, `INSERT INTO components (id,name,position,manual_status,updated_at,mutation_key,tags) SELECT ?,?,?,?,?,?,? WHERE 1=1${channelGuard}`, componentId, name, position, manualStatus, Date.now(), token, tags, ...channelGuardValues))
-    else operations.push(stmt(db, `UPDATE components SET name=?,manual_status=?,position=?,updated_at=?,version=version+1,mutation_key=?,tags=COALESCE(?,tags) WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=components.id)${checkGuard}${channelGuard}${snapshotGuard}`, name, manualStatus, position, Date.now(), token, tags, componentId, componentVersion, ...guardValues, ...channelGuardValues, ...snapshotValues))
+    if (creating) operations.push(stmt(db, `INSERT INTO components (id,name,position,manual_status,updated_at,mutation_key,tags) SELECT ?,?,?,?,?,?,? WHERE 1=1${channelGuard}${dependencyGuard}`, componentId, name, position, manualStatus, Date.now(), token, tags, ...channelGuardValues, ...dependencyGuardValues))
+    else operations.push(stmt(db, `UPDATE components SET name=?,manual_status=?,position=?,updated_at=?,version=version+1,mutation_key=?,tags=COALESCE(?,tags) WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=components.id)${checkGuard}${channelGuard}${dependencyGuard}${snapshotGuard}`, name, manualStatus, position, Date.now(), token, tags, componentId, componentVersion, ...guardValues, ...channelGuardValues, ...dependencyGuardValues, ...snapshotValues))
     if (checkData && checkData.changed) {
       if (!current) operations.push(stmt(db, `INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,advanced_config) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.id, componentId, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, componentId, token))
       // The advanced-config trigger increments when its value changes. Increment here only
@@ -887,11 +900,16 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       operations.push(stmt(db, `DELETE FROM monitor_notification_channels WHERE component_id=? AND channel_id NOT IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, componentId, selectedJson, componentId, token))
       operations.push(stmt(db, `INSERT OR IGNORE INTO monitor_notification_channels (component_id,channel_id) SELECT ?,value FROM json_each(?) WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, componentId, selectedJson, componentId, token))
     }
+    if (dependencyIds !== undefined) {
+      operations.push(stmt(db, `DELETE FROM monitor_dependencies WHERE dependent_id=? AND EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, componentId, componentId, token))
+      for (const dependencyId of dependencyIds) operations.push(stmt(db, `INSERT INTO monitor_dependencies (dependent_id,depends_on_id) SELECT ?,? WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, componentId, dependencyId, componentId, token))
+    }
     operations.push(audit(db, user, creating ? 'create' : 'update', 'component', componentId, { name, status: manualStatus, position }, { table: 'components', token }))
     operations.push(receiptFinish(db, receipt, token, creating ? 201 : 200, componentId, componentVersion + 1, 'SELECT 1 FROM components WHERE id=? AND mutation_key=?', [componentId, token], 'component'))
     try { await db.batch(operations) } catch (error) {
       const replay = await findReceipt(db, receipt)
       if (replay) return json({ id: replay.result_alias, version: replay.result_version }, replay.status)
+      if (error instanceof Error && (error.message.includes('monitor dependency cycle') || error.message.includes('invalid monitor dependency'))) throw new HttpError(400, error.message.includes('cycle') ? 'Dependency cycle' : 'Invalid dependency')
       if (error instanceof Error && error.message.includes('NOT NULL constraint failed: mutation_receipts.status')) throw new HttpError(409, 'This record changed. Reload and try again.')
       throw error
     }
@@ -904,14 +922,16 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
     const notificationsAvailable = await notificationsReady(env)
     const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
-    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
   if (method === 'GET' && route === '/public/access') return json({ private: true, signedIn: true, email: user.email, role: user.role, passwordChangeRequired: false, branding: null })
   if (method === 'GET' && route === '/public/status') {
     const [items, incidentList, windows] = await Promise.all([monitors(), incidents(false), maintenance(false)])
-    return json({ branding: null, monitors: items, activeIncidents: incidentList.filter(item => item.status !== 'resolved'), activeMaintenanceWindows: windows.filter(item => item.state === 'active'), monitorDependencies: [] })
+    const visible = new Map(items.map(item => [item.uuid, item.id]))
+    const monitorDependencies = items.flatMap(item => item.currentStatus === 'affected' && Array.isArray(item.dependencyCauses) ? item.dependencyCauses.flatMap((cause: unknown) => typeof cause === 'string' && visible.has(cause) ? [{ dependentId: item.id, dependsOnId: visible.get(cause) }] : []) : [])
+    return json({ branding: null, monitors: items, activeIncidents: incidentList.filter(item => item.status !== 'resolved'), activeMaintenanceWindows: windows.filter(item => item.state === 'active'), monitorDependencies })
   }
   if (method === 'GET' && route === '/public/layout') {
     const items = await monitors()

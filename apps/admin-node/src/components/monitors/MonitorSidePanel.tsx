@@ -207,7 +207,8 @@ export function ActionsSection({ actions, links, onChange }: {
 
 // ── Dependencies ──────────────────────────────────────────────────────────────
 
-export function DependenciesSection({ monitors, selected, onChange }: {
+export function DependenciesSection({ monitors, selected, onChange, cloudflare = false }: {
+  cloudflare?: boolean
   /** Candidate upstream monitors, already excluding the one being edited. */
   monitors: { id: number; name: string }[]
   selected: Set<number>
@@ -216,7 +217,7 @@ export function DependenciesSection({ monitors, selected, onChange }: {
   return (
     <div className="space-y-3">
       <Note tone="info">
-        If a selected dependency goes <strong>down</strong>, this monitor will show <strong>Affected</strong> instead of Down — suppressing duplicate alerts for the same root cause.
+        {cloudflare ? <>When a selected dependency has a fresh failed or degraded check, this monitor shows <strong>Dependency Issue</strong> and suppresses duplicate alerts. Unavailable or stale checks do not suppress alerts.</> : <>If a selected dependency goes <strong>down</strong>, this monitor will show <strong>Affected</strong> instead of Down — suppressing duplicate alerts for the same root cause.</>}
       </Note>
       <div className="space-y-1.5">
         {monitors.length === 0 && (

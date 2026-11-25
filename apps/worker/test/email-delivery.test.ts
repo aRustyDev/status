@@ -31,13 +31,13 @@ const destinationConfig = JSON.stringify([{ id: 'ops', name: 'Operations', addre
 type EmailMessage = { from: string; to: string; subject: string; text: string; html: string }
 async function fixture(send?: (message: EmailMessage) => Promise<unknown>) {
   const local = new Database()
-  for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_actions.sql', '0009_channels.sql', '0010_notification_transition_state.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql']) {
+  for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_actions.sql', '0009_channels.sql', '0010_notification_transition_state.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql']) {
     local.sqlite.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
   }
   local.sqlite.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Checkout <API>',0)").run()
   local.sqlite.prepare("INSERT INTO endpoint_registry VALUES ('check','approved')").run()
   local.sqlite.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at) VALUES (?,'component','check',1,1,200,'up',1)").run(check)
-  local.sqlite.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'up')").run(check)
+  local.sqlite.prepare("INSERT INTO notification_transition_state (check_id,check_version,status) VALUES (?,1,'up')").run(check)
   const fingerprint = await emailChannelFingerprint('status@example.test', 'ops@example.test')
   local.sqlite.prepare(`INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,version,created_at,updated_at,channel_type,recipient_id,email_fingerprint)
     VALUES ('email','Operations','','',0,0,1,1,0,0,'email','ops',?)`).run(fingerprint)
@@ -51,7 +51,7 @@ async function fixture(send?: (message: EmailMessage) => Promise<unknown>) {
       db.prepare('INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,?,?,?,?,?,1)').bind(check,scheduled,scheduled,status,status,status==='up'?200:500),
       enqueueTransition(db,check,1,'approved',scheduled,status),
       db.prepare('UPDATE http_checks SET last_status=?,last_scheduled_at=?,last_effective_status=?,last_effective_scheduled_at=? WHERE id=?').bind(status,scheduled,status,scheduled,check),
-      db.prepare('UPDATE automation_transition_state SET status=?,generation=generation+1 WHERE check_id=?').bind(status,check),
+      db.prepare('UPDATE notification_transition_state SET status=?,generation=generation+1 WHERE check_id=?').bind(status,check),
     ])
   }
   return { local, db, env, calls, transition }
@@ -184,7 +184,7 @@ test('Workerd D1 serializes concurrent email claims and persists the result', { 
   const runtime = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
   try {
     const db = await runtime.getD1Database('DB') as D1Database
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_actions.sql', '0009_channels.sql', '0010_notification_transition_state.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_actions.sql', '0009_channels.sql', '0010_notification_transition_state.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -196,13 +196,13 @@ test('Workerd D1 serializes concurrent email claims and persists the result', { 
       db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Checkout',0)"),
       db.prepare("INSERT INTO endpoint_registry VALUES ('check','approved')"),
       db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at) VALUES (?,'component','check',1,1,200,'up',1)").bind(check),
-      db.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'up')").bind(check),
+      db.prepare("INSERT INTO notification_transition_state (check_id,check_version,status) VALUES (?,1,'up')").bind(check),
       db.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,version,created_at,updated_at,channel_type,recipient_id,email_fingerprint) VALUES ('email','Operations','','',0,0,1,1,0,0,'email','ops',?)").bind(fingerprint),
       db.prepare("INSERT INTO notification_channel_checks (channel_id,check_id) VALUES ('email',?)").bind(check),
       db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,100,100,'down','down',500,1)").bind(check),
       enqueueTransition(db,check,1,'approved',100,'down'),
       db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100,last_effective_status='down',last_effective_scheduled_at=100 WHERE id=?").bind(check),
-      db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(check),
+      db.prepare("UPDATE notification_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(check),
     ])
     let calls = 0
     const binding = { send: async () => { calls++; return { messageId: 'accepted' } } } as unknown as SendEmail

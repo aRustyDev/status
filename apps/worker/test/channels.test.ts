@@ -29,12 +29,12 @@ const request=(method:string,body?:unknown)=>new Request('https://status.example
 
 async function setup() {
   const local=new DB()
-  for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+  for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
   local.db.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
   local.db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Test monitor',0)").run()
   local.db.prepare("INSERT INTO endpoint_registry VALUES ('check','approved')").run()
   local.db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at) VALUES (?,'component','check',1,1,200,'up',1)").run(checkId)
-  local.db.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'up')").run(checkId)
+  local.db.prepare("INSERT INTO notification_transition_state (check_id,check_version,status) VALUES (?,1,'up')").run(checkId)
   const db=local as unknown as D1Database
   const calls:{url:string;init:RequestInit}[]=[]
   let status=200
@@ -71,7 +71,7 @@ test('status transition outbox is atomic and concurrent flushes claim only one d
   const result=x.db.prepare(`INSERT OR IGNORE INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)`).bind(checkId)
   await x.db.batch([result,enqueueTransition(x.db,checkId,1,'approved',100,'down'),x.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100 WHERE id=?").bind(checkId)])
   await x.db.batch([result,enqueueTransition(x.db,checkId,1,'approved',100,'down')])
-  x.local.db.prepare("UPDATE automation_transition_state SET status='down',generation=1 WHERE check_id=?").run(checkId)
+  x.local.db.prepare("UPDATE notification_transition_state SET status='down',generation=1 WHERE check_id=?").run(checkId)
   assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get() as {n:number}).n,1)
   await Promise.all([flushChannelDeliveries(x.env),flushChannelDeliveries(x.env)])
   assert.equal(x.calls.length,1)
@@ -87,7 +87,7 @@ test('unavailable email jobs do not starve later ready webhook jobs',async()=>{
     const component=`email-component-${i}`, check=`email-check-${i}`
     x.local.db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').run(component,component,now)
     x.local.db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at) VALUES (?,?,'check',1,1,200,'down',10)").run(check,component)
-    x.local.db.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'down')").run(check)
+    x.local.db.prepare("INSERT INTO notification_transition_state (check_id,check_version,status) VALUES (?,1,'down')").run(check)
     for(let j=0;j<10;j++) {
       const channel=`email-${j}`
       x.local.db.prepare("INSERT OR IGNORE INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at,channel_type,recipient_id,email_fingerprint) VALUES (?,?,'','',0,0,1,?,?,'email','ops','fingerprint')").run(channel,channel,now,now)
@@ -135,7 +135,7 @@ test('failed deliveries retry within a bound and record only generic errors',asy
   const x=await setup(); x.setStatus(500)
   const result=x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId)
   await x.db.batch([result,enqueueTransition(x.db,checkId,1,'approved',100,'down')])
-  x.local.db.prepare("UPDATE automation_transition_state SET status='down',generation=1 WHERE check_id=?").run(checkId)
+  x.local.db.prepare("UPDATE notification_transition_state SET status='down',generation=1 WHERE check_id=?").run(checkId)
   await flushChannelDeliveries(x.env); await flushChannelDeliveries(x.env); await flushChannelDeliveries(x.env); await flushChannelDeliveries(x.env)
   assert.equal(x.calls.length,3)
   const row=x.local.db.prepare('SELECT state,attempts,error_code FROM notification_outbox').get() as {state:string;attempts:number;error_code:string}
@@ -157,7 +157,7 @@ test('Workerd D1 atomically queues and claims one delivery for concurrent schedu
   const runtime=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response()}}',d1Databases:['DB']}))
   try {
     const db=await runtime.getD1Database('DB') as D1Database
-    for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) {
+    for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql']) {
       const sql=readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8').replace(/^\s*--[^\n]*$/gm,'')
       const parts=sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements=parts.shift()!.split(';').map(s=>s.trim()).filter(Boolean)
@@ -169,7 +169,7 @@ test('Workerd D1 atomically queues and claims one delivery for concurrent schedu
       db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Test monitor',0)"),
       db.prepare("INSERT INTO endpoint_registry VALUES ('check','approved')"),
       db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at) VALUES (?,'component','check',1,1,200,'up',1)").bind(checkId),
-      db.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'up')").bind(checkId),
+      db.prepare("INSERT INTO notification_transition_state (check_id,check_version,status) VALUES (?,1,'up')").bind(checkId),
     ])
     let calls=0
     const env={DB:db,CHANNEL_ENDPOINTS:destinations,CHANNELS_READY:'true',VAULT_ENCRYPTION_KEY:key,OUTBOUND:{fetch:async (_url:string,_init:RequestInit)=>{calls++;return new Response(null,{status:204})}}} satisfies ChannelEnvironment
@@ -181,7 +181,7 @@ test('Workerd D1 atomically queues and claims one delivery for concurrent schedu
         db.prepare("INSERT OR IGNORE INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId),
         enqueueTransition(db,checkId,1,'approved',100,'down'),
         db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100,last_result_at=100 WHERE id=? AND (last_scheduled_at IS NULL OR last_scheduled_at<100)").bind(checkId),
-        db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=? AND status<>'down'").bind(checkId),
+        db.prepare("UPDATE notification_transition_state SET status='down',generation=generation+1 WHERE check_id=? AND status<>'down'").bind(checkId),
       ])
     }
     await Promise.all([save(),save()])
@@ -217,7 +217,7 @@ test('expired pending events fail without transmission',async()=>{
 async function queueTimingEvent(x:Awaited<ReturnType<typeof setup>>) {
   const result=x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId)
   await x.db.batch([result,enqueueTransition(x.db,checkId,1,'approved',100,'down')])
-  x.local.db.prepare("UPDATE automation_transition_state SET status='down',generation=1 WHERE check_id=?").run(checkId)
+  x.local.db.prepare("UPDATE notification_transition_state SET status='down',generation=1 WHERE check_id=?").run(checkId)
 }
 
 test('a lost or expired notification lease cannot transmit after slow resolution',async()=>{
@@ -296,11 +296,11 @@ test('degraded and down remain distinct and stale effective watermarks fall back
   const x=await setup()
   await x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,100,100,'down','degraded',200,4)").bind(checkId).run()
   await enqueueTransition(x.db,checkId,1,'approved',100,'degraded').run()
-  x.local.db.prepare("UPDATE automation_transition_state SET status='degraded',generation=1 WHERE check_id=?").run(checkId)
+  x.local.db.prepare("UPDATE notification_transition_state SET status='degraded',generation=1 WHERE check_id=?").run(checkId)
   await flushChannelDeliveries(x.env)
   assert.equal(JSON.parse(String(x.calls[0]!.init.body)).status,'degraded')
   x.local.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=101,last_effective_status='up',last_effective_scheduled_at=100 WHERE id=?").run(checkId)
-  x.local.db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=?").run(checkId)
+  x.local.db.prepare("UPDATE notification_transition_state SET status='down',generation=generation+1 WHERE check_id=?").run(checkId)
   await x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,102,102,'down','down',500,4)").bind(checkId).run()
   await enqueueTransition(x.db,checkId,1,'approved',102,'down').run()
   assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get() as {n:number}).n,1)
@@ -334,7 +334,7 @@ test('webhook retries use a stable idempotency key and recovery follows acknowle
   x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId),
   enqueueTransition(x.db,checkId,1,'approved',100,'down'),
   x.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100,last_result_at=100 WHERE id=?").bind(checkId),
-  x.db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(checkId),
+  x.db.prepare("UPDATE notification_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(checkId),
  ])
  x.setStatus(500);await flushChannelDeliveries(x.env);assert.equal(x.calls.length,1)
  x.setStatus(200);await flushChannelDeliveries(x.env);assert.equal(x.calls.length,2)
@@ -342,7 +342,7 @@ test('webhook retries use a stable idempotency key and recovery follows acknowle
   x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,200,200,'up',200,4)").bind(checkId),
   enqueueTransition(x.db,checkId,1,'approved',200,'up'),
   x.db.prepare("UPDATE http_checks SET last_status='up',last_scheduled_at=200,last_result_at=200 WHERE id=?").bind(checkId),
-  x.db.prepare("UPDATE automation_transition_state SET status='up',generation=generation+1 WHERE check_id=?").bind(checkId),
+  x.db.prepare("UPDATE notification_transition_state SET status='up',generation=generation+1 WHERE check_id=?").bind(checkId),
  ])
  await flushChannelDeliveries(x.env);assert.equal(x.calls.length,3)
  const headers=x.calls.map(call=>call.init.headers as Record<string,string>)
@@ -357,7 +357,7 @@ test('a pending channel event waits through maintenance and a fresh observation 
   x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,?,?,'down',500,4)").bind(checkId,scheduled,scheduled),
   enqueueTransition(x.db,checkId,1,'approved',scheduled,'down'),
   x.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=?,last_result_at=? WHERE id=?").bind(now-60_000,now-60_000,checkId),
-  x.db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(checkId),
+  x.db.prepare("UPDATE notification_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(checkId),
  ])
  x.local.db.prepare("UPDATE notification_outbox SET created_at=?").run(scheduled)
  x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now-120_000,now+60_000,now,now)
@@ -376,7 +376,7 @@ test('a post-maintenance recovery supersedes an unsent pre-window outage',async(
   x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,?,?,'down',500,4)").bind(checkId,scheduled,scheduled),
   enqueueTransition(x.db,checkId,1,'approved',scheduled,'down'),
   x.db.prepare("UPDATE http_checks SET last_status='up',last_scheduled_at=?,last_result_at=? WHERE id=?").bind(now,now,checkId),
-  x.db.prepare("UPDATE automation_transition_state SET status='up',generation=generation+2 WHERE check_id=?").bind(checkId),
+  x.db.prepare("UPDATE notification_transition_state SET status='up',generation=generation+2 WHERE check_id=?").bind(checkId),
  ])
  x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now-120_000,now-60_000,now,now)
  await flushChannelDeliveries(x.env)
@@ -390,7 +390,7 @@ test('an unqueued newer status while delivery is unavailable makes an old event 
   x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId),
   enqueueTransition(x.db,checkId,1,'approved',100,'down'),
   x.db.prepare("UPDATE http_checks SET last_status='up',last_scheduled_at=200 WHERE id=?").bind(checkId),
-  x.db.prepare("UPDATE automation_transition_state SET status='up',generation=generation+2 WHERE check_id=?").bind(checkId),
+  x.db.prepare("UPDATE notification_transition_state SET status='up',generation=generation+2 WHERE check_id=?").bind(checkId),
  ])
  await flushChannelDeliveries(x.env);assert.equal(x.calls.length,0)
  assert.equal((x.local.db.prepare('SELECT error_code FROM notification_outbox').get() as {error_code:string}).error_code,'unavailable')
@@ -402,7 +402,7 @@ test('a window starting after claim defers a notification before network transmi
   x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId),
   enqueueTransition(x.db,checkId,1,'approved',100,'down'),
   x.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100 WHERE id=?").bind(checkId),
-  x.db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(checkId),
+  x.db.prepare("UPDATE notification_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(checkId),
  ])
  let inserted=false
  const db={prepare(sql:string) {
@@ -421,7 +421,7 @@ test('down-up-down supersedes an earlier pending outage even if the latest statu
  await x.db.batch([
   x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId),
   enqueueTransition(x.db,checkId,1,'approved',100,'down'),
-  x.db.prepare("UPDATE automation_transition_state SET status='down',generation=3 WHERE check_id=?").bind(checkId),
+  x.db.prepare("UPDATE notification_transition_state SET status='down',generation=3 WHERE check_id=?").bind(checkId),
   x.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=300,last_result_at=300 WHERE id=?").bind(checkId),
  ])
  await flushChannelDeliveries(x.env);assert.equal(x.calls.length,0)
@@ -433,13 +433,13 @@ test('recovery is suppressed when no unhealthy notification was acknowledged',as
  await x.db.batch([
   x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId),
   enqueueTransition(x.db,checkId,1,'approved',100,'down'),
-  x.db.prepare("UPDATE automation_transition_state SET status='down',generation=1 WHERE check_id=?").bind(checkId),
+  x.db.prepare("UPDATE notification_transition_state SET status='down',generation=1 WHERE check_id=?").bind(checkId),
   x.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100,last_result_at=100 WHERE id=?").bind(checkId),
  ])
  await x.db.batch([
   x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,200,200,'up',200,4)").bind(checkId),
   enqueueTransition(x.db,checkId,1,'approved',200,'up'),
-  x.db.prepare("UPDATE automation_transition_state SET status='up',generation=2 WHERE check_id=?").bind(checkId),
+  x.db.prepare("UPDATE notification_transition_state SET status='up',generation=2 WHERE check_id=?").bind(checkId),
   x.db.prepare("UPDATE http_checks SET last_status='up',last_scheduled_at=200,last_result_at=200 WHERE id=?").bind(checkId),
  ])
  await flushChannelDeliveries(x.env);assert.equal(x.calls.length,0)
@@ -463,7 +463,7 @@ test('a webhook configuration change during the last preflight prevents the old 
     x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId),
     enqueueTransition(x.db,checkId,1,'approved',100,'down'),
     x.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100 WHERE id=?").bind(checkId),
-    x.db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(checkId),
+    x.db.prepare("UPDATE notification_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(checkId),
   ])
   let started!:()=>void, resume!:()=>void
   const reached=new Promise<void>(resolve=>{started=resolve})
@@ -500,7 +500,7 @@ test('webhook preflight refuses credentials rotated or deleted after resolution'
   await x.db.batch([
    x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId),
    enqueueTransition(x.db,checkId,1,'approved',100,'down'),
-   x.db.prepare("UPDATE automation_transition_state SET status='down',generation=1 WHERE check_id=?").bind(checkId),
+   x.db.prepare("UPDATE notification_transition_state SET status='down',generation=1 WHERE check_id=?").bind(checkId),
    x.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100,last_result_at=100 WHERE id=?").bind(checkId),
   ])
   let changed=false
@@ -537,7 +537,7 @@ test('a maintenance window or credential fault beginning during validation defer
   await x.db.batch([
    x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId),
    enqueueTransition(x.db,checkId,1,'approved',100,'down'),
-   x.db.prepare("UPDATE automation_transition_state SET status='down',generation=1 WHERE check_id=?").bind(checkId),
+   x.db.prepare("UPDATE notification_transition_state SET status='down',generation=1 WHERE check_id=?").bind(checkId),
    x.db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=100,last_result_at=100 WHERE id=?").bind(checkId),
   ])
   let changed=false
