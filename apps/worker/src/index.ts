@@ -34,6 +34,13 @@ const healthStatuses = ['operational', 'degraded', 'down']
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store' } })
 const bad = (message: string): never => { throw new HttpError(400, message) }
 const id = () => crypto.randomUUID()
+function serializeAdvancedConfig(value: unknown, endpointId: string, expectedStatus: number): string | null {
+  if (value === null) return null
+  if (!parsePersistedHttpConfig(value, endpointId, 'validation', expectedStatus)) return bad('Invalid advanced check settings')
+  const serialized = JSON.stringify(value)
+  if (serialized.length > 32_000) return bad('Invalid advanced check settings')
+  return serialized
+}
 // Reuse jose's issuer-scoped JWKS cache across requests in this isolate. The
 // resolver retains jose's freshness and key-rotation behavior; it never stores
 // request identities or tokens.
@@ -475,9 +482,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (current.gatusComponent) throw new HttpError(403, 'Gatus-managed component is read-only')
     if (current.version !== submittedVersion) throw new HttpError(409, 'This record changed. Reload and try again.')
     const candidate = body.advancedConfig
-    if (candidate !== null && !parsePersistedHttpConfig(candidate, current.endpointId, 'validation', current.expectedStatus)) return bad('Invalid advanced check settings')
-    const serialized = candidate === null ? null : JSON.stringify(candidate)
-    if (serialized !== null && serialized.length > 32000) return bad('Invalid advanced check settings')
+    const serialized = serializeAdvancedConfig(candidate, current.endpointId, current.expectedStatus)
     let unchanged = serialized === null && current.advancedConfig === null
     if (serialized !== null && current.advancedConfig !== null) {
       try { unchanged = stableJson(candidate) === stableJson(JSON.parse(current.advancedConfig)) } catch { unchanged = false }
@@ -657,7 +662,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const endpointId = string(body.endpointId, 'endpointId', 100)
     if (!approvedEndpoints(env).some(endpoint => endpoint.id === endpointId)) return bad('Unknown approved endpoint')
     if (!Number.isInteger(body.expectedStatus) || Number(body.expectedStatus) < 100 || Number(body.expectedStatus) > 599) return bad('Invalid expectedStatus')
-    if (body.advancedConfig !== null && !parsePersistedHttpConfig(body.advancedConfig, endpointId, 'validation', Number(body.expectedStatus))) return bad('Invalid advanced check settings')
+    serializeAdvancedConfig(body.advancedConfig, endpointId, Number(body.expectedStatus))
     if (!env.PROBE) throw new HttpError(503, 'Monitor testing is unavailable')
     try { return await requestProbeTest(env.PROBE, { endpointId, expectedStatus: body.expectedStatus, advancedConfig: body.advancedConfig }, request.signal) }
     catch (error) { if (error instanceof ProbeTestTimeout) throw new HttpError(504, 'Monitor test timed out'); throw error }
@@ -687,9 +692,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       if (typeof input.enabled !== 'boolean' || (input.intervalMinutes !== 1 && input.intervalMinutes !== 5)) return bad('Invalid check settings')
       if (!Number.isInteger(input.expectedStatus) || Number(input.expectedStatus) < 100 || Number(input.expectedStatus) > 599) return bad('Invalid expectedStatus')
       const advanced = input.advancedConfig ?? null
-      if (advanced !== null && !parsePersistedHttpConfig(advanced, endpointId, 'validation', Number(input.expectedStatus))) return bad('Invalid advanced check settings')
-      const serialized = advanced === null ? null : JSON.stringify(advanced)
-      if (serialized && serialized.length > 32000) return bad('Invalid advanced check settings')
+      const serialized = serializeAdvancedConfig(advanced, endpointId, Number(input.expectedStatus))
       current = creating ? null : await stmt(db, 'SELECT * FROM http_checks WHERE component_id=?', componentId).first<StoredCheck>()
       if (current && (input.id !== current.id || input.version !== current.config_version)) throw new HttpError(409, 'This check changed. Reload and try again.')
       if (!current && (input.id !== undefined || input.version !== undefined)) throw new HttpError(409, 'This check changed. Reload and try again.')
