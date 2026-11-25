@@ -1,7 +1,7 @@
 import { endpointFingerprint, parseEndpoints, type Endpoint } from '../../worker/src/endpoint-config'
 import { evaluateHttpMonitor, isBlockedRedirect, parsePersistedHttpConfig, type HttpMonitorConfig, type HttpMonitorResult } from './http-monitor'
 import { resolveMonitorCredential } from '../../worker/src/vault-resolver'
-import { enqueueTransition, flushChannelDeliveries } from '../../worker/src/channels-runtime'
+import { channelEndpoints, enqueueTransition, flushChannelDeliveries } from '../../worker/src/channels-runtime'
 import { enqueueActionTransition, flushActions } from '../../worker/src/actions-runtime'
 
 type Check = {
@@ -15,6 +15,10 @@ type Check = {
 }
 type Environment = { DB: D1Database; ENDPOINTS: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; [binding: string]: unknown }
 type Result = { status: 'up' | 'down'; effectiveStatus: 'up' | 'down' | 'degraded'; httpStatus: number | null; latencyMs: number; completedAt: number; credentialUnavailable?: boolean }
+
+function channelsReady(env: Environment): boolean {
+  return env.CHANNELS_READY === 'true' && (channelEndpoints(typeof env.CHANNEL_ENDPOINTS === 'string' ? env.CHANNEL_ENDPOINTS : undefined).size > 0)
+}
 
 // Cloudflare Workers VPC connection errors documented at
 // https://developers.cloudflare.com/workers-vpc/reference/troubleshooting/
@@ -124,8 +128,8 @@ async function saveResult(db: D1Database, check: Check, fingerprint: string, sch
       WHERE id = ? AND enabled = 1 AND config_version = ?
       AND EXISTS (SELECT 1 FROM endpoint_registry WHERE endpoint_id = http_checks.endpoint_id AND fingerprint = ?)`)
       .bind(scheduledAt, result.completedAt, result.status, result.effectiveStatus, result.httpStatus, result.latencyMs, check.id, check.config_version, fingerprint),
-    ...(!result.credentialUnavailable && env.CHANNELS_READY === 'true' && typeof env.CHANNEL_ENDPOINTS === 'string' && env.CHANNEL_ENDPOINTS ? [enqueueTransition(db, check.id, check.config_version, fingerprint, scheduledAt, result.effectiveStatus)] : []),
-    ...(!result.credentialUnavailable && env.ACTIONS_READY === 'true' && typeof env.ACTION_ENDPOINTS === 'string' && env.ACTION_ENDPOINTS ? [enqueueActionTransition(db, check.id, check.config_version, fingerprint, scheduledAt, result.effectiveStatus)] : []),
+    ...(!result.credentialUnavailable && channelsReady(env) ? [enqueueTransition(db, check.id, check.config_version, fingerprint, scheduledAt, result.effectiveStatus, result.completedAt)] : []),
+    ...(!result.credentialUnavailable && env.ACTIONS_READY === 'true' && typeof env.ACTION_ENDPOINTS === 'string' && env.ACTION_ENDPOINTS ? [enqueueActionTransition(db, check.id, check.config_version, fingerprint, scheduledAt, result.effectiveStatus, result.completedAt)] : []),
     db.prepare(`UPDATE http_checks SET transition_suppressed = ?, last_scheduled_at = ?,
       last_result_at = (SELECT completed_at FROM http_check_results WHERE check_id = ? AND config_version = ? AND scheduled_at = ?),
       last_status = (SELECT status FROM http_check_results WHERE check_id = ? AND config_version = ? AND scheduled_at = ?),
@@ -140,6 +144,14 @@ async function saveResult(db: D1Database, check: Check, fingerprint: string, sch
         check.id, check.config_version, scheduledAt, scheduledAt, check.id, check.config_version, scheduledAt,
         check.id, check.config_version, scheduledAt,
         check.id, check.config_version, scheduledAt, check.id, check.config_version, scheduledAt, fingerprint),
+    ...(!result.credentialUnavailable ? [db.prepare(`INSERT INTO automation_transition_state (check_id,check_version,status)
+      SELECT h.id,h.config_version,? FROM http_checks h WHERE h.id=? AND h.config_version=? AND h.last_scheduled_at=?
+      AND EXISTS (SELECT 1 FROM http_check_results r WHERE r.check_id=h.id AND r.config_version=h.config_version AND r.scheduled_at=? AND COALESCE(r.effective_status,r.status)=?)
+      AND NOT EXISTS (SELECT 1 FROM maintenance m WHERE m.cancelled=0 AND m.starts_at<=? AND m.ends_at>?
+        AND (NOT EXISTS (SELECT 1 FROM maintenance_components mc WHERE mc.maintenance_id=m.id)
+          OR EXISTS (SELECT 1 FROM maintenance_components mc WHERE mc.maintenance_id=m.id AND mc.component_id=h.component_id)))
+      ON CONFLICT(check_id) DO UPDATE SET generation=automation_transition_state.generation + CASE WHEN automation_transition_state.check_version<>excluded.check_version OR automation_transition_state.status<>excluded.status THEN 1 ELSE 0 END,check_version=excluded.check_version,status=excluded.status`)
+      .bind(result.effectiveStatus,check.id,check.config_version,scheduledAt,scheduledAt,result.effectiveStatus,result.completedAt,result.completedAt)] : []),
   ])
   return Number(results[0].meta.changes) > 0
 }
@@ -176,7 +188,7 @@ export async function runChecks(scheduledTime: number, env: Environment): Promis
       console.log(JSON.stringify({ event: saved ? 'probe_completed' : 'probe_discarded', endpointId: endpoint.id, status: result.status }))
     }))
   }
-  if (env.CHANNELS_READY === 'true' && typeof env.CHANNEL_ENDPOINTS === 'string' && env.CHANNEL_ENDPOINTS) await flushChannelDeliveries(env as Parameters<typeof flushChannelDeliveries>[0])
+  if (channelsReady(env)) await flushChannelDeliveries(env as Parameters<typeof flushChannelDeliveries>[0])
   if (env.ACTIONS_READY === 'true' && typeof env.ACTION_ENDPOINTS === 'string' && env.ACTION_ENDPOINTS) await flushActions(env as Parameters<typeof flushActions>[0])
   await env.DB.prepare('DELETE FROM http_check_results WHERE scheduled_at < ?').bind(scheduledAt - 14 * 86_400_000).run()
   console.log(JSON.stringify({ event: 'probe_tick', scheduledAt, due: due.length }))

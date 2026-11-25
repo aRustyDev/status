@@ -9,13 +9,15 @@ import worker, { runChecks } from '../src/index.ts'
 const originalFetch = globalThis.fetch
 afterEach(() => { globalThis.fetch = originalFetch })
 
-function fixture(count = 1) {
+function fixture(count = 1, withAutomation = true) {
   const sqlite = new DatabaseSync(':memory:')
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0001_board.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0002_checks.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0003_endpoint_registry.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0005_gatus_sources.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0009_monitor_auth.sql', import.meta.url), 'utf8'))
+  if (withAutomation) for (const file of ['0009_channels.sql','0009_actions.sql','0010_notification_transition_state.sql','0012_notification_delivery_state.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`, import.meta.url), 'utf8'))
   const now = 1_800_000_000_000
   const endpoints = []
   for (let i = 0; i < count; i++) {
@@ -613,7 +615,7 @@ test('credentialed checks reject redirects and stale or non-HTTPS targets withou
 
 test('scheduler sends degraded transitions to configured channels and actions', async () => {
   const {sqlite,now,env} = fixture()
-  for (const file of ['0005_gatus_sources.sql','0008_vault.sql','0009_channels.sql','0009_actions.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`,import.meta.url),'utf8'))
+  for (const file of ['0008_vault.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`,import.meta.url),'utf8'))
   sqlite.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
   const checkId = '00000000-0000-4000-8000-000000000001'
   sqlite.prepare('UPDATE http_checks SET id=?,advanced_config=? WHERE id=?').run(checkId,JSON.stringify({keyword:'ready'}),'check-0')
@@ -675,19 +677,51 @@ test('scheduler sends degraded transitions to configured channels and actions', 
   assert.equal(sqlite.prepare('SELECT transition_suppressed FROM http_checks WHERE id=?').get(checkId)?.transition_suppressed,1)
   globalThis.fetch = async () => { monitoredCalls++; return new Response('ready',{status:200}) }
   await runChecks(now+360_000,runtime as never)
-  assert.equal(bodies.length,4)
+  assert.equal(bodies.length,5)
+  assert.equal((bodies[4] as {status:string}).status,'up')
   assert.equal(sqlite.prepare('SELECT transition_suppressed FROM http_checks WHERE id=?').get(checkId)?.transition_suppressed,0)
   sqlite.close()
 })
 
 test('enabled delivery without its schema rolls back the check result rather than dropping the transition', async () => {
   for (const kind of ['channel','action'] as const) {
-    const {sqlite,now,env}=fixture()
+    const {sqlite,now,env}=fixture(1,false)
     globalThis.fetch=async()=>new Response(null,{status:200})
-    const configured=kind==='channel' ? {CHANNELS_READY:'true',CHANNEL_ENDPOINTS:'[]'} : {ACTIONS_READY:'true',ACTION_ENDPOINTS:'[]'}
+    const configured=kind==='channel' ? {CHANNELS_READY:'true',CHANNEL_ENDPOINTS:JSON.stringify([{id:'sink',name:'Sink',url:'https://sink.test/'}])} : {ACTIONS_READY:'true',ACTION_ENDPOINTS:'[]'}
     await assert.rejects(runChecks(now,{...env,...configured} as never),/no such table/)
     assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM http_check_results').get()?.n,0)
     assert.equal(sqlite.prepare('SELECT last_status FROM http_checks WHERE id=?').get('check-0')?.last_status,null)
     sqlite.close()
   }
+})
+
+test('maintenance preserves a shared automation baseline and re-evaluates global and targeted outages after the window',async()=>{
+ for (const targeted of [false,true]) {
+  const {sqlite,env}=fixture()
+  for (const file of ['0008_vault.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`,import.meta.url),'utf8'))
+  const check='check-0', tick=Math.floor(Date.now()/60_000)*60_000-240_000
+  sqlite.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at) VALUES ('c','channel','sink','f',1,1,1,0,0)").run()
+  sqlite.prepare("INSERT INTO notification_channel_checks (channel_id,check_id) VALUES ('c',?)").run(check)
+  sqlite.prepare("INSERT INTO worker_actions (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,trigger_status,created_at,updated_at) VALUES ('a','action','sink','f',1,1,1,'all',0,0)").run()
+  sqlite.prepare("INSERT INTO worker_action_checks (action_id,check_id) VALUES ('a',?)").run(check)
+  const runtime={...env,CHANNELS_READY:'true',CHANNEL_ENDPOINTS:JSON.stringify([{id:'sink',name:'Sink',url:'https://sink.test/'}]),ACTIONS_READY:'true',ACTION_ENDPOINTS:'[]'}
+  const realNow=Date.now
+  try {
+   Date.now=()=>tick
+   globalThis.fetch=async()=>new Response(null,{status:200})
+   await runChecks(tick,runtime as never)
+   sqlite.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(tick+30_000,tick+150_000,tick,tick)
+   if(targeted) sqlite.prepare("INSERT INTO maintenance_components (maintenance_id,component_id) VALUES ('m','component-0')").run()
+   globalThis.fetch=async()=>new Response(null,{status:500})
+   Date.now=()=>tick+60_000;await runChecks(tick+60_000,runtime as never)
+   Date.now=()=>tick+120_000;await runChecks(tick+120_000,runtime as never)
+   assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get()?.n,0)
+   assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM worker_action_outbox').get()?.n,0)
+   assert.equal(sqlite.prepare('SELECT status FROM automation_transition_state WHERE check_id=?').get(check)?.status,'up')
+   Date.now=()=>tick+180_000;await runChecks(tick+180_000,runtime as never)
+   assert.equal(sqlite.prepare('SELECT status FROM automation_transition_state WHERE check_id=?').get(check)?.status,'down')
+   assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get()?.n,1)
+   assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM worker_action_outbox').get()?.n,1)
+  } finally { Date.now=realNow;sqlite.close() }
+ }
 })
