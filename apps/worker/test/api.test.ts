@@ -1546,6 +1546,35 @@ test('channel association limit rejects concurrent monitor edits atomically', as
   } finally { delete env.EMAIL;delete env.EMAIL_READY;delete env.EMAIL_FROM;delete env.EMAIL_DESTINATIONS;delete env.CHANNELS_READY }
 })
 
+test('channel editor reports a full channel of manual monitors without partial changes', async () => {
+  env.CHANNELS_READY='true';env.EMAIL_READY='true';env.EMAIL_FROM='sender@example.test'
+  env.EMAIL_DESTINATIONS=JSON.stringify([{id:'ops',name:'Operations',address:'ops@example.test'}])
+  env.EMAIL={send:async()=>({messageId:'fixture'})}
+  try {
+    const response=await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{name:'Full manual channel',type:'email',recipientId:'ops',enabled:true,checkIds:[],expectedChecks:[]})
+    assert.equal(response.response.status,201)
+    const channel=(response.body as unknown as {id:string;version:number}).id
+    const fixtures=Array.from({length:20},()=>crypto.randomUUID())
+    await db.batch(fixtures.flatMap((id,index)=>[
+      db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').bind(id,`Manual full ${index}`,Date.now()),
+      db.prepare('INSERT INTO monitor_notification_channels (component_id,channel_id) VALUES (?,?)').bind(id,channel),
+    ]))
+    const component=crypto.randomUUID(),check=crypto.randomUUID()
+    await db.batch([
+      db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').bind(component,'Extra checked monitor',Date.now()),
+      db.prepare('INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status) VALUES (?,?,?,0,1,200)').bind(check,component,'unused'),
+    ])
+    const edit=await request(`/api/v1/bsp/admin/notifications/channels/${channel}`,adminToken,'PATCH',{name:'Must not persist',type:'email',recipientId:'ops',enabled:true,checkIds:[check],expectedChecks:[{id:check,componentId:component,version:1}],version:1,expectedCheckIds:[],expectedAssociationVersion:20})
+    assert.equal(edit.response.status,409)
+    assert.match((edit.body as unknown as {error:string}).error,/at most 20 monitors/i)
+    const unchanged=await db.prepare('SELECT name,version,association_version FROM notification_channels WHERE id=?').bind(channel).first<{name:string;version:number;association_version:number}>()
+    assert.deepEqual(unchanged && {...unchanged},{name:'Full manual channel',version:1,association_version:20})
+    assert.equal(await db.prepare('SELECT 1 FROM notification_channel_checks WHERE channel_id=? AND check_id=?').bind(channel,check).first(),null)
+    const count=await db.prepare('SELECT COUNT(*) AS n FROM monitor_notification_channels WHERE channel_id=?').bind(channel).first<{n:number}>()
+    assert.equal(count?.n,20)
+  } finally { delete env.EMAIL;delete env.EMAIL_READY;delete env.EMAIL_FROM;delete env.EMAIL_DESTINATIONS;delete env.CHANNELS_READY }
+})
+
 test('email-only notifications expose admin catalog and persist monitor selection without Vault', async () => {
   const messages: unknown[] = []
   env.CHANNELS_READY = 'true'

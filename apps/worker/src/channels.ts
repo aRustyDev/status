@@ -160,7 +160,12 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
   operations.push(statement(db,'DELETE FROM notification_channel_checks WHERE channel_id=? AND check_id NOT IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND mutation_key=?)',id,JSON.stringify(checks),id,token))
   for (const check of checks) operations.push(statement(db,'INSERT OR IGNORE INTO notification_channel_checks (channel_id,check_id) SELECT ?,? WHERE EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND mutation_key=?)',id,check,id,token))
   operations.push(audit(db,actor,method==='POST'?'create':'update',id,token))
-  const results=await db.batch(operations)
+  let results: D1Result[]
+  try { results=await db.batch(operations) }
+  catch (error) {
+    if (error instanceof Error && error.message.includes('notification channel monitor limit reached')) return fail(409,'A channel can be assigned to at most 20 monitors. Remove an assignment before adding another.')
+    throw error
+  }
   if (!results[0].meta.changes) return fail(method==='POST'?409:409,method==='POST'?'Channel limit reached or a monitor changed. Reload and try again.':'Channel or monitor changed. Reload and try again.')
   return json((await list(db)).find(row=>row.id===id),method==='POST'?201:200)
 }
