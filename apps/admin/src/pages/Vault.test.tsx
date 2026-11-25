@@ -42,6 +42,8 @@ describe('Vault', () => {
     const user = setup()
     await user.click(await screen.findByRole('button', { name: 'Operations' }))
     expect(screen.getByText(/Available integrations depend on deployment settings/)).toBeInTheDocument()
+    expect(screen.queryByText(/Monitor authentication and notification channels are not yet available/)).not.toBeInTheDocument()
+    expect(screen.getByText(/Secret values cannot be revealed/)).toBeInTheDocument()
     await user.click(await screen.findByRole('button', { name: 'Rotate Token' }))
     const dialog = screen.getByRole('dialog')
     await user.type(within(dialog).getByLabelText('Value'), 'replacement')
