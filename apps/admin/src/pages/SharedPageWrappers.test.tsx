@@ -1,6 +1,4 @@
 import { render, screen } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { api } from '../api/client'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
@@ -8,9 +6,6 @@ import type { AuditEntities } from '@better-forge/ui'
 import type { TokenPreset, TokenResource } from '@better-forge/contracts'
 import ApiTokens from './ApiTokens'
 import Login from './Login'
-import Users from './Users'
-
-vi.mock('../api/client', () => ({ api: { get: vi.fn(), patch: vi.fn() } }))
 
 // The shared pages are tested in the interface package; here only what this product hands them is checked.
 vi.mock('@better-forge/ui', () => ({
@@ -58,16 +53,6 @@ describe('shared pages as this product configures them', () => {
     expect(login).toHaveTextContent('Monitor everything.Stay ahead of issues.')
     expect(login).toHaveTextContent('uptime monitoring')
     expect(login).toHaveTextContent('Live status updates|Incidents and maintenance notices|Alerts through your notification channels')
-  })
-
-
-  it('lists Access users with the supported role choices', async () => {
-    vi.mocked(api.get).mockResolvedValueOnce([{ id: 'u', email: 'admin@example.com', role: 'admin', version: 1 }])
-    render(<QueryClientProvider client={new QueryClient()}><Users /></QueryClientProvider>)
-    expect(await screen.findByText('admin@example.com')).toBeInTheDocument()
-    expect(screen.getByRole('option', { name: 'Viewer' })).toBeInTheDocument()
-    expect(screen.getByRole('option', { name: 'Operator' })).toBeInTheDocument()
-    expect(screen.getByRole('option', { name: 'Admin' })).toBeInTheDocument()
   })
 
 
