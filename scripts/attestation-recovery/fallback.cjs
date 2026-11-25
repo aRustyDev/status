@@ -6,15 +6,32 @@ const path = require('node:path');
 const SLSA = 'https://slsa.dev/provenance/v1';
 const PUBLISH = 'https://github.com/npm/attestation/tree/main/specs/publish/v0.1';
 const packages = {
+  audit: ['0.2.0', 'sha512-RhuZWBVe0ojL7Ypc2LQ28bDxG8dn4Qrb3TFWqyJKM97eOUGivjY1SzMjXZ4v4rWlCeEwcz6PfbNK1TkweAsgSQ=='],
   contracts: ['0.2.0', 'sha512-0LafsRZIqKlapw4obJZZESsUmMUjej0xYmb0KCaiQ3oC8PeBAMfjmBhA+BcQ3IprvvhV2psC9awqS5ZKR4AKVg=='],
   db: ['0.2.0', 'sha512-ZgpzbDj6p5uO9yr2LTbi0V4qfShDx0NuNVDrT18j7efGM/AcC6OB9yZw+2UYVg4pwEvXTEDRRia5Awc1HReOkA=='],
   ui: ['0.4.0', 'sha512-fmWXxELM1fUUDRd6U6CJpUL8QkcU/99QK4pO1JKNcPLroLWxAib+9MOmTTCai//k7LpCI8l8nd4rzRwM+qccrQ=='],
 };
 const registry = 'https://registry.npmjs.org';
+// A registry response is untrusted. Bound buffering even when npm has no size limit.
+const MAX_ATTESTATION_BYTES = 4 * 1024 * 1024;
 const targets = new Map(Object.entries(packages).map(([name, [version, integrity]]) => [
   `${registry}/-/npm/v1/attestations/@better-forge%2f${name}@${version}`,
   { name, version, integrity },
 ]));
+
+async function readBounded(body) {
+  const chunks = [];
+  let length = 0;
+  if (!body) return Buffer.alloc(0);
+  const iterable = Buffer.isBuffer(body) ? [body] : body;
+  for await (const chunk of iterable) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    length += bytes.length;
+    if (length > MAX_ATTESTATION_BYTES) throw Error('Attestation response exceeds size limit');
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks, length);
+}
 
 function validateBundle(data, info) {
   if (!Array.isArray(data.attestations) || data.attestations.length !== 2) throw Error('Unexpected recovered attestation count');
@@ -41,7 +58,15 @@ function wrapFetch(original, options = {}) {
     return (async () => {
       const liveOpts = { ...args[1], cache: null, preferOnline: true, preferOffline: false, offline: false, strictSSL: true };
       const res = await Reflect.apply(target, receiver, [args[0], liveOpts]);
-      if (res.status !== 200 || await res.clone().text() !== 'OK\r\n') return res;
+      if (res.status !== 200) return res;
+      // minipass-fetch's clone tees into two streams and pauses the source if
+      // either is unread. Awaiting only the clone can deadlock before EOF.
+      // Consume once and reconstruct a response for npm when it was not the
+      // broken endpoint sentinel, so npm still parses and verifies the bytes.
+      const body = await readBounded(res.body);
+      if (!body.equals(Buffer.from('OK\r\n'))) return new res.constructor(body, {
+        status: res.status, statusText: res.statusText, headers: res.headers, url: res.url,
+      });
       const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
       const locked = lock.packages[`node_modules/@better-forge/${info.name}`];
       if (!locked || locked.version !== info.version || locked.integrity !== info.integrity) throw Error('Attestation recovery does not match lockfile');

@@ -60,7 +60,7 @@ export default function VaultPage() {
       {error && !deleting && <p role="alert">{error}</p>}
       {vault ? <>
         <div className="flex flex-wrap justify-between items-center gap-3"><div><h2 className="font-headline font-bold text-lg">{vault.name}</h2><span className="text-xs">Local</span></div><button className="btn btn-primary" onClick={() => { setError(''); setEditing('new') }}>New Secret</button></div>
-        <p className="text-sm my-4">Names are visible metadata; do not put credentials in names. Secret values cannot be revealed. Rotate a secret to replace its value. Monitor authentication and notification channels are not yet available.</p>
+        <p className="text-sm my-4">Names are visible metadata; do not put credentials in names. Secret values cannot be revealed. Rotate a secret to replace its value. Available integrations depend on deployment settings.</p>
         {secrets.isLoading && <p>Loading secrets…</p>}
         {secrets.isError && <p role="alert">Could not load secrets. <button onClick={() => void secrets.refetch()}>Retry</button></p>}
         {secrets.data?.length === 0 && <p>No secrets in this vault.</p>}

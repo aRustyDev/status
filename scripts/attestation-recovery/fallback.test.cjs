@@ -3,17 +3,21 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const { execFileSync } = require('node:child_process');
 const { wrapFetch, targets, validateBundle } = require('./fallback.cjs');
+// Use the Response and Minipass versions actually shipped with the npm being tested.
+const npmModules = path.join(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(), 'npm', 'node_modules');
+const { Response } = require(path.join(npmModules, 'minipass-fetch'));
+const { Minipass } = require(path.join(npmModules, 'minipass'));
 
 const [url, info] = targets.entries().next().value;
 const data = JSON.parse(fs.readFileSync(path.join(__dirname, `${info.name}.json`), 'utf8'));
 const metadata = { name: `@better-forge/${info.name}`, version: info.version, dist: { integrity: info.integrity,
   attestations: { url, provenance: { predicateType: 'https://slsa.dev/provenance/v1' } } } };
-const response = (status, text, json) => ({ status, clone: () => ({ text: async () => text }), json: async () => json });
-const good = response(200, 'OK\r\n');
-function fixture(first = good, meta = metadata, root) {
+const response = (status, body, headers) => new Response(body, { status, headers });
+function fixture(first = response(200, 'OK\r\n'), meta = metadata, root) {
   const calls = [];
-  const fetch = (...args) => { calls.push(args); return Promise.resolve(calls.length === 1 ? first : response(200, '', meta)); };
+  const fetch = (...args) => { calls.push(args); return Promise.resolve(calls.length === 1 ? first : response(200, JSON.stringify(meta))); };
   return { calls, fetch: wrapFetch(fetch, root ? { root } : {}) };
 }
 
@@ -26,9 +30,29 @@ test('known response uses recovered original attestations with live metadata', a
 });
 test('other addresses pass through, and other bodies or HTTP errors are never replaced', async () => {
   const f = fixture(); await f.fetch(url.replace('registry.npmjs.org', 'example.com')); assert.equal(f.calls.length, 1);
-  for (const res of [response(404, 'OK\r\n'), response(200, '{}'), response(200, 'OK\n')]) {
-    const f = fixture(res); assert.equal(await f.fetch(url), res); assert.equal(f.calls.length, 1);
+  const missing = response(404, 'OK\r\n');
+  assert.equal(await fixture(missing).fetch(url), missing);
+  for (const content of ['{}', 'OK\n']) {
+    const original = response(200, content, { 'x-test': 'retained' });
+    const f = fixture(original); const res = await f.fetch(url);
+    assert.equal(res.status, 200); assert.equal(res.headers.get('x-test'), 'retained');
+    assert.equal(await res.text(), content); assert.equal(f.calls.length, 1);
   }
+});
+test('asynchronously streamed responses do not deadlock when inspected', { timeout: 2000 }, async () => {
+  for (const content of ['OK\r\n', '{"attestations":[]}']) {
+    const stream = new Minipass();
+    const f = fixture(response(200, stream));
+    const pending = f.fetch(url);
+    setImmediate(() => { stream.write(content.slice(0, 2)); stream.end(content.slice(2)); });
+    const res = await pending;
+    assert.deepEqual(await res.json(), content === 'OK\r\n' ? data : { attestations: [] });
+  }
+});
+test('replayed invalid JSON still fails and oversized responses fail closed', async () => {
+  const res = await fixture(response(200, 'not JSON')).fetch(url);
+  await assert.rejects(res.json(), /invalid json/i);
+  await assert.rejects(fixture(response(200, Buffer.alloc(4 * 1024 * 1024 + 1))).fetch(url), /size limit/);
 });
 test('transport error is not hidden', async () => {
   const wrapped = wrapFetch(async () => { throw Error('network failed'); });
@@ -36,9 +60,9 @@ test('transport error is not hidden', async () => {
 });
 test('changed metadata or lockfile fails closed', async () => {
   const changed = structuredClone(metadata); changed.dist.attestations.extra = true;
-  await assert.rejects(fixture(good, changed).fetch(url), /metadata changed/);
+  await assert.rejects(fixture(response(200, 'OK\r\n'), changed).fetch(url), /metadata changed/);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'attestation-test-'));
-  try { fs.writeFileSync(path.join(dir, 'package-lock.json'), JSON.stringify({ packages: {} })); await assert.rejects(fixture(good, metadata, dir).fetch(url), /lockfile/); }
+  try { fs.writeFileSync(path.join(dir, 'package-lock.json'), JSON.stringify({ packages: {} })); await assert.rejects(fixture(response(200, 'OK\r\n'), metadata, dir).fetch(url), /lockfile/); }
   finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 test('recovered statements require unique known predicates and exact package digest', () => {
@@ -51,8 +75,8 @@ test('recovered statements require unique known predicates and exact package dig
 });
 test('metadata response failure and changed integrity fail closed', async () => {
   let count = 0;
-  const f = wrapFetch(async () => (++count === 1 ? good : response(500, '')));
+  const f = wrapFetch(async () => (++count === 1 ? response(200, 'OK\r\n') : response(500, '')));
   await assert.rejects(f(url), /metadata/);
   const changed = structuredClone(metadata); changed.dist.integrity = 'sha512-other';
-  await assert.rejects(fixture(good, changed).fetch(url), /metadata changed/);
+  await assert.rejects(fixture(response(200, 'OK\r\n'), changed).fetch(url), /metadata changed/);
 });
