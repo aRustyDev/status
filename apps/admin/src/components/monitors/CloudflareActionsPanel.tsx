@@ -47,7 +47,9 @@ function ActionLinkEditor({ componentId, actions, initial }: { componentId: stri
   }
   return <div className="space-y-3">
     <p className="text-xs">Save action links separately from monitor settings. The first valid check establishes a baseline; actions run on later status changes. Existing degraded triggers remain active until the action is unlinked from this monitor.</p>
-    <ActionsSection actions={actions} links={links} onChange={value => { setLinks(value); setSaved(false); setError('') }} />
+    <fieldset disabled={busy} aria-label="Action links">
+      <ActionsSection actions={actions} links={links} onChange={value => { setLinks(value); setSaved(false); setError('') }} />
+    </fieldset>
     {error && <Alert tone="error">{error}</Alert>}
     {saved && <p role="status">Monitor actions saved.</p>}
     <button type="button" disabled={busy} className="btn btn-primary" onClick={() => void save()}>Save actions</button>
