@@ -37,7 +37,7 @@ function randomUuid(): string {
 }
 
 function supported(method: string, path: string): boolean {
-  if (method === 'POST' && /^\/admin\/(components|checks|incidents|maintenance|monitors)$/.test(path)) return true
+  if (method === 'POST' && /^\/admin\/(components|checks|incidents|maintenance|monitors|backups)$/.test(path)) return true
   if (method === 'POST' && /^\/admin\/(incidents\/[^/]+\/(publish|updates)|maintenance\/[^/]+\/(cancel|end))$/.test(path)) return true
   if (method === 'PATCH' && /^\/admin\/(components|checks|incidents|maintenance|users|monitors)\/[^/]+$/.test(path)) return true
   return method === 'PUT' && /^\/admin\/checks\/[^/]+\/advanced$/.test(path)
