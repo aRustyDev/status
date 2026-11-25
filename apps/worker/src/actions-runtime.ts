@@ -5,7 +5,7 @@ import { resolveActionCredentialSnapshot } from './vault-resolver'
 /** Private in-process execution, authorized by the saved action and check version. */
 export type ActionEnvironment = {DB:D1Database;ACTION_ENDPOINTS?:string;ACTIONS_READY?:string;VAULT_ENCRYPTION_KEY?:string;[key:string]:unknown}
 type Action = {id:string;endpoint_id:string;endpoint_fingerprint:string;enabled:number;version:number}
-type Job = {id:string;action_id:string;action_version:number;check_id:string;check_version:number;scheduled_at:number;status:'up'|'degraded'|'down';transition_generation:number}
+type Job = {id:string;action_id:string;action_version:number;check_id:string;check_version:number;scheduled_at:number;status:'up'|'degraded'|'down';transition_generation:number;link_id:string|null}
 type ActionResult = 'completed'|'unavailable'|'uncertain'|'deferred'
 export function actionEndpoints(value:string|undefined):Map<string,Endpoint> {
   try { return new Map([...parseEndpoints(value??'[]')].filter(([,endpoint])=>new URL(endpoint.url).protocol==='https:')) } catch {return new Map()}
@@ -14,15 +14,16 @@ export function actionEndpoints(value:string|undefined):Map<string,Endpoint> {
 /** Atomically records only an accepted transition; jobs contain no secret or URL. */
 export function enqueueActionTransition(db:D1Database,checkId:string,version:number,fingerprint:string,scheduledAt:number,status:'up'|'degraded'|'down',observedAt=scheduledAt):D1PreparedStatement {
   const now=Date.now()
-  return db.prepare(`INSERT OR IGNORE INTO worker_action_outbox (id,action_id,action_version,check_id,check_version,scheduled_at,status,created_at,updated_at,transition_generation,observed_at)
-    SELECT ? || ':' || a.id,a.id,a.version,h.id,h.config_version,?,?,?,?,ns.generation+1,? FROM worker_actions a
-    JOIN worker_action_checks ac ON ac.action_id=a.id JOIN http_checks h ON h.id=ac.check_id
+  return db.prepare(`INSERT OR IGNORE INTO worker_action_outbox (id,action_id,action_version,check_id,check_version,scheduled_at,status,created_at,updated_at,transition_generation,observed_at,due_at,link_id,cooldown_minutes)
+    SELECT ? || ':' || a.id,a.id,a.version,h.id,h.config_version,?,?,?,?,ns.generation+1,?,CASE WHEN COALESCE(l.delay_minutes,0)>0 THEN ?+l.delay_minutes*60000 ELSE 0 END,l.id,COALESCE(l.cooldown_minutes,0) FROM worker_actions a
+    JOIN http_checks h ON h.id=? LEFT JOIN monitor_action_links l ON l.component_id=h.component_id AND l.action_id=a.id AND l.on_status=?
     JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version
-    WHERE a.enabled=1 AND (a.trigger_status=? OR a.trigger_status='all') AND h.id=? AND h.enabled=1 AND h.config_version=?
+    WHERE a.enabled=1 AND (l.id IS NOT NULL OR (NOT EXISTS (SELECT 1 FROM monitor_action_links custom WHERE custom.component_id=h.component_id AND custom.action_id=a.id)
+      AND EXISTS (SELECT 1 FROM worker_action_checks ac WHERE ac.action_id=a.id AND ac.check_id=h.id) AND (a.trigger_status=? OR a.trigger_status='all'))) AND h.id=? AND h.enabled=1 AND h.config_version=?
       AND ns.status<>? AND ${outsideMaintenance} AND (h.last_scheduled_at IS NULL OR h.last_scheduled_at<?)
       AND EXISTS (SELECT 1 FROM endpoint_registry WHERE endpoint_id=h.endpoint_id AND fingerprint=?)
       AND EXISTS (SELECT 1 FROM http_check_results WHERE check_id=h.id AND config_version=h.config_version AND scheduled_at=? AND COALESCE(effective_status,status)=?)`)
-    .bind(crypto.randomUUID(),scheduledAt,status,now,now,observedAt,status,checkId,version,status,observedAt,observedAt,scheduledAt,fingerprint,scheduledAt,status)
+    .bind(crypto.randomUUID(),scheduledAt,status,now,now,observedAt,now,checkId,status,status,checkId,version,status,observedAt,observedAt,scheduledAt,fingerprint,scheduledAt,status)
 }
 
 async function executeAction(env:ActionEnvironment,job:Job,claimedAt:number):Promise<ActionResult> {
@@ -34,24 +35,24 @@ async function executeAction(env:ActionEnvironment,job:Job,claimedAt:number):Pro
     if(!endpoint||await endpointFingerprint(endpoint)!==action.endpoint_fingerprint) return 'unavailable'
     const ready=async()=>!!await env.DB.prepare(`SELECT 1 FROM worker_action_outbox o JOIN http_checks h ON h.id=o.check_id WHERE o.id=? AND o.state='executing' AND h.transition_suppressed=0 AND ${maintenanceBarrier}`).bind(job.id,Date.now(),Date.now()).first()
     if(!await ready()) return 'deferred'
-    const active=async()=>!!await env.DB.prepare(`SELECT 1 AS present FROM worker_actions a JOIN worker_action_checks ac ON ac.action_id=a.id JOIN http_checks h ON h.id=ac.check_id JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version
-      WHERE a.id=? AND a.version=? AND a.enabled=1 AND ac.check_id=? AND h.enabled=1 AND h.config_version=? AND (a.trigger_status=? OR a.trigger_status='all') AND ns.generation=?
+    const active=async()=>!!await env.DB.prepare(`SELECT 1 AS present FROM worker_actions a JOIN http_checks h ON h.id=? JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version
+      WHERE a.id=? AND a.version=? AND a.enabled=1 AND h.enabled=1 AND h.config_version=? AND EXISTS (SELECT 1 FROM worker_action_outbox o WHERE o.id=? AND ((o.link_id IS NOT NULL AND EXISTS (SELECT 1 FROM monitor_action_links l WHERE l.id=o.link_id AND l.component_id=h.component_id AND l.action_id=a.id AND l.on_status=o.status)) OR (o.link_id IS NULL AND EXISTS (SELECT 1 FROM worker_action_checks ac WHERE ac.action_id=a.id AND ac.check_id=h.id) AND NOT EXISTS (SELECT 1 FROM monitor_action_links l WHERE l.component_id=h.component_id AND l.action_id=a.id) AND (a.trigger_status=o.status OR a.trigger_status='all')))) AND ns.generation=?
         AND (CASE WHEN h.last_effective_scheduled_at=h.last_scheduled_at THEN COALESCE(h.last_effective_status,h.last_status) ELSE h.last_status END)=?`)
-      .bind(job.action_id,job.action_version,job.check_id,job.check_version,job.status,job.transition_generation,job.status).first()
+      .bind(job.check_id,job.action_id,job.action_version,job.check_version,job.id,job.transition_generation,job.status).first()
     if(!await active()) return await ready() ? 'unavailable' : 'deferred'
     const credential=await resolveActionCredentialSnapshot(env.DB,env.VAULT_ENCRYPTION_KEY,action.id,action.version)
     if(!credential||credential.value.length>4096||!/^[A-Za-z0-9._~+/-]+=*$/.test(credential.value)) return await ready() ? 'unavailable' : 'deferred'
     if(!await active()) return await ready() ? 'unavailable' : 'deferred'
     // Deferral is safe here: no network call has been made for this claim.
     const checkedAt=Date.now()
-    const claim=await env.DB.prepare(`SELECT o.created_at AS createdAt,${overlappedMaintenance} AS maintenanceExempt,${nextMaintenanceStart} AS nextMaintenance FROM worker_action_outbox o JOIN http_checks h ON h.id=o.check_id
+    const claim=await env.DB.prepare(`SELECT MAX(o.created_at,o.due_at) AS createdAt,${overlappedMaintenance} AS maintenanceExempt,${nextMaintenanceStart} AS nextMaintenance FROM worker_action_outbox o JOIN http_checks h ON h.id=o.check_id
       JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version AND ns.generation=o.transition_generation
-      JOIN worker_actions a ON a.id=o.action_id JOIN worker_action_checks ac ON ac.action_id=a.id AND ac.check_id=h.id
+      JOIN worker_actions a ON a.id=o.action_id
       JOIN vault_secrets v ON v.id=a.secret_id AND v.vault_id=a.vault_id AND v.type='value'
-      WHERE o.id=? AND o.state='executing' AND o.claimed_at=? AND a.id=? AND a.enabled=1 AND a.version=? AND (a.trigger_status=? OR a.trigger_status='all')
+      WHERE o.id=? AND o.state='executing' AND o.claimed_at=? AND a.id=? AND a.enabled=1 AND a.version=? AND ((o.link_id IS NOT NULL AND EXISTS (SELECT 1 FROM monitor_action_links l WHERE l.id=o.link_id AND l.component_id=h.component_id AND l.action_id=a.id AND l.on_status=o.status)) OR (o.link_id IS NULL AND EXISTS (SELECT 1 FROM worker_action_checks ac WHERE ac.action_id=a.id AND ac.check_id=h.id) AND NOT EXISTS (SELECT 1 FROM monitor_action_links l WHERE l.component_id=h.component_id AND l.action_id=a.id) AND (a.trigger_status=o.status OR a.trigger_status='all')))
         AND h.enabled=1 AND h.config_version=? AND h.transition_suppressed=0 AND ${currentCheckStatus}=?
         AND v.id=? AND v.vault_id=? AND v.version=? AND v.nonce=? AND ${maintenanceBarrier}`)
-      .bind(checkedAt,checkedAt,job.id,claimedAt,action.id,action.version,job.status,job.check_version,job.status,credential.secretId,credential.vaultId,credential.version,credential.nonce,checkedAt,checkedAt).first<{createdAt:number;maintenanceExempt:number;nextMaintenance:number|null}>()
+      .bind(checkedAt,checkedAt,job.id,claimedAt,action.id,action.version,job.check_version,job.status,credential.secretId,credential.vaultId,credential.version,credential.nonce,checkedAt,checkedAt).first<{createdAt:number;maintenanceExempt:number;nextMaintenance:number|null}>()
     // A D1 lookup can itself cross the claim or job deadline. Reserve the
     // complete transport timeout before another worker marks this uncertain.
     const readyAt=Date.now()
@@ -84,19 +85,28 @@ export async function flushActions(env:ActionEnvironment):Promise<void> {
       AND EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND h.transition_suppressed=0 AND ${maintenanceBarrier} AND ${overlappedMaintenance}
         AND ${currentCheckStatus} IS NOT NULL AND ${currentCheckStatus}<>o.status)`)
       .bind(now,now,now,now).run()
-    await env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='unavailable',updated_at=? WHERE o.state='pending' AND o.created_at<?
+    await env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='unavailable',updated_at=? WHERE o.state='pending' AND MAX(o.created_at,o.due_at)<?
       AND NOT EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance})`).bind(now,now-3_600_000,now).run()
     await env.DB.prepare("UPDATE worker_action_outbox SET state='uncertain',updated_at=? WHERE state='executing' AND claimed_at<?").bind(now,now-30_000).run()
     await env.DB.prepare("DELETE FROM worker_action_outbox WHERE id IN (SELECT id FROM worker_action_outbox WHERE state IN ('completed','unavailable','uncertain') AND updated_at<? LIMIT 500)").bind(now-86_400_000).run()
-    jobs=(await env.DB.prepare(`SELECT o.id,o.action_id,o.action_version,o.check_id,o.check_version,o.scheduled_at,o.status,o.transition_generation FROM worker_action_outbox o JOIN http_checks h ON h.id=o.check_id WHERE o.state='pending' AND h.transition_suppressed=0 AND ${maintenanceBarrier} ORDER BY o.created_at LIMIT 20`).bind(now,now).all<Job>()).results
+    jobs=(await env.DB.prepare(`SELECT o.id,o.action_id,o.action_version,o.check_id,o.check_version,o.scheduled_at,o.status,o.transition_generation,o.link_id FROM worker_action_outbox o JOIN http_checks h ON h.id=o.check_id WHERE o.state='pending' AND o.due_at<=? AND h.transition_suppressed=0 AND ${maintenanceBarrier} ORDER BY o.created_at LIMIT 20`).bind(now,now,now).all<Job>()).results
   } catch {return}
   for(const job of jobs) {
     const claimedAt=Date.now()
-    await env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='unavailable',updated_at=? WHERE o.id=? AND o.state='pending' AND o.created_at<?
+    await env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='unavailable',updated_at=? WHERE o.id=? AND o.state='pending' AND MAX(o.created_at,o.due_at)<?
       AND NOT EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance})`).bind(claimedAt,job.id,claimedAt-3_600_000,claimedAt).run()
-    const claim=await env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='executing',claimed_at=?,updated_at=? WHERE o.id=? AND o.state='pending'
-      AND (o.created_at>=? OR EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance}))`).bind(claimedAt,claimedAt,job.id,claimedAt-3_600_000,claimedAt).run()
-    if(!claim.meta.changes) continue
+    const [claim]=await env.DB.batch([
+      env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='executing',claimed_at=?,updated_at=? WHERE o.id=? AND o.state='pending' AND o.due_at<=?
+        AND (MAX(o.created_at,o.due_at)>=? OR EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance}))
+        AND NOT EXISTS (SELECT 1 FROM monitor_action_cooldowns c JOIN http_checks h ON h.component_id=c.component_id WHERE h.id=o.check_id AND c.action_id=o.action_id AND c.on_status=o.status AND c.claimed_at+o.cooldown_minutes*60000>?)`).bind(claimedAt,claimedAt,job.id,claimedAt,claimedAt-3_600_000,claimedAt,claimedAt),
+      env.DB.prepare(`INSERT INTO monitor_action_cooldowns (component_id,action_id,on_status,claimed_at,reservation_id)
+        SELECT h.component_id,o.action_id,o.status,?,o.id FROM worker_action_outbox o JOIN http_checks h ON h.id=o.check_id WHERE o.id=? AND o.state='executing' AND o.claimed_at=?
+        ON CONFLICT(component_id,action_id,on_status) DO UPDATE SET claimed_at=excluded.claimed_at,reservation_id=excluded.reservation_id`).bind(claimedAt,job.id,claimedAt),
+    ])
+    if(!claim?.meta.changes) {
+      await env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='unavailable',updated_at=? WHERE o.id=? AND o.state='pending' AND EXISTS (SELECT 1 FROM monitor_action_cooldowns c JOIN http_checks h ON h.component_id=c.component_id WHERE h.id=o.check_id AND c.action_id=o.action_id AND c.on_status=o.status AND c.claimed_at+o.cooldown_minutes*60000>?)`).bind(claimedAt,job.id,claimedAt).run()
+      continue
+    }
     let result=await executeAction(env,job,claimedAt)
     if(result==='unavailable') {
       // A cosmetic rename can carry this exact claim to a new action version.
@@ -106,6 +116,12 @@ export async function flushActions(env:ActionEnvironment):Promise<void> {
         .bind(job.id,claimedAt,job.action_version).first()
       if(renamed) result='deferred'
     }
-    await env.DB.prepare("UPDATE worker_action_outbox SET state=?,claimed_at=CASE WHEN ?='deferred' THEN NULL ELSE claimed_at END,updated_at=? WHERE id=? AND state='executing' AND claimed_at=?").bind(result==='deferred'?'pending':result,result,Date.now(),job.id,claimedAt).run()
+    // A pre-send deferral or rejection must not consume the cooldown. The conditional
+    // delete cannot erase a later reservation by another execution.
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM monitor_action_cooldowns WHERE claimed_at=? AND reservation_id=? AND ? IN ('deferred','unavailable') AND EXISTS
+        (SELECT 1 FROM worker_action_outbox o JOIN http_checks h ON h.id=o.check_id WHERE o.id=? AND o.state='executing' AND o.claimed_at=? AND h.component_id=monitor_action_cooldowns.component_id AND o.action_id=monitor_action_cooldowns.action_id AND o.status=monitor_action_cooldowns.on_status)`).bind(claimedAt,job.id,result,job.id,claimedAt),
+      env.DB.prepare("UPDATE worker_action_outbox SET state=?,claimed_at=CASE WHEN ?='deferred' THEN NULL ELSE claimed_at END,updated_at=? WHERE id=? AND state='executing' AND claimed_at=?").bind(result==='deferred'?'pending':result,result,Date.now(),job.id,claimedAt),
+    ])
   }
 }

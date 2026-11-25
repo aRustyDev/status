@@ -39,14 +39,97 @@ function audit(db:D1Database, actor:Actor, action:string, id:string, token:strin
 }
 async function list(db:D1Database):Promise<(Row & {checkIds:string[]})[]> {
   const rows=(await db.prepare(`SELECT ${select} FROM worker_actions ORDER BY name,id`).all<Row>()).results
-  const links=(await db.prepare('SELECT action_id,check_id FROM worker_action_checks ORDER BY check_id').all<{action_id:string;check_id:string}>()).results
+  const links=(await db.prepare(`SELECT action_id,check_id FROM worker_action_checks UNION SELECT l.action_id,h.id AS check_id FROM monitor_action_links l JOIN http_checks h ON h.component_id=l.component_id ORDER BY check_id`).all<{action_id:string;check_id:string}>()).results
   return rows.map(row=>({...row,checkIds:links.filter(link=>link.action_id===row.id).map(link=>link.check_id)}))
+}
+
+type MonitorLink = { actionId:string; onStatus:'up'|'down'; delayMinutes:number; cooldownMinutes:number }
+async function monitorLinks(db:D1Database, componentId:string):Promise<{links:MonitorLink[];version:number}> {
+  // One SQL statement observes the links and revision in the same D1 snapshot.
+  const row=await statement(db, `WITH links AS (
+    SELECT action_id AS actionId,on_status AS onStatus,delay_minutes AS delayMinutes,cooldown_minutes AS cooldownMinutes FROM monitor_action_links WHERE component_id=? AND on_status IN ('up','down')
+    UNION SELECT a.id, status.value, 0, 0 FROM worker_action_checks ac JOIN http_checks h ON h.id=ac.check_id JOIN worker_actions a ON a.id=ac.action_id
+    JOIN json_each('["up","down"]') status ON (a.trigger_status=status.value OR a.trigger_status='all')
+    WHERE h.component_id=? AND NOT EXISTS (SELECT 1 FROM monitor_action_links l WHERE l.component_id=h.component_id AND l.action_id=a.id)
+    ORDER BY actionId,onStatus)
+    SELECT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=c.id) AS managed,
+      COALESCE((SELECT version FROM monitor_action_revisions WHERE component_id=c.id),0) AS version,
+      (SELECT json_group_array(json_object('actionId',actionId,'onStatus',onStatus,'delayMinutes',delayMinutes,'cooldownMinutes',cooldownMinutes)) FROM links) AS links
+    FROM components c WHERE c.id=?`,componentId,componentId,componentId).first<{managed:number;version:number;links:string}>()
+  if (!row) return fail(404,'Monitor not found')
+  if (row.managed) return fail(403,'Gatus-managed monitors are read-only')
+  return {links:JSON.parse(row.links) as MonitorLink[],version:row.version}
+}
+
+async function monitorActionApi(request:Request, db:D1Database, actor:Actor, componentId:string):Promise<Response> {
+  if (request.method==='GET') return json(await monitorLinks(db,componentId))
+  if (request.method!=='PUT') return fail(404,'Not found')
+  const input=await body(request)
+  if (Object.keys(input).some(k=>!['links','version'].includes(k)) || !Number.isSafeInteger(input.version) || Number(input.version)<0 || !Array.isArray(input.links) || input.links.length>40) return fail(400,'Invalid action links')
+  const links:MonitorLink[]=[]
+  const seen=new Set<string>()
+  for (const value of input.links) {
+    if (!value || typeof value!=='object' || Array.isArray(value)) return fail(400,'Invalid action link')
+    const item=value as Record<string,unknown>
+    if (Object.keys(item).some(k=>!['actionId','onStatus','delayMinutes','cooldownMinutes'].includes(k)) || typeof item.actionId!=='string' || !/^[a-f0-9-]{36}$/.test(item.actionId) || !['up','down'].includes(String(item.onStatus)) || !Number.isSafeInteger(item.delayMinutes) || Number(item.delayMinutes)<0 || Number(item.delayMinutes)>10080 || !Number.isSafeInteger(item.cooldownMinutes) || Number(item.cooldownMinutes)<0 || Number(item.cooldownMinutes)>10080) return fail(400,'Invalid action link')
+    const key=`${item.actionId}:${item.onStatus}`
+    if (seen.has(key)) return fail(400,'Duplicate action link')
+    seen.add(key); links.push(item as MonitorLink)
+  }
+  const current=await monitorLinks(db,componentId)
+  if (current.version!==input.version) return fail(409,'Monitor actions changed. Reload and try again.')
+  const order=(values:MonitorLink[])=>[...values].sort((a,b)=>`${a.actionId}:${a.onStatus}`.localeCompare(`${b.actionId}:${b.onStatus}`))
+  const group=(values:MonitorLink[],id:string)=>JSON.stringify(order(values.filter(link=>link.actionId===id)))
+  const changedIds=[...new Set([...current.links,...links].map(link=>link.actionId))].filter(id=>group(current.links,id)!==group(links,id))
+  if (changedIds.length===0) {
+    const results=await db.batch([
+      statement(db,'INSERT OR IGNORE INTO monitor_action_revisions (component_id) SELECT id FROM components WHERE id=?',componentId),
+      statement(db, `UPDATE monitor_action_revisions SET version=version WHERE component_id=? AND version=? AND EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?) AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=?)`,componentId,input.version,actor.id,actor.version,componentId),
+    ])
+    if (!results[1].meta.changes) return fail(409,'Monitor actions or identity changed. Reload and try again.')
+    return json(await monitorLinks(db,componentId))
+  }
+  const changed=JSON.stringify(changedIds)
+  const token=crypto.randomUUID(), selected=JSON.stringify(links)
+  const guard=`EXISTS (SELECT 1 FROM monitor_action_revisions WHERE component_id=? AND mutation_key=?)`
+  const operations=[
+    statement(db, 'INSERT OR IGNORE INTO monitor_action_revisions (component_id) SELECT id FROM components WHERE id=?',componentId),
+    statement(db, `UPDATE monitor_action_revisions SET version=version+1,mutation_key=? WHERE component_id=? AND version=?
+      AND EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?)
+      AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=?)
+      AND NOT EXISTS (SELECT 1 FROM json_each(?) item WHERE NOT EXISTS (SELECT 1 FROM worker_actions a WHERE a.id=json_extract(item.value,'$.actionId')))`, token,componentId,input.version,actor.id,actor.version,componentId,selected),
+    // Fence action editors opened before this monitor changed. Carry unaffected
+    // jobs to the new action version without resetting claims.
+    statement(db, `UPDATE worker_actions SET version=version+1 WHERE id IN (SELECT value FROM json_each(?)) AND ${guard}`,changed,componentId,token),
+    statement(db, `UPDATE worker_action_outbox AS o SET action_version=action_version+1 WHERE action_id IN (SELECT value FROM json_each(?)) AND state IN ('pending','executing') AND EXISTS (SELECT 1 FROM worker_actions a WHERE a.id=o.action_id AND a.version=o.action_version+1) AND ${guard}
+      AND (NOT EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND h.component_id=?) OR EXISTS (SELECT 1 FROM monitor_action_links l JOIN json_each(?) j ON json_extract(j.value,'$.actionId')=l.action_id AND json_extract(j.value,'$.onStatus')=l.on_status AND json_extract(j.value,'$.delayMinutes')=l.delay_minutes AND json_extract(j.value,'$.cooldownMinutes')=l.cooldown_minutes WHERE l.id=o.link_id))`,changed,componentId,token,componentId,selected),
+    // Preserve a legacy degraded trigger when the action remains linked. The monitor editor only exposes down and recovery.
+    statement(db, `INSERT OR IGNORE INTO monitor_action_links (id,component_id,action_id,on_status,delay_minutes,cooldown_minutes)
+      SELECT lower(hex(randomblob(16))),?,a.id,'degraded',0,0 FROM worker_action_checks ac JOIN http_checks h ON h.id=ac.check_id JOIN worker_actions a ON a.id=ac.action_id
+      WHERE h.component_id=? AND a.trigger_status IN ('degraded','all') AND EXISTS (SELECT 1 FROM json_each(?) j WHERE json_extract(j.value,'$.actionId')=a.id) AND ${guard}`,componentId,componentId,selected,componentId,token),
+    statement(db, `DELETE FROM worker_action_checks WHERE check_id IN (SELECT id FROM http_checks WHERE component_id=?) AND NOT EXISTS (SELECT 1 FROM worker_actions a WHERE a.id=worker_action_checks.action_id AND a.trigger_status='degraded' AND NOT EXISTS (SELECT 1 FROM json_each(?) j WHERE json_extract(j.value,'$.actionId')=a.id)) AND ${guard}`,componentId,selected,componentId,token),
+    statement(db, `DELETE FROM monitor_action_links WHERE component_id=? AND ((on_status='degraded' AND action_id NOT IN (SELECT json_extract(value,'$.actionId') FROM json_each(?))) OR (on_status<>'degraded' AND NOT EXISTS (SELECT 1 FROM json_each(?) j WHERE json_extract(j.value,'$.actionId')=monitor_action_links.action_id AND json_extract(j.value,'$.onStatus')=monitor_action_links.on_status AND json_extract(j.value,'$.delayMinutes')=monitor_action_links.delay_minutes AND json_extract(j.value,'$.cooldownMinutes')=monitor_action_links.cooldown_minutes))) AND ${guard}`,componentId,selected,selected,componentId,token),
+  ]
+  for (const link of links) operations.push(statement(db, `INSERT OR IGNORE INTO monitor_action_links (id,component_id,action_id,on_status,delay_minutes,cooldown_minutes) SELECT ?,?,?,?,?,? WHERE ${guard}`,crypto.randomUUID(),componentId,link.actionId,link.onStatus,link.delayMinutes,link.cooldownMinutes,componentId,token))
+  // Legacy jobs with unchanged zero-delay policies can follow the newly
+  // materialized link without losing their claim or execution fence.
+  operations.push(statement(db, `UPDATE worker_action_outbox AS o SET link_id=(SELECT l.id FROM monitor_action_links l JOIN http_checks h ON h.component_id=l.component_id WHERE h.id=o.check_id AND l.action_id=o.action_id AND l.on_status=o.status AND l.delay_minutes=0 AND l.cooldown_minutes=0),
+    action_version=(SELECT a.version FROM worker_actions a WHERE a.id=o.action_id)
+    WHERE o.link_id IS NULL AND o.state IN ('pending','executing') AND o.check_id IN (SELECT id FROM http_checks WHERE component_id=?) AND ${guard}
+      AND EXISTS (SELECT 1 FROM worker_actions a WHERE a.id=o.action_id AND a.version IN (o.action_version,o.action_version+1))
+      AND EXISTS (SELECT 1 FROM monitor_action_links l JOIN http_checks h ON h.component_id=l.component_id WHERE h.id=o.check_id AND l.action_id=o.action_id AND l.on_status=o.status AND l.delay_minutes=0 AND l.cooldown_minutes=0)`,componentId,componentId,token))
+  operations.push(statement(db, `INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) SELECT ?,?,'update','monitor-actions',?,?, '{}' WHERE ${guard}`,crypto.randomUUID(),actor.email,componentId,Date.now(),componentId,token))
+  const results=await db.batch(operations)
+  if (!results[1].meta.changes) return fail(409,'Monitor actions or identity changed. Reload and try again.')
+  return json(await monitorLinks(db,componentId))
 }
 
 /** The caller enforces Access, admin role and same-origin mutations. */
 export async function actionApi(request:Request, env:ActionEnvironment, actor:Actor, route:string):Promise<Response> {
   const method=request.method, db=env.DB
   if (env.ACTIONS_READY !== 'true' || actionEndpoints(env.ACTION_ENDPOINTS).size===0) return fail(503,'Actions are unavailable')
+  const monitorMatch=/^\/admin\/actions\/monitor\/([a-f0-9-]{36})$/.exec(route)
+  if (monitorMatch) return monitorActionApi(request,db,actor,monitorMatch[1]!)
   if (route==='/admin/actions/destinations' && method==='GET') return json([...actionEndpoints(env.ACTION_ENDPOINTS).values()].map(({id,name})=>({id,name})))
   if (route==='/admin/actions/checks' && method==='GET') return json((await db.prepare(`SELECT h.id,c.name,h.component_id AS componentId,h.config_version AS configVersion FROM http_checks h JOIN components c ON c.id=h.component_id
     WHERE NOT EXISTS (SELECT 1 FROM gatus_sources g WHERE g.component_id=c.id) ORDER BY c.name,h.id`).all()).results)
@@ -93,7 +176,7 @@ export async function actionApi(request:Request, env:ActionEnvironment, actor:Ac
     const current=await statement(db,`SELECT name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,trigger_status FROM worker_actions WHERE id=? AND version=?`,id,version)
       .first<{name:string;endpoint_id:string;endpoint_fingerprint:string;vault_id:number;secret_id:number;enabled:number;trigger_status:string}>()
     if (!current) return fail(409,'Action changed. Reload and try again.')
-    const links=(await statement(db,'SELECT check_id FROM worker_action_checks WHERE action_id=?',id).all<{check_id:string}>()).results
+    const links=(await statement(db,`SELECT check_id FROM worker_action_checks WHERE action_id=? UNION SELECT h.id AS check_id FROM monitor_action_links l JOIN http_checks h ON h.component_id=l.component_id WHERE l.action_id=?`,id,id).all<{check_id:string}>()).results
     equivalent=current.endpoint_id===input.endpointId && current.endpoint_fingerprint===fingerprint && current.vault_id===input.vaultId && current.secret_id===input.secretId && current.enabled===(input.enabled?1:0) && current.trigger_status===input.triggerStatus
       && links.length===checks.length && links.every(link=>checks.includes(link.check_id))
     unchanged=equivalent && current.name===input.name.trim()
@@ -107,8 +190,12 @@ export async function actionApi(request:Request, env:ActionEnvironment, actor:Ac
     ? statement(db,`INSERT INTO worker_actions (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,trigger_status,mutation_key,created_at,updated_at)
       SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM worker_actions)<20 AND ${unchangedChecks}`,id,input.name.trim(),input.endpointId,fingerprint,input.vaultId,input.secretId,input.enabled?1:0,input.triggerStatus,token,now,now,snapshots)
     : statement(db,`UPDATE worker_actions SET name=?,endpoint_id=?,endpoint_fingerprint=?,vault_id=?,secret_id=?,enabled=?,trigger_status=?,version=version+?,mutation_key=?,updated_at=? WHERE id=? AND version=? AND ${unchangedChecks}`,input.name.trim(),input.endpointId,fingerprint,input.vaultId,input.secretId,input.enabled?1:0,input.triggerStatus,unchanged?0:1,token,now,id,version,snapshots)
-  const operations:D1PreparedStatement[]=[mutation,statement(db,'DELETE FROM worker_action_checks WHERE action_id=? AND EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)',id,id,token)]
-  for (const check of checks) operations.push(statement(db,'INSERT INTO worker_action_checks (action_id,check_id) SELECT ?,? WHERE EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)',id,check,id,token))
+  const operations:D1PreparedStatement[]=[mutation,
+    statement(db, `INSERT OR IGNORE INTO monitor_action_revisions (component_id) SELECT h.component_id FROM http_checks h WHERE h.id IN (SELECT check_id FROM worker_action_checks WHERE action_id=?) OR h.id IN (SELECT value FROM json_each(?)) OR h.component_id IN (SELECT component_id FROM monitor_action_links WHERE action_id=?)`,id,JSON.stringify(checks),id),
+    statement(db, `UPDATE monitor_action_revisions SET version=version+1 WHERE component_id IN (SELECT h.component_id FROM http_checks h WHERE h.id IN (SELECT check_id FROM worker_action_checks WHERE action_id=?) OR h.id IN (SELECT value FROM json_each(?)) OR h.component_id IN (SELECT component_id FROM monitor_action_links WHERE action_id=?)) AND EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)`,id,JSON.stringify(checks),id,id,token),
+    statement(db, `DELETE FROM monitor_action_links WHERE action_id=? AND component_id IN (SELECT component_id FROM http_checks) AND component_id NOT IN (SELECT component_id FROM http_checks WHERE id IN (SELECT value FROM json_each(?))) AND EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)`,id,JSON.stringify(checks),id,token),
+    statement(db,'DELETE FROM worker_action_checks WHERE action_id=? AND check_id NOT IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)',id,JSON.stringify(checks),id,token)]
+  for (const check of checks) operations.push(statement(db,'INSERT OR IGNORE INTO worker_action_checks (action_id,check_id) SELECT ?,? WHERE EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)',id,check,id,token))
   if (method==='PATCH' && equivalent && !unchanged) {
     // Carry pending and claimed work without resetting a claim or retrying an
     // action that may already have reached its destination.

@@ -5,6 +5,7 @@ import { Alert, getCurrentUser, Modal, ModalFooter } from '@better-forge/ui'
 import { api } from '../../api/client'
 import { useCapabilities } from '../../capabilities'
 import LegacyMonitorFormModal from './LegacyMonitorFormModal'
+import { CloudflareActionsPanel } from './CloudflareActionsPanel'
 import UpstreamMonitorFormModal, { type CloudflareProfile } from '../../../../admin-node/src/components/monitors/MonitorFormModal'
 
 type Component = Monitor & { uuid: string; version: number; manualStatus: string; position: number; channelIds?: string[] }
@@ -54,6 +55,8 @@ function CloudflareMonitorFormModal({ monitor, allTags = [], onClose, onSaved, s
     isAdmin,
     monitorAuth: !!capabilities.monitorAuth,
     monitorAlerts: isAdmin && !!capabilities.notifications,
+    monitorActions: isAdmin && !!capabilities.actions,
+    actionsPanel: isAdmin && capabilities.actions ? <CloudflareActionsPanel componentId={component?.uuid} /> : undefined,
     alertChannels: alertChannels.data ?? [],
     alertChannelIds: initialComponent?.channelIds ?? [],
     listVaults: () => api.get('/admin/vaults'),

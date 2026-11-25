@@ -26,6 +26,8 @@ export interface CloudflareProfile {
   isAdmin: boolean
   monitorAuth?: boolean
   monitorAlerts?: boolean
+  monitorActions?: boolean
+  actionsPanel?: React.ReactNode
   alertChannels?: ChannelOption<string>[]
   alertChannelIds?: string[]
   listVaults?: () => Promise<VaultSummary[]>
@@ -521,7 +523,8 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
             <ChannelsSection channels={cloudflare.alertChannels ?? []} selected={selectedAlertChannelIds} onChange={setSelectedAlertChannelIds} />
             {initialAlertChannelIds.filter(id => !(cloudflare.alertChannels ?? []).some(channel => channel.id === id) && selectedAlertChannelIds.has(id)).map(id => <p key={id} role="alert">A selected channel is unavailable. <button type="button" className="underline" onClick={() => setSelectedAlertChannelIds(prev => { const next = new Set(prev); next.delete(id); return next })}>Remove unavailable channel</button></p>)}
           </> : <ChannelsSection channels={channels} selected={selectedChannelIds} onChange={setSelectedChannelIds} />)}
-          {sidePanel === 'actions' && availableActions !== null && actionLinks !== null && (
+          {cloudflare?.monitorActions && <div className={sidePanel === 'actions' ? undefined : 'hidden'}>{cloudflare.actionsPanel}</div>}
+          {!cloudflare && sidePanel === 'actions' && availableActions !== null && actionLinks !== null && (
             <ActionsSection actions={availableActions} links={actionLinks} onChange={setActionLinks} />
           )}
           {sidePanel === 'dependencies' && (
@@ -541,7 +544,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
       {/* ── Vertical tab strip ──────────────────────────────────────────── */}
       {cloudflare
-        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} canEditAuth={cloudflare.isAdmin && !!cloudflare.monitorAuth} canEditAlerts={cloudflare.isAdmin && !!cloudflare.monitorAlerts} checkCount={checkCount} tagCount={tags.length} alertCount={selectedAlertChannelIds.size} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
+        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} canEditAuth={cloudflare.isAdmin && !!cloudflare.monitorAuth} canEditAlerts={cloudflare.isAdmin && !!cloudflare.monitorAlerts} canEditActions={cloudflare.isAdmin && !!cloudflare.monitorActions} checkCount={checkCount} tagCount={tags.length} alertCount={selectedAlertChannelIds.size} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
         : <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" />}
 
       </div>{/* outer flex row */}

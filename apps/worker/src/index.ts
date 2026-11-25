@@ -571,11 +571,11 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     // Notification links belong to monitors and are transferred by triggers.
     let replay: Receipt | null
     try {
-      replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND (component_id=? OR NOT EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=http_checks.id))',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,submittedVersion,componentId),[audit(db,user,'update','check',recordId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus},{table:'http_checks',token})],receipt,recordId,submittedVersion+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
+      replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND (component_id=? OR (NOT EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=http_checks.id) AND NOT EXISTS (SELECT 1 FROM monitor_action_links WHERE component_id=http_checks.component_id)))',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,submittedVersion,componentId),[audit(db,user,'update','check',recordId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus},{table:'http_checks',token})],receipt,recordId,submittedVersion+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
     } catch (error) {
       if (error instanceof HttpError && error.status === 409 && error.message === 'This record changed. Reload and try again.') {
         const linked = await stmt(db, `SELECT 1 AS present FROM http_checks h WHERE h.id=? AND h.config_version=? AND h.component_id<>? AND
-          EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=h.id)`,recordId,submittedVersion,componentId).first()
+          (EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=h.id) OR EXISTS (SELECT 1 FROM monitor_action_links WHERE component_id=h.component_id))`,recordId,submittedVersion,componentId).first()
         if (linked) throw new HttpError(409,'Unlink actions before moving this check to another monitor.')
       }
       throw error
