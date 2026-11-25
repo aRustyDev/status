@@ -7,7 +7,7 @@ import { YamlViewModal } from '../YamlViewModal'
 import { AuthSection, readAuth } from './AuthSection'
 import { CloudflareSideTabStrip } from './CloudflareSideTabStrip'
 import { SidePanelFrame, SideTabStrip, type SideTab } from '@better-forge/ui'
-import { ActionsSection, ChannelsSection, CredentialsSection, DependenciesSection, PANEL_META, RequestSection, hasAccountCredentials, hasDatabaseCredentials, usesCredentials, type SidePanelKey } from './MonitorSidePanel'
+import { ActionsSection, ChannelsSection, CredentialsSection, DependenciesSection, PANEL_META, RequestSection, hasAccountCredentials, hasDatabaseCredentials, usesCredentials, type ChannelOption, type SidePanelKey } from './MonitorSidePanel'
 import { HttpAssertionsFields } from './HttpAssertionsFields'
 import { StatusRangesFields, statusRangesProblem, type StatusRange } from './StatusRangesFields'
 import { MonitorTypeConfigFields } from './MonitorTypeConfigFields'
@@ -25,17 +25,21 @@ import { Alert } from '@better-forge/ui'
 export interface CloudflareProfile {
   isAdmin: boolean
   monitorAuth?: boolean
+  monitorAlerts?: boolean
+  alertChannels?: ChannelOption<string>[]
+  alertChannelIds?: string[]
   listVaults?: () => Promise<VaultSummary[]>
   listVaultSecrets?: (vaultId: number) => Promise<SecretSummary[]>
   statusUnavailable?: boolean | undefined
   settingsUnavailable?: boolean | undefined
+  alertSettingsUnavailable?: boolean | undefined
   retrySettings?: (() => void) | undefined
   endpoints: { id: string; name: string }[]
   check?: { id: string; version: number; endpointId: string; enabled: boolean | number; intervalMinutes: number; expectedStatus: number; advancedConfig?: Record<string, unknown> | null; advancedConfigInvalid?: boolean } | undefined
   manualStatus: string
   position: number
   history?: React.ReactNode
-  save: (draft: { name: string; manualStatus: string; position: number; tags: MonitorTag[]; check?: Record<string, unknown> }) => Promise<void>
+  save: (draft: { name: string; manualStatus: string; position: number; tags: MonitorTag[]; channelIds?: string[]; expectedChannelIds?: string[]; check?: Record<string, unknown> }) => Promise<void>
   test: (draft: { endpointId: string; expectedStatus: number; advancedConfig: Record<string, unknown>; checkId?: string; checkVersion?: number }) => Promise<TestResult>
 }
 
@@ -131,6 +135,8 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   const [vaultError, setVaultError] = useState(false)
   const [channels, setChannels]             = useState<NotificationChannel[]>([])
   const [selectedChannelIds, setSelectedChannelIds] = useState<Set<number>>(new Set())
+  const [initialAlertChannelIds] = useState(() => cloudflare?.alertChannelIds ?? [])
+  const [selectedAlertChannelIds, setSelectedAlertChannelIds] = useState<Set<string>>(() => new Set(initialAlertChannelIds))
   // Actions are managed by admins only: for anyone else the list does not load and the tab stays hidden.
   const [availableActions, setAvailableActions] = useState<Action[] | null>(null)
   const [actionLinks, setActionLinks]           = useState<MonitorAction[] | null>(monitor ? null : [])
@@ -313,7 +319,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         const basicUnchanged = previous && endpointId === previous.endpointId && enabled === Boolean(previous.enabled) && intervalSecs === previous.intervalMinutes * 60 && Number(config['expectedStatus'] ?? 200) === previous.expectedStatus
         if (previous?.advancedConfigInvalid && !(basicUnchanged && advancedUnchanged)) throw new Error('Check settings are invalid. Contact an administrator to review the configuration.')
         const check = cloudflare.isAdmin && endpointId && !(basicUnchanged && advancedUnchanged) ? { ...(previous ? { id: previous.id, version: previous.version } : {}), endpointId, enabled, intervalMinutes: intervalSecs / 60, expectedStatus: Number(config['expectedStatus'] ?? 200), advancedConfig: previous && advancedUnchanged ? previous.advancedConfig ?? null : advanced } : undefined
-        await cloudflare.save({ name, manualStatus, position, tags, ...(check ? { check } : {}) })
+        const channelIds = [...selectedAlertChannelIds]
+        const alertsChanged = cloudflare.monitorAlerts && comparable([...channelIds].sort()) !== comparable([...initialAlertChannelIds].sort())
+        await cloudflare.save({ name, manualStatus, position, tags, ...(alertsChanged ? { channelIds, ...(isEdit ? { expectedChannelIds: initialAlertChannelIds } : {}) } : {}), ...(check ? { check } : {}) })
         onSaved()
       } catch (err) { setError(err instanceof Error ? err.message : 'Save failed') } finally { setLoading(false) }
       return
@@ -401,7 +409,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         {/* Header */}
         <ModalHeader icon="radio_button_checked" title={isEdit ? 'Edit Monitor' : 'New Monitor'} onClose={onClose} />
 
-        {cloudflare?.statusUnavailable && <div className="p-6"><Alert tone="error">{cloudflare.settingsUnavailable ? 'Check settings are unavailable. Your draft is preserved.' : 'Monitor status is unavailable. Your draft is preserved while the latest status is loaded.'}</Alert>{cloudflare.retrySettings && <button type="button" className="btn btn-secondary mt-2" onClick={cloudflare.retrySettings}>Retry check settings</button>}</div>}
+        {cloudflare?.statusUnavailable && <div className="p-6"><Alert tone="error">{cloudflare.alertSettingsUnavailable ? 'Alert channels are unavailable. Your draft is preserved.' : cloudflare.settingsUnavailable ? 'Check settings are unavailable. Your draft is preserved.' : 'Monitor status is unavailable. Your draft is preserved while the latest status is loaded.'}</Alert>{cloudflare.retrySettings && <button type="button" className="btn btn-secondary mt-2" onClick={cloudflare.retrySettings}>{cloudflare.alertSettingsUnavailable ? 'Retry alert channels' : 'Retry check settings'}</button>}</div>}
         <form onSubmit={handleSubmit} style={{ display: cloudflare?.statusUnavailable ? 'none' : undefined }}>
         <div className="p-6 space-y-4">
           {error && <Alert tone="error">{error}</Alert>}
@@ -508,7 +516,11 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
           {sidePanel === 'credentials' && <CredentialsSection config={config} updateConfig={updateConfig} vaultPicker={vaultPicker} userKey={isDatabaseType(type) ? 'user' : 'username'} />}
           {sidePanel === 'auth' && <AuthSection auth={auth} onChange={(next) => updateConfig('auth', cloudflare && next.type === 'none' ? undefined : next)} vaultPicker={vaultPicker} cloudflare={!!cloudflare} vaultError={vaultError} />}
           <div className={sidePanel === 'tags' ? undefined : 'hidden'}><TagsSection tags={tags} allTags={allTags} onChange={setTags} limits={cloudflare ? { count: 20, labelLength: 40 } : undefined} /></div>
-          {sidePanel === 'channels' && <ChannelsSection channels={channels} selected={selectedChannelIds} onChange={setSelectedChannelIds} />}
+          {sidePanel === 'channels' && (cloudflare ? <>
+            <p className="text-xs">Alerts are sent when an HTTP check runs and its status changes.</p>
+            <ChannelsSection channels={cloudflare.alertChannels ?? []} selected={selectedAlertChannelIds} onChange={setSelectedAlertChannelIds} />
+            {initialAlertChannelIds.filter(id => !(cloudflare.alertChannels ?? []).some(channel => channel.id === id) && selectedAlertChannelIds.has(id)).map(id => <p key={id} role="alert">A selected channel is unavailable. <button type="button" className="underline" onClick={() => setSelectedAlertChannelIds(prev => { const next = new Set(prev); next.delete(id); return next })}>Remove unavailable channel</button></p>)}
+          </> : <ChannelsSection channels={channels} selected={selectedChannelIds} onChange={setSelectedChannelIds} />)}
           {sidePanel === 'actions' && availableActions !== null && actionLinks !== null && (
             <ActionsSection actions={availableActions} links={actionLinks} onChange={setActionLinks} />
           )}
@@ -529,7 +541,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
       {/* ── Vertical tab strip ──────────────────────────────────────────── */}
       {cloudflare
-        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} canEditAuth={cloudflare.isAdmin && !!cloudflare.monitorAuth} checkCount={checkCount} tagCount={tags.length} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
+        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} canEditAuth={cloudflare.isAdmin && !!cloudflare.monitorAuth} canEditAlerts={cloudflare.isAdmin && !!cloudflare.monitorAlerts} checkCount={checkCount} tagCount={tags.length} alertCount={selectedAlertChannelIds.size} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
         : <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" />}
 
       </div>{/* outer flex row */}

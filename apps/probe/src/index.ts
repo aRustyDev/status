@@ -2,6 +2,7 @@ import { endpointFingerprint, parseEndpoints, type Endpoint } from '../../worker
 import { evaluateHttpMonitor, isBlockedRedirect, parsePersistedHttpConfig, type HttpMonitorConfig, type HttpMonitorResult } from './http-monitor'
 import { resolveMonitorCredentialSnapshot, type MonitorCredentialSnapshot } from '../../worker/src/vault-resolver'
 import { channelEndpoints, enqueueTransition, flushChannelDeliveries } from '../../worker/src/channels-runtime'
+import { emailReady, type EmailChannelEnv } from '../../worker/src/email-channel'
 import { enqueueActionTransition, flushActions } from '../../worker/src/actions-runtime'
 
 type Check = {
@@ -13,11 +14,11 @@ type Check = {
   last_scheduled_at: number | null
   advanced_config: string | null
 }
-type Environment = { DB: D1Database; ENDPOINTS: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; [binding: string]: unknown }
+type Environment = { DB: D1Database; ENDPOINTS: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; [binding: string]: unknown } & EmailChannelEnv
 type Result = { status: 'up' | 'down'; effectiveStatus: 'up' | 'down' | 'degraded'; httpStatus: number | null; latencyMs: number; completedAt: number; credentialUnavailable?: boolean }
 
 function channelsReady(env: Environment): boolean {
-  return env.CHANNELS_READY === 'true' && (channelEndpoints(typeof env.CHANNEL_ENDPOINTS === 'string' ? env.CHANNEL_ENDPOINTS : undefined).size > 0)
+  return env.CHANNELS_READY === 'true' && (channelEndpoints(typeof env.CHANNEL_ENDPOINTS === 'string' ? env.CHANNEL_ENDPOINTS : undefined).size > 0 || emailReady(env))
 }
 
 // Cloudflare Workers VPC connection errors documented at

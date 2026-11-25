@@ -31,11 +31,17 @@ test('concurrent Access verification in workerd keeps requests isolated and reus
     const sql = readFileSync(new URL('../migrations/0001_board.sql', import.meta.url), 'utf8')
     await db.batch(sql.split(';').map(value => value.trim()).filter(Boolean).map(value => db.prepare(value)))
     const request = () => miniflare.dispatchFetch('https://status.example/api/v1/auth/me', { headers: { 'Cf-Access-Jwt-Assertion': jwt } })
-    const concurrent = await Promise.all(Array.from({ length: 12 }, request))
-    for (const response of concurrent) assert.equal(response.status, 200, await response.text())
+    // Consume each response as it arrives rather than holding streams open
+    // while the remaining concurrent requests finish.
+    const concurrent = await Promise.all(Array.from({ length: 12 }, async () => {
+      const response = await request()
+      return { status: response.status, body: await response.text() }
+    }))
+    for (const response of concurrent) assert.equal(response.status, 200, response.body)
     const coldFetches = keyFetches
     assert.ok(coldFetches > 0)
-    assert.equal((await request()).status, 200)
+    const warm = await request()
+    assert.equal(warm.status, 200, await warm.text())
     assert.equal(keyFetches, coldFetches)
   } finally { await miniflare.dispose() }
 })

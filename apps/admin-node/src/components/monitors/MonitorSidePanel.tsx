@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { isDatabaseType } from '@bsp/shared'
-import type { Action, MonitorAction, MonitorType, NotificationChannel } from '@bsp/shared'
+import type { Action, MonitorAction, MonitorType } from '@bsp/shared'
 import type { VaultRef } from '@better-forge/contracts'
 import type { SidePanelMeta } from '@better-forge/ui'
 import { ConnectionStringSection, CredentialSection } from '@better-forge/ui'
@@ -121,10 +121,12 @@ export function CredentialsSection({ config, updateConfig, vaultPicker, userKey 
   )
 }
 
-export function ChannelsSection({ channels, selected, onChange }: {
-  channels: NotificationChannel[]
-  selected: Set<number>
-  onChange: (update: (prev: Set<number>) => Set<number>) => void
+export type ChannelOption<T extends string | number> = { id: T; name: string; type: string; enabled: boolean | number; available?: boolean }
+
+export function ChannelsSection<T extends string | number>({ channels, selected, onChange }: {
+  channels: ChannelOption<T>[]
+  selected: Set<T>
+  onChange: (update: (prev: Set<T>) => Set<T>) => void
 }) {
   return (
     <div className="space-y-2">
@@ -132,12 +134,13 @@ export function ChannelsSection({ channels, selected, onChange }: {
         <p className="text-xs" style={{ color: 'var(--m3-secondary)' }}>No notification channels configured. Create one in the Notifications section.</p>
       )}
       {channels.map((ch) => (
-        <SelectableRow key={ch.id} checked={selected.has(ch.id)} onChange={(on) => onChange((prev) => toggleInSet(prev, ch.id, on))}>
+        <SelectableRow key={ch.id} checked={selected.has(ch.id)} disabled={ch.available === false && !selected.has(ch.id)} onChange={(on) => onChange((prev) => { const next = new Set(prev); if (on) next.add(ch.id); else next.delete(ch.id); return next })}>
           <span className="material-symbols-outlined flex-shrink-0" aria-hidden="true" style={{ fontSize: '16px', color: 'var(--admin-icon-color)' }}>
             {ch.type === 'email' ? 'mail' : 'webhook'}
           </span>
           <span className="text-sm flex-1" style={{ color: 'var(--m3-on-surface)' }}>{ch.name}</span>
           {!ch.enabled && <span className="text-xs" style={{ color: 'var(--m3-secondary)' }}>disabled</span>}
+          {ch.available === false && <span className="text-xs" style={{ color: 'var(--m3-secondary)' }}>unavailable</span>}
         </SelectableRow>
       ))}
     </div>
@@ -230,12 +233,12 @@ export function DependenciesSection({ monitors, selected, onChange }: {
   )
 }
 
-function SelectableRow({ checked, onChange, children }: { checked: boolean; onChange: (checked: boolean) => void; children: ReactNode }) {
+function SelectableRow({ checked, onChange, children, disabled = false }: { checked: boolean; onChange: (checked: boolean) => void; children: ReactNode; disabled?: boolean }) {
   return (
-    <label className="flex items-center gap-3 cursor-pointer select-none rounded-lg px-3 py-2 transition-colors hover:bg-surface-container"
+    <label className={`flex items-center gap-3 select-none rounded-lg px-3 py-2 transition-colors ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:bg-surface-container'}`}
       style={{ border: '1px solid var(--m3-outline-variant)' }}
     >
-      <input type="checkbox" checked={checked}
+      <input type="checkbox" checked={checked} disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
         className="w-4 h-4 rounded"
       />

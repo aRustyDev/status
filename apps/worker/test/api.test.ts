@@ -71,7 +71,7 @@ let db: TestDatabase = sqlite
 let miniflare: Miniflare | undefined
 const issuer = 'https://test.cloudflareaccess.com'
 const audience = 'status-test'
-const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; CHANNELS_READY?: string; CHANNEL_ENDPOINTS?: string; ACTIONS_READY?: string; ACTION_ENDPOINTS?: string } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
+const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; CHANNELS_READY?: string; CHANNEL_ENDPOINTS?: string; ACTIONS_READY?: string; ACTION_ENDPOINTS?: string; EMAIL_READY?: string; EMAIL_FROM?: string; EMAIL_DESTINATIONS?: string; EMAIL?: { send: (message: unknown) => Promise<{messageId:string}> } } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
 const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
@@ -97,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -119,6 +119,11 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0009_monitor_auth.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0009_channels.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0009_actions.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0010_monitor_alert_links.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0011_email_channels.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0012_notification_delivery_state.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0013_notification_unlink_cancel.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0014_monitor_alert_channel_limit.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -577,7 +582,7 @@ test('check configuration requires an approved endpoint and rejects stale change
   assert.equal(Number((await db.prepare('SELECT expected_status FROM http_checks WHERE id=?').bind(created.body.id).first())?.expected_status), 204)
 })
 
-test('moving a check with actions or channels is rejected atomically until they are unlinked', async () => {
+test('moving an action-linked check is blocked; channel-only moves preserve monitor assignments', async () => {
   const previousEndpoints=env.ENDPOINTS
   const endpoint = { id:'action-move-endpoint', name:'Action move endpoint', url:'https://api.example/action-move' }
   env.ENDPOINTS=JSON.stringify([endpoint])
@@ -593,16 +598,18 @@ test('moving a check with actions or channels is rejected atomically until they 
     db.prepare('INSERT INTO worker_action_checks (action_id,check_id) VALUES (?,?)').bind('move-action',checkId),
     db.prepare("INSERT INTO worker_action_outbox (id,action_id,action_version,check_id,check_version,scheduled_at,status,state,created_at,updated_at) VALUES ('move-job','move-action',1,?,1,100,'down','pending',0,0)").bind(checkId),
     db.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,created_at,updated_at) VALUES ('move-channel','Move guard channel','api','fingerprint',1,1,0,0)"),
+    db.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,created_at,updated_at) VALUES ('target-channel','Move target channel','api','fingerprint',1,1,0,0)"),
+    db.prepare("INSERT INTO monitor_notification_channels (component_id,channel_id) VALUES (?,'target-channel')").bind(second.body.id),
     db.prepare('INSERT INTO notification_channel_checks (channel_id,check_id) VALUES (?,?)').bind('move-channel',checkId),
     db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,state,created_at,updated_at) VALUES ('move-notification','move-channel',1,?,1,100,'down','pending',0,0)").bind(checkId),
   ])
   const auditsBefore=Number((await db.prepare("SELECT count(*) AS count FROM audit_events WHERE entity_type='check' AND entity_id=?").bind(checkId).first())?.count)
   const moved=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:1})
   assert.equal(moved.response.status,409)
-  assert.match((moved.body as unknown as {error:string}).error,/Unlink notification channels and actions before moving/)
+  assert.match((moved.body as unknown as {error:string}).error,/Unlink actions before moving/)
   const keyedMove=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:1},'https://status.example',`${Date.now()}.${crypto.randomUUID()}`)
   assert.equal(keyedMove.response.status,409)
-  assert.match((keyedMove.body as unknown as {error:string}).error,/Unlink notification channels and actions before moving/)
+  assert.match((keyedMove.body as unknown as {error:string}).error,/Unlink actions before moving/)
   const after=await db.prepare('SELECT component_id,config_version FROM http_checks WHERE id=?').bind(checkId).first<{component_id:string;config_version:number}>()
   assert.equal(after?.component_id,first.body.id);assert.equal(after?.config_version,1)
   assert.equal(Number((await db.prepare("SELECT count(*) AS count FROM audit_events WHERE entity_type='check' AND entity_id=?").bind(checkId).first())?.count),auditsBefore)
@@ -616,13 +623,14 @@ test('moving a check with actions or channels is rejected atomically until they 
   await db.prepare('DELETE FROM worker_action_checks WHERE action_id=? AND check_id=?').bind('move-action',checkId).run()
   const retryKey=`${Date.now()}.${crypto.randomUUID()}`
   const channelStillLinked=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:2},'https://status.example',retryKey)
-  assert.equal(channelStillLinked.response.status,409)
-  assert.match((channelStillLinked.body as unknown as {error:string}).error,/Unlink notification channels and actions before moving/)
-  await db.prepare('DELETE FROM notification_channel_checks WHERE channel_id=? AND check_id=?').bind('move-channel',checkId).run()
-  const unlinkedMove=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:2},'https://status.example',retryKey)
-  assert.equal(unlinkedMove.response.status,200)
+  assert.equal(channelStillLinked.response.status,200)
+  const links=await db.prepare('SELECT component_id,channel_id FROM monitor_notification_channels WHERE channel_id IN (?,?) ORDER BY channel_id').bind('move-channel','target-channel').all<{component_id:string;channel_id:string}>()
+  assert.deepEqual(links.results.map(row=>({...row})),[{component_id:first.body.id,channel_id:'move-channel'},{component_id:second.body.id,channel_id:'target-channel'}])
+  const checkLinks=await db.prepare('SELECT channel_id FROM notification_channel_checks WHERE check_id=?').bind(checkId).all<{channel_id:string}>()
+  assert.deepEqual(checkLinks.results.map(row=>({...row})),[{channel_id:'target-channel'}])
+  assert.equal((await db.prepare("SELECT state FROM notification_outbox WHERE id='move-notification'").first())?.state,'failed')
   await db.prepare('DELETE FROM worker_actions WHERE id=?').bind('move-action').run()
-  await db.prepare('DELETE FROM notification_channels WHERE id=?').bind('move-channel').run()
+  await db.prepare('DELETE FROM notification_channels WHERE id IN (?,?)').bind('move-channel','target-channel').run()
   await db.prepare('DELETE FROM http_checks WHERE id=?').bind(checkId).run()
   env.ENDPOINTS=previousEndpoints
 })
@@ -1496,6 +1504,249 @@ test('actions capability and routes require explicit readiness and an Access adm
     assert.equal((await request('/api/v1/bsp/admin/actions',adminToken)).response.status,200)
     assert.equal((await request('/api/v1/bsp/admin/actions',adminToken,'POST',{})).response.status,400)
   } finally { delete env.VAULT_ENCRYPTION_KEY; delete env.ACTION_ENDPOINTS; delete env.ACTIONS_READY }
+})
+
+test('monitor alert selections persist atomically, including manual monitors, and reject stale changes', async () => {
+  const key = () => `${Date.now()}.${crypto.randomUUID()}`
+  const path = '/api/v1/bsp/admin/monitors'
+  const channelA = crypto.randomUUID(), channelB = crypto.randomUUID(), missing = crypto.randomUUID()
+  const now = Date.now()
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  env.CHANNEL_ENDPOINTS = JSON.stringify([{ id: 'sink', name: 'Approved sink', url: 'https://sink.example/' }])
+  env.CHANNELS_READY = 'true'
+  env.ENDPOINTS = JSON.stringify([{ id: 'alert-test', name: 'Check target', url: 'https://example.test/' }])
+  try {
+    for (const [id, name, enabled] of [[channelA, 'Primary', 1], [channelB, 'Disabled', 0]] as const) {
+      await db.prepare(`INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)`)
+        .bind(id,name,'sink','fixture',1,1,enabled,now,now).run()
+    }
+    const catalogue = await request('/api/v1/bsp/admin/monitor-alert-channels',adminToken)
+    assert.equal(catalogue.response.status,200)
+    const choices = catalogue.body as unknown as {id:string;name:string;type:string;enabled:boolean}[]
+    assert.deepEqual(choices.filter(item => item.id === channelA || item.id === channelB), [
+      { id:channelB,name:'Disabled',type:'webhook',enabled:false,available:false }, { id:channelA,name:'Primary',type:'webhook',enabled:true,available:false },
+    ])
+    assert.equal((await request('/api/v1/bsp/admin/monitor-alert-channels',operatorToken)).response.status,403)
+    assert.equal((await request(path,operatorToken,'POST',{name:'Forbidden selection',channelIds:[channelA]},'https://status.example',key())).response.status,403)
+    const createKey = key(), payload = {name:'Alert manual fixture',channelIds:[channelA]}
+    const created = await request(path,adminToken,'POST',payload,'https://status.example',createKey)
+    assert.equal(created.response.status,201)
+    const id = (created.body as unknown as {id:number}).id
+    const retry = await request(path,adminToken,'POST',payload,'https://status.example',createKey)
+    assert.equal((retry.body as unknown as {id:number}).id,id)
+    const find = async () => ((await request(path,adminToken)).body as unknown as {id:number;channelIds:string[]}[]).find(item => item.id === id)
+    assert.deepEqual((await find())?.channelIds,[channelA])
+    const check = {endpointId:'alert-test',enabled:false,intervalMinutes:1,expectedStatus:200}
+    const addCheck = await request(`${path}/${id}`,adminToken,'PATCH',{name:'Alert manual fixture',version:1,check},'https://status.example',key())
+    assert.equal(addCheck.response.status,200)
+    const linked = await db.prepare(`SELECT cc.check_id FROM notification_channel_checks cc JOIN http_checks h ON h.id=cc.check_id JOIN entity_aliases a ON a.entity_id=h.component_id WHERE a.entity_type='component' AND a.alias=? AND cc.channel_id=?`).bind(id,channelA).first<{check_id:string}>()
+    assert.ok(linked)
+    const stale = await request(`${path}/${id}`,adminToken,'PATCH',{name:'Rejected',version:2,channelIds:[channelB],expectedChannelIds:[]},'https://status.example',key())
+    assert.equal(stale.response.status,409)
+    assert.deepEqual((await find())?.channelIds,[channelA])
+    const invalid = await request(`${path}/${id}`,adminToken,'PATCH',{name:'Rejected',version:2,channelIds:[missing],expectedChannelIds:[channelA]},'https://status.example',key())
+    assert.equal(invalid.response.status,409)
+    const changed = await request(`${path}/${id}`,adminToken,'PATCH',{name:'Alert manual fixture',version:2,channelIds:[channelB],expectedChannelIds:[channelA]},'https://status.example',key())
+    assert.equal(changed.response.status,200)
+    assert.deepEqual((await find())?.channelIds,[channelB])
+    assert.ok(await db.prepare('SELECT 1 FROM notification_channel_checks WHERE channel_id=? AND check_id=?').bind(channelB,linked.check_id).first())
+    assert.equal(await db.prepare('SELECT 1 FROM notification_channel_checks WHERE channel_id=? AND check_id=?').bind(channelA,linked.check_id).first(),null)
+    // Channel administration can update check links without touching component.version.
+    await db.batch([
+      db.prepare('DELETE FROM notification_channel_checks WHERE channel_id=? AND check_id=?').bind(channelB,linked.check_id),
+      db.prepare('INSERT INTO notification_channel_checks (channel_id,check_id) VALUES (?,?)').bind(channelA,linked.check_id),
+    ])
+    const concurrent = await request(`${path}/${id}`,adminToken,'PATCH',{name:'Must not overwrite',version:3,channelIds:[],expectedChannelIds:[channelB]},'https://status.example',key())
+    assert.equal(concurrent.response.status,409)
+    assert.deepEqual((await find())?.channelIds,[channelA])
+    const preserved = await request(`${path}/${id}`,operatorToken,'PATCH',{name:'Renamed',version:3},'https://status.example',key())
+    assert.equal(preserved.response.status,200)
+    assert.deepEqual((await find())?.channelIds,[channelA])
+    const cleared = await request(`${path}/${id}`,adminToken,'PATCH',{name:'Renamed',version:4,channelIds:[],expectedChannelIds:[channelA]},'https://status.example',key())
+    assert.equal(cleared.response.status,200)
+    assert.deepEqual((await find())?.channelIds,[])
+  } finally { delete env.VAULT_ENCRYPTION_KEY; delete env.CHANNEL_ENDPOINTS; delete env.CHANNELS_READY; env.ENDPOINTS='[]' }
+})
+
+test('channel association limit rejects concurrent monitor edits atomically', async () => {
+  env.CHANNELS_READY='true';env.EMAIL_READY='true';env.EMAIL_FROM='sender@example.test'
+  env.EMAIL_DESTINATIONS=JSON.stringify([{id:'ops',name:'Operations',address:'ops@example.test'}])
+  env.EMAIL={send:async()=>({messageId:'fixture'})}
+  try {
+    const response=await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{name:'Association limit fixture',type:'email',recipientId:'ops',enabled:true,checkIds:[],expectedChecks:[]})
+    const channel=(response.body as unknown as {id:string}).id
+    const fixtures=Array.from({length:19},()=>crypto.randomUUID())
+    await db.batch(fixtures.flatMap((id,index)=>[
+      db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').bind(id,`Limit ${index}`,Date.now()),
+      db.prepare('INSERT INTO monitor_notification_channels (component_id,channel_id) VALUES (?,?)').bind(id,channel),
+    ]))
+    const key=()=>`${Date.now()}.${crypto.randomUUID()}`
+    const path='/api/v1/bsp/admin/monitors'
+    const results=await Promise.all(['Concurrent limit A','Concurrent limit B'].map(name=>request(path,adminToken,'POST',{name,channelIds:[channel]},'https://status.example',key())))
+    assert.deepEqual(results.map(result=>result.response.status).sort(),[201,409])
+    const rejected=results.find(result=>result.response.status===409)!
+    assert.match((rejected.body as unknown as {error:string}).error,/at most 20 monitors/i)
+    const count=await db.prepare('SELECT COUNT(*) AS n FROM monitor_notification_channels WHERE channel_id=?').bind(channel).first<{n:number}>()
+    assert.equal(count?.n,20)
+    const names=await db.prepare("SELECT name FROM components WHERE name IN ('Concurrent limit A','Concurrent limit B')").all<{name:string}>()
+    assert.equal(names.results.length,1)
+    const untouched=await request(path,adminToken,'POST',{name:'Unchanged limit fixture'},'https://status.example',key())
+    const alias=(untouched.body as unknown as {id:number}).id
+    const patch=await request(`${path}/${alias}`,adminToken,'PATCH',{name:'Must not persist',version:1,channelIds:[channel],expectedChannelIds:[]},'https://status.example',key())
+    assert.equal(patch.response.status,409)
+    const row=await db.prepare("SELECT c.name,c.version FROM components c JOIN entity_aliases a ON a.entity_id=c.id WHERE a.entity_type='component' AND a.alias=?").bind(alias).first<{name:string;version:number}>()
+    assert.deepEqual(row && {...row},{name:'Unchanged limit fixture',version:1})
+  } finally { delete env.EMAIL;delete env.EMAIL_READY;delete env.EMAIL_FROM;delete env.EMAIL_DESTINATIONS;delete env.CHANNELS_READY }
+})
+
+test('channel editor reports a full channel of manual monitors without partial changes', async () => {
+  env.CHANNELS_READY='true';env.EMAIL_READY='true';env.EMAIL_FROM='sender@example.test'
+  env.EMAIL_DESTINATIONS=JSON.stringify([{id:'ops',name:'Operations',address:'ops@example.test'}])
+  env.EMAIL={send:async()=>({messageId:'fixture'})}
+  try {
+    const response=await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{name:'Full manual channel',type:'email',recipientId:'ops',enabled:true,checkIds:[],expectedChecks:[]})
+    assert.equal(response.response.status,201)
+    const channel=(response.body as unknown as {id:string;version:number}).id
+    const fixtures=Array.from({length:20},()=>crypto.randomUUID())
+    await db.batch(fixtures.flatMap((id,index)=>[
+      db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').bind(id,`Manual full ${index}`,Date.now()),
+      db.prepare('INSERT INTO monitor_notification_channels (component_id,channel_id) VALUES (?,?)').bind(id,channel),
+    ]))
+    const component=crypto.randomUUID(),check=crypto.randomUUID()
+    await db.batch([
+      db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').bind(component,'Extra checked monitor',Date.now()),
+      db.prepare('INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status) VALUES (?,?,?,0,1,200)').bind(check,component,'unused'),
+    ])
+    const edit=await request(`/api/v1/bsp/admin/notifications/channels/${channel}`,adminToken,'PATCH',{name:'Must not persist',type:'email',recipientId:'ops',enabled:true,checkIds:[check],expectedChecks:[{id:check,componentId:component,version:1}],version:1,expectedCheckIds:[],expectedAssociationVersion:20})
+    assert.equal(edit.response.status,409)
+    assert.match((edit.body as unknown as {error:string}).error,/at most 20 monitors/i)
+    const unchanged=await db.prepare('SELECT name,version,association_version FROM notification_channels WHERE id=?').bind(channel).first<{name:string;version:number;association_version:number}>()
+    assert.deepEqual(unchanged && {...unchanged},{name:'Full manual channel',version:1,association_version:20})
+    assert.equal(await db.prepare('SELECT 1 FROM notification_channel_checks WHERE channel_id=? AND check_id=?').bind(channel,check).first(),null)
+    const count=await db.prepare('SELECT COUNT(*) AS n FROM monitor_notification_channels WHERE channel_id=?').bind(channel).first<{n:number}>()
+    assert.equal(count?.n,20)
+  } finally { delete env.EMAIL;delete env.EMAIL_READY;delete env.EMAIL_FROM;delete env.EMAIL_DESTINATIONS;delete env.CHANNELS_READY }
+})
+
+test('email-only notifications expose admin catalog and persist monitor selection without Vault', async () => {
+  const messages: unknown[] = []
+  env.CHANNELS_READY = 'true'
+  env.EMAIL_READY = 'true'
+  env.EMAIL_FROM = 'sender@example.test'
+  env.EMAIL_DESTINATIONS = JSON.stringify([{id:'operators',name:'Operators',address:'private@example.test'}])
+  env.EMAIL = {send:async message => {messages.push(message);return {messageId:'fixture'}}}
+  try {
+    assert.equal((await request('/api/v1/bsp/capabilities',adminToken)).body.notifications,true)
+    const channel = await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{name:'Email only fixture',type:'email',recipientId:'operators',enabled:false,checkIds:[],expectedChecks:[]})
+    assert.equal(channel.response.status,201)
+    const channelId = (channel.body as unknown as {id:string}).id
+    const destinations = await request('/api/v1/bsp/admin/notifications/email-destinations',adminToken)
+    assert.deepEqual(destinations.body,[{id:'operators',name:'Operators'}])
+    const catalog = await request('/api/v1/bsp/admin/monitor-alert-channels',adminToken)
+    assert.deepEqual((catalog.body as unknown as {id:string}[]).find(item=>item.id===channelId),{id:channelId,name:'Email only fixture',type:'email',enabled:false,available:true})
+    assert.doesNotMatch(JSON.stringify(catalog.body),/private@example|endpointId|fingerprint|secretId|recipientId/)
+    const unavailableWebhook=crypto.randomUUID()
+    await db.prepare(`INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)`).bind(unavailableWebhook,'Unavailable webhook','not-configured','private-fingerprint',0,0,1,Date.now(),Date.now()).run()
+    const mixedCatalog=await request('/api/v1/bsp/admin/monitor-alert-channels',adminToken)
+    assert.deepEqual((mixedCatalog.body as unknown as {id:string}[]).find(item=>item.id===unavailableWebhook),{id:unavailableWebhook,name:'Unavailable webhook',type:'webhook',enabled:true,available:false})
+    assert.doesNotMatch(JSON.stringify(mixedCatalog.body),/private@example|not-configured|private-fingerprint/)
+    env.EMAIL_DESTINATIONS=JSON.stringify([{id:'operators',name:'Operators',address:'changed@example.test'}])
+    const drifted=await request('/api/v1/bsp/admin/monitor-alert-channels',adminToken)
+    assert.deepEqual((drifted.body as unknown as {id:string}[]).find(item=>item.id===channelId),{id:channelId,name:'Email only fixture',type:'email',enabled:false,available:false})
+    env.EMAIL_DESTINATIONS=JSON.stringify([{id:'operators',name:'Operators',address:'private@example.test'}])
+    assert.equal((await request('/api/v1/bsp/admin/monitor-alert-channels',operatorToken)).response.status,403)
+    const key=()=>`${Date.now()}.${crypto.randomUUID()}`
+    const created = await request('/api/v1/bsp/admin/monitors',adminToken,'POST',{name:'Email selection fixture',channelIds:[channelId]},'https://status.example',key())
+    assert.equal(created.response.status,201)
+    const monitorId=(created.body as unknown as {id:number}).id
+    const listed = await request('/api/v1/bsp/admin/monitors',adminToken)
+    assert.deepEqual((listed.body as unknown as {id:number;channelIds:string[]}[]).find(item=>item.id===monitorId)?.channelIds,[channelId])
+    const checkId=crypto.randomUUID(), sourceId=crypto.randomUUID(), movedId=crypto.randomUUID()
+    await db.batch([
+      db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').bind(sourceId,'Identity source',Date.now()),
+      db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').bind(movedId,'Identity destination',Date.now()),
+      db.prepare('INSERT INTO http_checks (id,component_id,endpoint_id,interval_minutes,expected_status) VALUES (?,?,?,?,?)').bind(checkId,sourceId,'unused',1,200),
+    ])
+    const checkCatalog=await request('/api/v1/bsp/admin/notifications/checks',adminToken)
+    const checkSnapshot=(checkCatalog.body as unknown as {id:string;name:string;componentId:string;version:number}[]).find(item=>item.id===checkId)
+    assert.deepEqual(checkSnapshot,{id:checkId,name:'Identity source',componentId:sourceId,version:1})
+    await db.prepare('UPDATE http_checks SET component_id=?,config_version=config_version+1 WHERE id=?').bind(movedId,checkId).run()
+    const staleChannel=await request(`/api/v1/bsp/admin/notifications/channels/${channelId}`,adminToken,'PATCH',{name:'Email only fixture',type:'email',recipientId:'operators',enabled:false,checkIds:[checkId],expectedChecks:[{id:checkId,componentId:sourceId,version:1}],version:1,expectedCheckIds:[],expectedAssociationVersion:1})
+    assert.equal(staleChannel.response.status,409)
+    const testSend=await request(`/api/v1/bsp/admin/notifications/channels/${channelId}/test`,adminToken,'POST',{version:1})
+    assert.equal(testSend.response.status,200)
+    assert.equal(messages.length,1)
+    assert.equal((messages[0] as {to:string}).to,'private@example.test')
+    env.EMAIL_READY='false'
+    assert.equal((await request('/api/v1/bsp/capabilities',adminToken)).body.notifications,false)
+    const refused=await request(`/api/v1/bsp/admin/monitors/${monitorId}`,adminToken,'PATCH',{name:'Refused',version:1,channelIds:[],expectedChannelIds:[channelId]},'https://status.example',key())
+    assert.equal(refused.response.status,503)
+    env.EMAIL_READY='true'
+    const staleDelete=await request(`/api/v1/bsp/admin/notifications/channels/${channelId}`,adminToken,'DELETE',{version:1,expectedAssociationVersion:0})
+    assert.equal(staleDelete.response.status,409)
+    const cleared=await request(`/api/v1/bsp/admin/monitors/${monitorId}`,adminToken,'PATCH',{name:'Email selection fixture',version:1,channelIds:[],expectedChannelIds:[channelId]},'https://status.example',key())
+    assert.equal(cleared.response.status,200)
+    const removed=await request(`/api/v1/bsp/admin/notifications/channels/${channelId}`,adminToken,'DELETE',{version:1,expectedAssociationVersion:2})
+    assert.equal(removed.response.status,200)
+  } finally { delete env.EMAIL; delete env.EMAIL_READY; delete env.EMAIL_FROM; delete env.EMAIL_DESTINATIONS; delete env.CHANNELS_READY }
+})
+
+test('monitor alert catalog checks webhook credentials without disclosing them', async () => {
+  const base='/api/v1/bsp/admin/vaults'
+  const invalid='not a valid bearer token'
+  env.VAULT_ENCRYPTION_KEY='ab'.repeat(32)
+  env.CHANNELS_READY='true'
+  env.CHANNEL_ENDPOINTS=JSON.stringify([{id:'approved-catalog',name:'Approved',url:'https://approved.example.test/'}])
+  try {
+    const vaultResponse=await request(base,adminToken,'POST',{name:'Catalog verifier vault'})
+    assert.equal(vaultResponse.response.status,201)
+    const vault=(vaultResponse.body as unknown as {id:number}).id
+    const secretResponse=await request(`${base}/${vault}/secrets`,adminToken,'POST',{name:'Catalog test token',type:'value',value:invalid})
+    assert.equal(secretResponse.response.status,201)
+    const secret=(secretResponse.body as unknown as {id:number;version:number})
+    const channelResponse=await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{name:'Invalid token channel',endpointId:'approved-catalog',vaultId:vault,secretId:secret.id,enabled:true,checkIds:[],expectedChecks:[]})
+    assert.equal(channelResponse.response.status,201)
+    const channel=(channelResponse.body as unknown as {id:string;version:number;associationVersion:number})
+    const find=async () => {
+      const result=await request('/api/v1/bsp/admin/monitor-alert-channels',adminToken)
+      assert.doesNotMatch(JSON.stringify(result.body),/not a valid bearer token|approved\.example/)
+      return (result.body as unknown as {id:string;available:boolean}[]).find(item=>item.id===channel.id)
+    }
+    assert.equal((await find())?.available,false)
+    const rotate=await request(`${base}/${vault}/secrets/${secret.id}`,adminToken,'PATCH',{version:secret.version,value:'valid-bearer-token'})
+    assert.equal(rotate.response.status,200)
+    assert.equal((await find())?.available,true)
+    const deleted=await request(`/api/v1/bsp/admin/notifications/channels/${channel.id}`,adminToken,'DELETE',{version:channel.version,expectedAssociationVersion:channel.associationVersion})
+    assert.equal(deleted.response.status,200)
+    assert.equal((await request(`${base}/${vault}/secrets/${secret.id}`,adminToken,'DELETE',{version:secret.version+1})).response.status,200)
+    assert.equal((await request(`${base}/${vault}`,adminToken,'DELETE')).response.status,200)
+  } finally { delete env.VAULT_ENCRYPTION_KEY; delete env.CHANNELS_READY; delete env.CHANNEL_ENDPOINTS }
+})
+
+test('a channel rename preserves queued work on the live linked check', async () => {
+  env.CHANNELS_READY='true';env.EMAIL_READY='true';env.EMAIL_FROM='sender@example.test'
+  env.EMAIL_DESTINATIONS=JSON.stringify([{id:'ops',name:'Operations',address:'ops@example.test'}])
+  env.EMAIL={send:async()=>({messageId:'fixture'})}
+  try {
+    const channelResponse=await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{name:'Before rename',type:'email',recipientId:'ops',enabled:true,checkIds:[],expectedChecks:[]})
+    assert.equal(channelResponse.response.status,201)
+    const channel=channelResponse.body as unknown as {id:string;version:number;associationVersion:number}
+    const key=()=>`${Date.now()}.${crypto.randomUUID()}`
+    const monitorResponse=await request('/api/v1/bsp/admin/monitors',adminToken,'POST',{name:'Rename queue fixture',channelIds:[channel.id]},'https://status.example',key())
+    const alias=(monitorResponse.body as unknown as {id:number}).id
+    const component=await db.prepare("SELECT entity_id FROM entity_aliases WHERE entity_type='component' AND alias=?").bind(alias).first<{entity_id:string}>()
+    assert.ok(component)
+    const checkId=crypto.randomUUID()
+    await db.prepare('INSERT INTO http_checks (id,component_id,endpoint_id,interval_minutes,expected_status) VALUES (?,?,?,?,?)').bind(checkId,component.entity_id,'unused',1,200).run()
+    const now=Date.now()
+    await db.prepare(`INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)`).bind('rename-queued-job',channel.id,channel.version,checkId,1,now,'down',now,now).run()
+    await db.prepare(`INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,?,'down')`).bind(channel.id,checkId,channel.version).run()
+    const renamed=await request(`/api/v1/bsp/admin/notifications/channels/${channel.id}`,adminToken,'PATCH',{name:'After rename',type:'email',recipientId:'ops',enabled:true,checkIds:[checkId],expectedChecks:[{id:checkId,componentId:component.entity_id,version:1}],expectedCheckIds:[checkId],expectedAssociationVersion:1,version:channel.version})
+    assert.equal(renamed.response.status,200)
+    assert.equal((renamed.body as unknown as {version:number}).version,2)
+    assert.equal((await db.prepare('SELECT channel_version FROM notification_outbox WHERE id=?').bind('rename-queued-job').first<{channel_version:number}>())?.channel_version,2)
+    assert.equal((await db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').bind(channel.id,checkId).first<{channel_version:number}>())?.channel_version,2)
+  } finally { delete env.EMAIL;delete env.EMAIL_READY;delete env.EMAIL_FROM;delete env.EMAIL_DESTINATIONS;delete env.CHANNELS_READY }
 })
 
 test('atomic monitor check edits increment exactly once and fence stale results', async () => {

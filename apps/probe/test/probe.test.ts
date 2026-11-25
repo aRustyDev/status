@@ -17,7 +17,7 @@ function fixture(count = 1, withAutomation = true) {
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0005_gatus_sources.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0009_monitor_auth.sql', import.meta.url), 'utf8'))
-  if (withAutomation) for (const file of ['0009_channels.sql','0009_actions.sql','0010_notification_transition_state.sql','0012_notification_delivery_state.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`, import.meta.url), 'utf8'))
+  if (withAutomation) for (const file of ['0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`, import.meta.url), 'utf8'))
   const now = 1_800_000_000_000
   const endpoints = []
   for (let i = 0; i < count; i++) {
@@ -758,6 +758,41 @@ test('maintenance preserves a shared automation baseline and re-evaluates global
    assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get()?.n,1)
    assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM worker_action_outbox').get()?.n,1)
   } finally { Date.now=realNow;sqlite.close() }
+ }
+})
+
+test('email-only configuration enqueues and sends confirmed monitor transitions',async()=>{
+ const {sqlite,now,env}=fixture()
+ const {emailChannelFingerprint}=await import('../../worker/src/email-channel.ts')
+ const sender='sender@example.test', recipient='alerts@example.test'
+ const fingerprint=await emailChannelFingerprint(sender,recipient)
+ sqlite.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at,channel_type,recipient_id,email_fingerprint) VALUES ('c','Email','','',0,0,1,0,0,'email','ops',?)").run(fingerprint)
+ sqlite.prepare("INSERT INTO notification_channel_checks (channel_id,check_id) VALUES ('c','check-0')").run()
+ const messages:unknown[]=[]
+ const runtime={...env,CHANNELS_READY:'true',EMAIL_READY:'true',EMAIL_FROM:sender,EMAIL_DESTINATIONS:JSON.stringify([{id:'ops',name:'Ops',address:recipient}]),EMAIL:{send:async(message:unknown)=>{messages.push(message)}}}
+ globalThis.fetch=async()=>new Response(null,{status:200});await runChecks(now,runtime as never)
+ globalThis.fetch=async()=>new Response(null,{status:500});await runChecks(now+60_000,runtime as never)
+ assert.equal(messages.length,1)
+ assert.match(JSON.stringify(messages[0]),/down/)
+ assert.equal(sqlite.prepare('SELECT state FROM notification_outbox').get()?.state,'sent')
+ sqlite.close()
+})
+
+test('a first trustworthy unhealthy observation alerts when no automation baseline exists',async()=>{
+ for(const prior of ['new','migrated','credential'] as const) {
+  const {sqlite,now,env}=fixture()
+  const {emailChannelFingerprint}=await import('../../worker/src/email-channel.ts')
+  const sender='sender@example.test', recipient='alerts@example.test'
+  const fingerprint=await emailChannelFingerprint(sender,recipient)
+  sqlite.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at,channel_type,recipient_id,email_fingerprint) VALUES ('c','Email','','',0,0,1,0,0,'email','ops',?)").run(fingerprint)
+  sqlite.prepare("INSERT INTO notification_channel_checks (channel_id,check_id) VALUES ('c','check-0')").run()
+  if(prior!=='new') sqlite.prepare('UPDATE http_checks SET last_scheduled_at=?,last_result_at=?,last_status=?,transition_suppressed=? WHERE id=?').run(now-60_000,now-60_000,'down',prior==='credential'?1:0,'check-0')
+  const messages:unknown[]=[]
+  const runtime={...env,CHANNELS_READY:'true',EMAIL_READY:'true',EMAIL_FROM:sender,EMAIL_DESTINATIONS:JSON.stringify([{id:'ops',name:'Ops',address:recipient}]),EMAIL:{send:async(message:unknown)=>{messages.push(message)}}}
+  globalThis.fetch=async()=>new Response(null,{status:500});await runChecks(now,runtime as never)
+  assert.equal(messages.length,1,prior)
+  assert.equal(sqlite.prepare('SELECT status FROM automation_transition_state WHERE check_id=?').get('check-0')?.status,'down')
+  sqlite.close()
  }
 })
 

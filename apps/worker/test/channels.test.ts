@@ -29,7 +29,7 @@ const request=(method:string,body?:unknown)=>new Request('https://status.example
 
 async function setup() {
   const local=new DB()
-  for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_notification_transition_state.sql','0012_notification_delivery_state.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+  for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
   local.db.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
   local.db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Test monitor',0)").run()
   local.db.prepare("INSERT INTO endpoint_registry VALUES ('check','approved')").run()
@@ -78,6 +78,28 @@ test('status transition outbox is atomic and concurrent flushes claim only one d
   const row=x.local.db.prepare('SELECT state,attempts,error_code FROM notification_outbox').get() as {state:string;attempts:number;error_code:string|null}
   assert.deepEqual({...row},{state:'sent',attempts:1,error_code:null})
   assert.doesNotMatch(JSON.stringify(x.local.db.prepare('SELECT * FROM notification_outbox').all()),/fixture-token/)
+})
+
+test('unavailable email jobs do not starve later ready webhook jobs',async()=>{
+  const x=await setup()
+  const now=Date.now()
+  for(let i=0;i<2;i++) {
+    const component=`email-component-${i}`, check=`email-check-${i}`
+    x.local.db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').run(component,component,now)
+    x.local.db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at) VALUES (?,?,'check',1,1,200,'down',10)").run(check,component)
+    x.local.db.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'down')").run(check)
+    for(let j=0;j<10;j++) {
+      const channel=`email-${j}`
+      x.local.db.prepare("INSERT OR IGNORE INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at,channel_type,recipient_id,email_fingerprint) VALUES (?,?,'','',0,0,1,?,?,'email','ops','fingerprint')").run(channel,channel,now,now)
+      x.local.db.prepare('INSERT INTO notification_channel_checks (channel_id,check_id) VALUES (?,?)').run(channel,check)
+      x.local.db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,created_at,updated_at,observed_at) VALUES (?,?,1,?,1,10,'down',?,?,10)").run(`email-job-${i}-${j}`,channel,check,now,now)
+    }
+  }
+  await queueTimingEvent(x)
+  await flushChannelDeliveries(x.env)
+  assert.equal(x.calls.length,1)
+  assert.equal((x.local.db.prepare("SELECT state FROM notification_outbox WHERE channel_id=?").get(x.channel.id) as {state:string}).state,'sent')
+  assert.equal((x.local.db.prepare("SELECT count(*) AS n FROM notification_outbox WHERE channel_id LIKE 'email-%' AND state='pending' AND attempts=0").get() as {n:number}).n,20)
 })
 
 test('rotations take effect, missing credentials fail closed, and delivery errors remain generic',async()=>{
@@ -135,7 +157,7 @@ test('Workerd D1 atomically queues and claims one delivery for concurrent schedu
   const runtime=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response()}}',d1Databases:['DB']}))
   try {
     const db=await runtime.getD1Database('DB') as D1Database
-    for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_notification_transition_state.sql','0012_notification_delivery_state.sql']) {
+    for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) {
       const sql=readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8').replace(/^\s*--[^\n]*$/gm,'')
       const parts=sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements=parts.shift()!.split(';').map(s=>s.trim()).filter(Boolean)
@@ -220,14 +242,22 @@ test('a lost or expired notification lease cannot transmit after slow resolution
 
 test('notification jobs that expire after selection cannot be claimed',async()=>{
   const x=await setup();await queueTimingEvent(x)
-  const db={...x.db,prepare(sql:string){
-    if(sql.includes("WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?"))
-      x.local.db.prepare('UPDATE notification_outbox SET created_at=?').run(Date.now()-3_600_001)
-    return x.db.prepare(sql)
-  }} as D1Database
-  await flushChannelDeliveries({...x.env,DB:db})
-  assert.equal(x.calls.length,0)
-  assert.equal((x.local.db.prepare('SELECT state FROM notification_outbox').get() as {state:string}).state,'failed')
+  const realNow=Date.now;let now=realNow(),selected=0
+  x.local.db.prepare('UPDATE notification_outbox SET created_at=?').run(now-3_599_000)
+  try {
+    Date.now=()=>now
+    const db={prepare(sql:string){
+      const statement=x.db.prepare(sql)
+      if(!sql.includes('SELECT o.id,o.channel_id,o.channel_version,o.check_id')) return statement
+      return {bind(...values:unknown[]){statement.bind(...values);return this},async all(){
+        const result=await statement.all();selected=result.results.length;now+=2_000;return result
+      }} as D1PreparedStatement
+    },batch:x.db.batch.bind(x.db)} as D1Database
+    await flushChannelDeliveries({...x.env,DB:db})
+    assert.equal(selected,1)
+    assert.equal(x.calls.length,0)
+    assert.equal((x.local.db.prepare('SELECT state FROM notification_outbox').get() as {state:string}).state,'failed')
+  } finally {Date.now=realNow}
 })
 
 test('a notification does not send if the final lease query consumes its send window',async()=>{
@@ -529,15 +559,10 @@ test('a maintenance window or credential fault beginning during validation defer
 
 test('channel no-op and rename preserve pending delivery and acknowledged history',async()=>{
   const x=await setup();await queueTimingEvent(x)
-  // The integrated Alerts migration cancels jobs when an association is actually removed.
-  x.local.db.exec(`CREATE TRIGGER notification_check_unlink_cancel AFTER DELETE ON notification_channel_checks BEGIN
-    UPDATE notification_outbox SET state='failed',error_code='unavailable',lease_token=NULL,lease_until=NULL WHERE channel_id=OLD.channel_id AND check_id=OLD.check_id AND state IN ('pending','sending');
-    DELETE FROM notification_delivery_state WHERE channel_id=OLD.channel_id AND check_id=OLD.check_id;
-  END`)
   x.local.db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,1,'up')").run(x.channel.id,checkId)
-  const noop=await channelApi(request('PATCH',{...x.channelBody,version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  const noop=await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
   assert.equal((await noop.json() as {version:number}).version,1)
-  const renamed=await channelApi(request('PATCH',{...x.channelBody,name:'Renamed',version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  const renamed=await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Renamed',version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
   assert.equal((await renamed.json() as {version:number}).version,2)
   assert.deepEqual({...x.local.db.prepare('SELECT state,channel_version FROM notification_outbox').get()},{state:'pending',channel_version:2})
   assert.equal(x.local.db.prepare('SELECT channel_version FROM notification_delivery_state').get()?.channel_version,2)
@@ -561,13 +586,13 @@ test('channel create and update reject a monitor moved or changed before the tra
       }
       return x.db.batch(statements)
     }} as D1Database
-    const input=method==='POST' ? {...x.channelBody,name:'Second'} : {...x.channelBody,name:'Changed',version:1}
+    const input=method==='POST' ? {...x.channelBody,name:'Second'} : {...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Changed',version:1}
     const route=method==='POST' ? '/admin/notifications/channels' : `/admin/notifications/channels/${x.channel.id}`
     const audits=x.local.db.prepare('SELECT COUNT(*) AS n FROM audit_events').get()?.n
     await assert.rejects(channelApi(request(method,input),{...x.env,DB:db},actor,route),(e:unknown)=>e instanceof ChannelError && e.status===409)
     assert.equal(changed,true)
     assert.equal(x.local.db.prepare('SELECT name FROM notification_channels WHERE id=?').get(x.channel.id)?.name,'Fixture')
-    assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_channel_checks WHERE channel_id=?').get(x.channel.id)?.n,1)
+    assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_channel_checks WHERE channel_id=?').get(x.channel.id)?.n,change==='component'?0:1)
     assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM audit_events').get()?.n,audits)
   }
 })
@@ -587,12 +612,8 @@ test('an old channel editor must refresh; malformed monitor snapshots remain inv
 
 test('removing a monitor still invokes integrated unlink cancellation',async()=>{
   const x=await setup();await queueTimingEvent(x)
-  x.local.db.exec(`CREATE TRIGGER notification_check_unlink_cancel AFTER DELETE ON notification_channel_checks BEGIN
-    UPDATE notification_outbox SET state='failed',error_code='unavailable',lease_token=NULL,lease_until=NULL WHERE channel_id=OLD.channel_id AND check_id=OLD.check_id AND state IN ('pending','sending');
-    DELETE FROM notification_delivery_state WHERE channel_id=OLD.channel_id AND check_id=OLD.check_id;
-  END`)
   x.local.db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,1,'down')").run(x.channel.id,checkId)
-  await channelApi(request('PATCH',{...x.channelBody,checkIds:[],expectedChecks:[],version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,checkIds:[],expectedChecks:[],version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
   assert.equal(x.local.db.prepare('SELECT state FROM notification_outbox').get()?.state,'failed')
   assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_delivery_state').get()?.n,0)
   await flushChannelDeliveries(x.env)
@@ -602,7 +623,7 @@ test('removing a monitor still invokes integrated unlink cancellation',async()=>
 test('functional channel edits do not carry pending work or delivery history',async()=>{
   const x=await setup();await queueTimingEvent(x)
   x.local.db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,1,'down')").run(x.channel.id,checkId)
-  const response=await channelApi(request('PATCH',{...x.channelBody,enabled:false,version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  const response=await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,enabled:false,version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
   assert.equal((await response.json() as {version:number}).version,2)
   assert.equal(x.local.db.prepare('SELECT channel_version FROM notification_outbox').get()?.channel_version,1)
   assert.equal(x.local.db.prepare('SELECT channel_version FROM notification_delivery_state').get()?.channel_version,1)
@@ -614,8 +635,8 @@ test('concurrent channel rename and functional edits have one version winner',as
   const x=await setup();await queueTimingEvent(x)
   const path=`/admin/notifications/channels/${x.channel.id}`
   const results=await Promise.allSettled([
-    channelApi(request('PATCH',{...x.channelBody,name:'Renamed',version:1}),x.env,actor,path),
-    channelApi(request('PATCH',{...x.channelBody,enabled:false,version:1}),x.env,actor,path),
+    channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Renamed',version:1}),x.env,actor,path),
+    channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,enabled:false,version:1}),x.env,actor,path),
   ])
   assert.equal(results.filter(result=>result.status==='fulfilled').length,1)
   const failure=results.find(result=>result.status==='rejected') as PromiseRejectedResult
@@ -631,7 +652,7 @@ test('channel rename does not retry an in-flight send and retains its acknowledg
   const started=new Promise<void>(resolve=>{start=resolve}), blocked=new Promise<void>(resolve=>{release=resolve})
   const env={...x.env,OUTBOUND:{fetch:async()=>{start();await blocked;return new Response(null,{status:200})}}}
   const flushing=flushChannelDeliveries(env);await started
-  await channelApi(request('PATCH',{...x.channelBody,name:'Renamed',version:1}),env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Renamed',version:1}),env,actor,`/admin/notifications/channels/${x.channel.id}`)
   assert.deepEqual({...x.local.db.prepare('SELECT state,channel_version FROM notification_outbox').get()},{state:'sending',channel_version:2})
   release();await flushing
   assert.equal(x.local.db.prepare('SELECT state FROM notification_outbox').get()?.state,'sent')
@@ -646,7 +667,7 @@ test('channel rename during claimed pre-send validation defers rather than disca
     if(renamed || !sql.includes('SELECT 1 AS present FROM notification_channels WHERE')) return statement
     return {bind(...values:unknown[]){statement.bind(...values);return this},async first(){
       renamed=true
-      await channelApi(request('PATCH',{...x.channelBody,name:'Renamed',version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+      await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Renamed',version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
       return statement.first()
     }} as D1PreparedStatement
   }} as D1Database

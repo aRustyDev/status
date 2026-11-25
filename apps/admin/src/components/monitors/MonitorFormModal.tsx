@@ -7,7 +7,7 @@ import { useCapabilities } from '../../capabilities'
 import LegacyMonitorFormModal from './LegacyMonitorFormModal'
 import UpstreamMonitorFormModal, { type CloudflareProfile } from '../../../../admin-node/src/components/monitors/MonitorFormModal'
 
-type Component = Monitor & { uuid: string; version: number; manualStatus: string; position: number }
+type Component = Monitor & { uuid: string; version: number; manualStatus: string; position: number; channelIds?: string[] }
 type Check = NonNullable<CloudflareProfile['check']> & { componentId: string }
 type History = { results: Array<{ completedAt: number; status: string; httpStatus: number | null; latencyMs: number }>; retentionDays: number }
 
@@ -34,6 +34,7 @@ function CloudflareMonitorFormModal({ monitor, allTags = [], onClose, onSaved, s
   const managedInGatus = component?.source === 'gatus'
   const checks = useQuery<Check[]>({ queryKey: ['checks'], queryFn: () => api.get('/admin/checks', { timeoutMs: 15_000 }), enabled: isAdmin && !managedInGatus, refetchOnMount: 'always' })
   const endpoints = useQuery<CloudflareProfile['endpoints']>({ queryKey: ['endpoints'], queryFn: () => api.get('/admin/endpoints', { timeoutMs: 15_000 }), enabled: isAdmin && !managedInGatus, refetchOnMount: 'always' })
+  const alertChannels = useQuery<NonNullable<CloudflareProfile['alertChannels']>>({ queryKey: ['monitor-alert-channels'], queryFn: () => api.get('/admin/monitor-alert-channels', { timeoutMs: 15_000 }), enabled: isAdmin && !!capabilities.notifications && !managedInGatus, refetchOnMount: 'always' })
   const history = useQuery<History>({ queryKey: ['monitor-history', component?.id], queryFn: () => api.get(`/admin/monitors/${component!.id}/history`), enabled: !!component && !managedInGatus })
 
   if (managedInGatus) return <LegacyMonitorFormModal monitor={monitor} statusUnavailable={statusUnavailable} onClose={onClose} onSaved={onSaved} />
@@ -41,21 +42,26 @@ function CloudflareMonitorFormModal({ monitor, allTags = [], onClose, onSaved, s
   // Do not unmount a populated editor when a background refresh fails: its
   // in-progress form is the only copy of the operator's draft. Hide it until
   // both check settings and the monitor status are available again.
-  const settingsUnavailable = isAdmin && (checks.isError || endpoints.isError)
+  const settingsUnavailable = isAdmin && (checks.isError || endpoints.isError || (!!capabilities.notifications && alertChannels.isError))
   if (settingsUnavailable && (!checks.data || !endpoints.data)) return <Modal title={component ? 'Edit Monitor' : 'New Monitor'} icon="edit" onClose={onClose} flush>
     <div className="p-6 space-y-3"><Alert tone="error">Could not load check settings.</Alert><button type="button" className="btn btn-secondary" onClick={() => { void Promise.all([checks.refetch(), endpoints.refetch()]) }}>Retry check settings</button></div>
     <ModalFooter><button type="button" className="btn btn-secondary" onClick={onClose}>Close</button></ModalFooter>
   </Modal>
-  if (isAdmin && (!checks.isFetchedAfterMount || !endpoints.isFetchedAfterMount)) return <p role="status">Loading check settings…</p>
+  if (isAdmin && !!capabilities.notifications && alertChannels.isError && !alertChannels.data) return <Modal title={component ? 'Edit Monitor' : 'New Monitor'} icon="edit" onClose={onClose} flush><div className="p-6 space-y-3"><Alert tone="error">Could not load alert channels.</Alert><button type="button" className="btn btn-secondary" onClick={() => { void alertChannels.refetch() }}>Retry alert channels</button></div><ModalFooter><button type="button" className="btn btn-secondary" onClick={onClose}>Close</button></ModalFooter></Modal>
+  if (isAdmin && (!checks.isFetchedAfterMount || !endpoints.isFetchedAfterMount || (!!capabilities.notifications && !alertChannels.isFetchedAfterMount))) return <p role="status">Loading check settings…</p>
 
   const profile: CloudflareProfile = {
     isAdmin,
     monitorAuth: !!capabilities.monitorAuth,
+    monitorAlerts: isAdmin && !!capabilities.notifications,
+    alertChannels: alertChannels.data ?? [],
+    alertChannelIds: initialComponent?.channelIds ?? [],
     listVaults: () => api.get('/admin/vaults'),
     listVaultSecrets: vaultId => api.get(`/admin/vaults/${vaultId}/secrets`),
     statusUnavailable: statusUnavailable || settingsUnavailable,
     settingsUnavailable,
-    retrySettings: settingsUnavailable ? () => { void Promise.all([checks.refetch(), endpoints.refetch()]) } : undefined,
+    alertSettingsUnavailable: !!capabilities.notifications && alertChannels.isError,
+    retrySettings: settingsUnavailable ? () => { void Promise.all([checks.refetch(), endpoints.refetch(), ...(capabilities.notifications ? [alertChannels.refetch()] : [])]) } : undefined,
     endpoints: endpoints.data ?? [],
     check: checks.data?.find(item => item.componentId === component?.uuid),
     manualStatus: component?.manualStatus ?? 'operational',

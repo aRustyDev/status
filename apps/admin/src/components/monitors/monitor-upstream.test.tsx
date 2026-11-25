@@ -22,6 +22,7 @@ beforeEach(() => {
   vi.mocked(api.get).mockImplementation(async path => {
     if (path === '/admin/checks') return [check]
     if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }, { id: 'other', name: 'Other API' }]
+    if (path === '/admin/monitor-alert-channels') return [{ id: 'ops', name: 'Operations', type: 'webhook', enabled: true }, { id: 'old', name: 'Old channel', type: 'webhook', enabled: false }]
     if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
     if (path === '/auth/me') return { id: 'actor', email: 'operator@example.com' }
     throw new Error(`Unexpected request ${path}`)
@@ -30,9 +31,9 @@ beforeEach(() => {
   vi.mocked(api.post).mockResolvedValue({})
 })
 
-function renderModal(value: Monitor | null, allTags: { label: string; color: string }[] = [], monitorAuth = false) {
+function renderModal(value: Monitor | null, allTags: { label: string; color: string }[] = [], monitorAuth = false, notifications = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, monitorAuth }}><MonitorFormModal monitor={value} allTags={allTags} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
+  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, monitorAuth, notifications }}><MonitorFormModal monitor={value} allTags={allTags} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
 }
 
 it('shows unavailable upstream sidebar sections while keeping Checks usable', async () => {
@@ -423,6 +424,124 @@ it('enables only Vault Basic auth when the runtime capability is ready and saves
   await user.selectOptions(screen.getByLabelText('Secret'), '20')
   await user.click(screen.getByRole('button', { name:'Save Changes' }))
   await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7',expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.objectContaining({auth:{type:'basic',basic:{vault:{vaultId:12,secretId:20}}}}) }) })))
+})
+
+
+it('selects alert channels in a new monitor and saves them atomically', async () => {
+  const user = userEvent.setup()
+  renderModal(null, [], false, true)
+  await user.type(await screen.findByLabelText('Name'), 'New service')
+  await user.click(screen.getByRole('button', { name: 'Alerts' }))
+  expect(screen.getByText(/Alerts are sent when an HTTP check runs/)).toBeInTheDocument()
+  expect(screen.getByText('disabled')).toBeInTheDocument()
+  await user.click(screen.getByRole('checkbox', { name: 'Operations' }))
+  await user.click(screen.getByRole('button', { name: 'Create Monitor' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors', expect.objectContaining({ name: 'New service', channelIds: ['ops'] })))
+})
+
+it('saves changed channel links with the original snapshot and keeps the draft after a conflict', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.patch).mockRejectedValueOnce(new Error('This record changed. Reload and try again.'))
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const original = { ...monitor, channelIds: ['old'] } as Monitor
+  const view = (value: Monitor) => <QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, notifications: true }}><MonitorFormModal monitor={value} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>
+  const rendered = render(view(original))
+  await user.click(await screen.findByRole('button', { name: 'Alerts' }))
+  expect(screen.getByRole('checkbox', { name: /Old channel/ })).toBeChecked()
+  await user.click(screen.getByRole('checkbox', { name: 'Operations' }))
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  expect(await screen.findByText('This record changed. Reload and try again.')).toBeInTheDocument()
+  rendered.rerender(view({ ...original, version: 5, channelIds: ['ops'] } as Monitor))
+  expect(screen.getByRole('checkbox', { name: /Old channel/ })).toBeChecked()
+  expect(screen.getByRole('checkbox', { name: 'Operations' })).toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenLastCalledWith('/admin/monitors/7', expect.objectContaining({ version: 4, channelIds: ['old', 'ops'], expectedChannelIds: ['old'] })))
+})
+
+it('omits untouched channel links and distinguishes an empty channel list', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [check]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitor-alert-channels') return []
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor, [], false, true)
+  await user.click(await screen.findByRole('button', { name: 'Alerts' }))
+  expect(screen.getByText(/No notification channels configured/)).toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', { name: 'API', manualStatus: 'operational', position: 1, tags: [], version: 4 }))
+})
+
+it('does not treat failure to load channels as an empty list', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [check]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitor-alert-channels') throw new Error('Unavailable')
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor, [], false, true)
+  expect(await screen.findByText('Could not load alert channels.')).toBeInTheDocument()
+  expect(screen.queryByText(/No notification channels configured/)).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Save Changes' })).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Retry alert channels' }))
+  await waitFor(() => expect(api.get).toHaveBeenCalledWith('/admin/monitor-alert-channels', expect.anything()))
+})
+
+it('preserves the alert draft when a channel refresh fails and succeeds on retry', async () => {
+  const user = userEvent.setup()
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const view = <QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, notifications: true }}><MonitorFormModal monitor={monitor} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>
+  render(view)
+  await user.click(await screen.findByRole('button', { name: 'Alerts' }))
+  await user.click(screen.getByRole('checkbox', { name: 'Operations' }))
+  let fail = true
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [check]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitor-alert-channels') {
+      if (fail) throw new Error('Unavailable')
+      return [{ id: 'ops', name: 'Operations', type: 'webhook', enabled: true }]
+    }
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  await act(async () => { await client.refetchQueries({ queryKey: ['monitor-alert-channels'] }) })
+  expect(await screen.findByText('Alert channels are unavailable. Your draft is preserved.')).toBeInTheDocument()
+  fail = false
+  await user.click(screen.getByRole('button', { name: 'Retry alert channels' }))
+  expect(await screen.findByRole('checkbox', { name: 'Operations' })).toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ version: 4, channelIds: ['ops'], expectedChannelIds: [] })))
+})
+
+
+it('identifies unavailable channels and allows removing existing selections', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [check]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitor-alert-channels') return [
+      { id: 'old', name: 'Old endpoint', type: 'webhook', enabled: true, available: false },
+      { id: 'other', name: 'Other endpoint', type: 'webhook', enabled: true, available: false },
+    ]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal({ ...monitor, channelIds: ['old'] } as Monitor, [], false, true)
+  await user.click(await screen.findByRole('button', { name: 'Alerts' }))
+  const old = screen.getByRole('checkbox', { name: /Old endpoint\s*unavailable/ })
+  expect(old).toBeChecked()
+  expect(old).toBeEnabled()
+  expect(screen.getByRole('checkbox', { name: /Other endpoint\s*unavailable/ })).toBeDisabled()
+  await user.click(old)
+  expect(old).not.toBeChecked()
+  expect(old).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ channelIds: [], expectedChannelIds: ['old'], version: 4 })))
 })
 
 it('tests a sparse saved Vault check using effective defaults without changing its saved version', async () => {

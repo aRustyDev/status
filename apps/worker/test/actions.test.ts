@@ -24,7 +24,7 @@ const destinations=JSON.stringify([{id:'approved',name:'Approved action',url:'ht
 const request=(method:string,body?:unknown)=>new Request('https://status.example.test',{method,headers:{'content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})})
 async function setup(){
  const local=new DB()
- for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_actions.sql','0009_channels.sql','0010_notification_transition_state.sql','0012_notification_delivery_state.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+ for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_actions.sql','0009_channels.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
  local.db.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
  local.db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Service',0)").run()
  local.db.prepare("INSERT INTO endpoint_registry VALUES ('check','approved')").run()
@@ -152,14 +152,22 @@ test('an expired or superseded action claim cannot transmit after slow resolutio
 
 test('action jobs that expire after selection cannot be claimed',async()=>{
  const x=await setup();await queue(x)
- const db={...x.db,prepare(sql:string){
-  if(sql.includes("WHERE o.id=? AND o.state='pending' AND o.created_at<?"))
-   x.local.db.prepare('UPDATE worker_action_outbox SET created_at=?').run(Date.now()-3_600_001)
-  return x.db.prepare(sql)
- }} as D1Database
- await flushActions({...x.env,DB:db})
- assert.equal(x.calls.length,0)
- assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'unavailable')
+ const realNow=Date.now;let now=realNow(),selected=0
+ x.local.db.prepare('UPDATE worker_action_outbox SET created_at=?').run(now-3_599_000)
+ try {
+  Date.now=()=>now
+  const db={prepare(sql:string){
+   const statement=x.db.prepare(sql)
+   if(!sql.includes('SELECT o.id,o.action_id,o.action_version,o.check_id')) return statement
+   return {bind(...values:unknown[]){statement.bind(...values);return this},async all(){
+    const result=await statement.all();selected=result.results.length;now+=2_000;return result
+   }} as D1PreparedStatement
+  },batch:x.db.batch.bind(x.db)} as D1Database
+  await flushActions({...x.env,DB:db})
+  assert.equal(selected,1)
+  assert.equal(x.calls.length,0)
+  assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'unavailable')
+ } finally {Date.now=realNow}
 })
 
 test('an action does not send if the final claim query crosses its deadline',async()=>{
@@ -227,7 +235,7 @@ test('Workerd D1 concurrently dispatches a transition at most once', {skip:!proc
  const runtime=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response()}}',d1Databases:['DB']}))
  try {
   const db=await runtime.getD1Database('DB') as D1Database
-  for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_actions.sql','0009_channels.sql','0010_notification_transition_state.sql','0012_notification_delivery_state.sql']) {
+  for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_actions.sql','0009_channels.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) {
    const sql=readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8').replace(/^\s*--[^\n]*$/gm,'')
    const parts=sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/),statements=parts.shift()!.split(';').map(s=>s.trim()).filter(Boolean)
    statements.push(...parts.map(s=>s.trim()).filter(Boolean));await db.batch(statements.map(s=>db.prepare(s)))
