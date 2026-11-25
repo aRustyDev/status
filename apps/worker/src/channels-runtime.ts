@@ -123,10 +123,11 @@ export async function flushChannelDeliveries(env: ChannelEnvironment): Promise<v
     jobs = (await env.DB.prepare(`SELECT o.id,o.channel_id,o.channel_version,o.check_id,o.check_version,o.scheduled_at,o.status,o.attempts,o.transition_generation,c.channel_type FROM notification_outbox o
       JOIN http_checks h ON h.id=o.check_id JOIN notification_channels c ON c.id=o.channel_id
       WHERE h.transition_suppressed=0 AND ${maintenanceBarrier} AND attempts<3 AND (state='pending' OR (state='sending' AND lease_until<?))
+      AND (c.channel_type<>'email' OR ?=1)
       AND NOT EXISTS (SELECT 1 FROM notification_outbox earlier WHERE earlier.channel_id=o.channel_id
         AND earlier.check_id=o.check_id AND earlier.state IN ('pending','sending')
         AND (earlier.scheduled_at<o.scheduled_at OR (earlier.scheduled_at=o.scheduled_at AND earlier.id<o.id)))
-      ORDER BY o.scheduled_at,o.created_at LIMIT 20`).bind(now,now,now).all<Job>()).results
+      ORDER BY o.scheduled_at,o.created_at LIMIT 20`).bind(now,now,now,emailReady(env)?1:0).all<Job>()).results
   } catch { return }
   for (const job of jobs) {
     if (job.channel_type === 'email' && !emailReady(env)) continue

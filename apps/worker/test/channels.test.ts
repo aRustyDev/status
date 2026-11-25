@@ -80,6 +80,28 @@ test('status transition outbox is atomic and concurrent flushes claim only one d
   assert.doesNotMatch(JSON.stringify(x.local.db.prepare('SELECT * FROM notification_outbox').all()),/fixture-token/)
 })
 
+test('unavailable email jobs do not starve later ready webhook jobs',async()=>{
+  const x=await setup()
+  const now=Date.now()
+  for(let i=0;i<2;i++) {
+    const component=`email-component-${i}`, check=`email-check-${i}`
+    x.local.db.prepare('INSERT INTO components (id,name,updated_at) VALUES (?,?,?)').run(component,component,now)
+    x.local.db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,last_status,last_scheduled_at) VALUES (?,?,'check',1,1,200,'down',10)").run(check,component)
+    x.local.db.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'down')").run(check)
+    for(let j=0;j<10;j++) {
+      const channel=`email-${j}`
+      x.local.db.prepare("INSERT OR IGNORE INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at,channel_type,recipient_id,email_fingerprint) VALUES (?,?,'','',0,0,1,?,?,'email','ops','fingerprint')").run(channel,channel,now,now)
+      x.local.db.prepare('INSERT INTO notification_channel_checks (channel_id,check_id) VALUES (?,?)').run(channel,check)
+      x.local.db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,created_at,updated_at,observed_at) VALUES (?,?,1,?,1,10,'down',?,?,10)").run(`email-job-${i}-${j}`,channel,check,now,now)
+    }
+  }
+  await queueTimingEvent(x)
+  await flushChannelDeliveries(x.env)
+  assert.equal(x.calls.length,1)
+  assert.equal((x.local.db.prepare("SELECT state FROM notification_outbox WHERE channel_id=?").get(x.channel.id) as {state:string}).state,'sent')
+  assert.equal((x.local.db.prepare("SELECT count(*) AS n FROM notification_outbox WHERE channel_id LIKE 'email-%' AND state='pending' AND attempts=0").get() as {n:number}).n,20)
+})
+
 test('rotations take effect, missing credentials fail closed, and delivery errors remain generic',async()=>{
   const x=await setup()
   await vaultApi(request('PATCH',{version:1,value:'fixture-token-two'}),x.db,key,actor,`/admin/vaults/${x.vault.id}/secrets/${x.secret.id}`)
