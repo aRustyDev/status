@@ -38,7 +38,7 @@ export default function CloudflareNotifications() {
       <div className="flex-1"><p className="font-semibold">{channel.name}</p><p className="text-xs">Webhook · {channel.enabled?'Enabled':'Disabled'} · {channel.checkIds.length} monitor(s)</p></div>
       <button className="btn btn-secondary btn-sm" disabled={busy} onClick={()=>void test(channel)}>Send test</button><button className="btn btn-secondary btn-sm" onClick={()=>setEditing(channel)}>Edit</button><button className="btn-icon" aria-label={`Delete channel ${channel.name}`} onClick={()=>{setMessage('');setRemoving(channel)}}>×</button>
     </div>)}</div>
-    <section><h2 className="font-headline font-bold">Recent delivery attempts</h2><p className="text-sm">An unavailable credential or destination fails closed; check Vault and deployment settings. Initial monitor results do not send an alert.</p>
+    <section><h2 className="font-headline font-bold">Recent delivery attempts</h2><p className="text-sm">An unavailable credential or destination fails closed; check Vault and deployment settings. A first unhealthy monitor result can send an alert; a first healthy result establishes a baseline.</p>
       {deliveries.isError && <p role="alert">Could not load delivery status.</p>}
       {deliveries.data?.length===0 && <p>No deliveries yet.</p>}
       {deliveries.data?.map((delivery,index)=><p key={`${delivery.channelId}-${delivery.checkId}-${delivery.updatedAt}-${index}`} className="text-sm">{channels.data?.find(c=>c.id===delivery.channelId)?.name ?? 'Channel'}: {delivery.status}, {delivery.state}{delivery.errorCode ? ` (${delivery.errorCode})` : ''} · attempts {delivery.attempts}</p>)}
