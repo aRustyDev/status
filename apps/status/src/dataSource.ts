@@ -32,8 +32,11 @@ export function loadSnapshot(url: string): Promise<StatusSnapshot> {
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
   const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new ApiError('Snapshot request timed out', 0)) }, 15_000) })
-  const request = fetch(url, { cache: 'no-store', signal: controller.signal })
+  const request = fetch(url, { cache: 'no-store', redirect: 'manual', signal: controller.signal })
     .then((res) => {
+      if (res.status === 401 || res.status === 403 || res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+        window.dispatchEvent(new Event('access-session-expired'))
+      }
       if (!res.ok) throw new ApiError(`Snapshot request failed with status ${res.status}`, res.status)
       return res.json() as Promise<unknown>
     })
