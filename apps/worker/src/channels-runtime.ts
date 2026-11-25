@@ -1,4 +1,4 @@
-import { maintenanceBarrier, outsideMaintenance, overlappedMaintenance } from './automation-maintenance'
+import { maintenanceBarrier, nextMaintenanceStart, outsideMaintenance, overlappedMaintenance } from './automation-maintenance'
 import { endpointFingerprint, parseEndpoints, type Endpoint } from './endpoint-config'
 import { resolveChannelCredentialSnapshot } from './vault-resolver'
 
@@ -42,14 +42,19 @@ export async function sendChannel(env: ChannelEnvironment, channelId: string, ve
       .bind(channelId,version).first()
     if (!active || (event.checkId && !await env.DB.prepare(`SELECT 1 AS present FROM notification_channel_checks cc JOIN http_checks h ON h.id=cc.check_id WHERE cc.channel_id=? AND cc.check_id=? AND h.enabled=1 AND h.config_version=?`).bind(channelId,event.checkId,event.checkVersion).first())) return 'unavailable'
     // Recheck immediately before the network call; a window may start after the job was claimed.
-    if (event.deliveryId && !await env.DB.prepare(`SELECT 1 FROM notification_outbox o JOIN http_checks h ON h.id=o.check_id
+    if (event.deliveryId) {
+      const checkedAt=Date.now()
+      const lease=await env.DB.prepare(`SELECT o.created_at AS createdAt,o.lease_until AS leaseUntil,${overlappedMaintenance} AS maintenanceExempt,${nextMaintenanceStart} AS nextMaintenance FROM notification_outbox o JOIN http_checks h ON h.id=o.check_id
       JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version AND ns.generation=o.transition_generation
       JOIN notification_channels c ON c.id=o.channel_id JOIN notification_channel_checks cc ON cc.channel_id=c.id AND cc.check_id=h.id
       JOIN vault_secrets v ON v.id=c.secret_id AND v.vault_id=c.vault_id AND v.type='value'
       WHERE o.id=? AND o.state='sending' AND o.lease_token=? AND c.id=? AND c.version=? AND c.enabled=1
         AND h.enabled=1 AND h.config_version=? AND h.transition_suppressed=0
         AND v.id=? AND v.vault_id=? AND v.version=? AND v.nonce=? AND ${maintenanceBarrier}`)
-      .bind(event.deliveryId,event.leaseToken,channelId,version,event.checkVersion,credential.secretId,credential.vaultId,credential.version,credential.nonce,Date.now(),Date.now()).first()) return 'deferred'
+        .bind(checkedAt,checkedAt,event.deliveryId,event.leaseToken,channelId,version,event.checkVersion,credential.secretId,credential.vaultId,credential.version,credential.nonce,checkedAt,checkedAt).first<{createdAt:number;leaseUntil:number;maintenanceExempt:number;nextMaintenance:number|null}>()
+      const readyAt=Date.now()
+      if (!lease || lease.leaseUntil<=readyAt+5_000 || (!lease.maintenanceExempt && readyAt-lease.createdAt>=3_600_000) || (lease.nextMaintenance!==null && lease.nextMaintenance<=readyAt)) return 'deferred'
+    }
     if (!event.deliveryId && !await env.DB.prepare(`SELECT 1 FROM notification_channels c JOIN vault_secrets v ON v.id=c.secret_id AND v.vault_id=c.vault_id AND v.type='value' WHERE c.id=? AND c.version=? AND v.id=? AND v.vault_id=? AND v.version=? AND v.nonce=?`).bind(channelId,version,credential.secretId,credential.vaultId,credential.version,credential.nonce).first()) return 'unavailable'
     const init: RequestInit = { method:'POST', redirect:'manual', signal:AbortSignal.timeout(5000), headers:{'Content-Type':'application/json', 'Authorization':`Bearer ${credential.value}`, ...(event.deliveryId ? {'Idempotency-Key':event.deliveryId} : {})}, body:JSON.stringify({event: event.checkId ? 'monitor_status' : 'test', ...(event.checkId ? {checkId:event.checkId,status:event.status,scheduledAt:event.scheduledAt} : {})}) }
     let response: Response
@@ -100,8 +105,12 @@ export async function flushChannelDeliveries(env: ChannelEnvironment): Promise<v
   } catch { return }
   for (const job of jobs) {
     const lease = crypto.randomUUID(), claimedAt = Date.now()
-    const claim = await env.DB.prepare(`UPDATE notification_outbox SET state='sending',lease_token=?,lease_until=?,attempts=attempts+1,updated_at=? WHERE id=? AND attempts<3 AND (state='pending' OR (state='sending' AND lease_until<?))`)
-      .bind(lease,claimedAt+15_000,claimedAt,job.id,claimedAt).run()
+    await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='delivery_failed',lease_token=NULL,lease_until=NULL,updated_at=?
+      WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?
+        AND NOT EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance})`).bind(claimedAt,job.id,claimedAt,claimedAt-3_600_000,claimedAt).run()
+    const claim = await env.DB.prepare(`UPDATE notification_outbox AS o SET state='sending',lease_token=?,lease_until=?,attempts=attempts+1,updated_at=? WHERE o.id=? AND o.attempts<3 AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?))
+      AND (o.created_at>=? OR EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance}))`)
+      .bind(lease,claimedAt+15_000,claimedAt,job.id,claimedAt,claimedAt-3_600_000,claimedAt).run()
     if (!claim.meta.changes) continue
     let result = await sendChannel(env,job.channel_id,job.channel_version,{checkId:job.check_id,checkVersion:job.check_version,status:job.status,scheduledAt:job.scheduled_at,deliveryId:job.id,leaseToken:lease},true)
     // An unavailable result has not sent anything. A credential fault or maintenance
