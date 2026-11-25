@@ -799,3 +799,59 @@ test('Basic credentials rotated or deleted after resolution are not sent by test
     sqlite.close()
   }
 })
+
+test('first trustworthy observation after an initial credential fault or maintenance alerts only when unhealthy', async () => {
+  for (const reason of ['credential', 'maintenance'] as const) for (const status of [200, 503]) {
+    const { sqlite, now, env } = fixture()
+    sqlite.exec(readFileSync(new URL('../../worker/migrations/0008_vault.sql', import.meta.url), 'utf8'))
+    const checkId = '00000000-0000-4000-8000-000000000001'
+    sqlite.prepare('UPDATE http_checks SET id=? WHERE id=?').run(checkId, 'check-0')
+    sqlite.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
+    const actor = { id: 'admin', email: 'admin@example.test', version: 1 }, key = 'ab'.repeat(32)
+    const req = (body: unknown) => new Request('https://status.example/', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const { vaultApi } = await import('../../worker/src/vault.ts')
+    const { channelApi } = await import('../../worker/src/channels.ts')
+    const vault = await (await vaultApi(req({ name: 'fixture' }), env.DB as never, key, actor, '/admin/vaults')).json() as { id: number }
+    const token = await (await vaultApi(req({ name: 'token', type: 'value', value: 'fixture-token' }), env.DB as never, key, actor, `/admin/vaults/${vault.id}/secrets`)).json() as { id: number }
+    const login = await (await vaultApi(req({ name: 'login', type: 'userpass', userpass: { username: 'fixture', password: 'secret' } }), env.DB as never, key, actor, `/admin/vaults/${vault.id}/secrets`)).json() as { id: number }
+    const destinations = JSON.stringify([{ id: 'sink', name: 'Fixture', url: 'https://sink.internal/', binding: 'SINK', serviceId: 'sink-worker' }])
+    const bodies: unknown[] = []
+    const runtime = { ...env, VAULT_ENCRYPTION_KEY: key, MONITOR_AUTH_READY: 'true', CHANNELS_READY: 'true', CHANNEL_ENDPOINTS: destinations, SINK: { fetch: async (_url: string, init: RequestInit) => { bodies.push(JSON.parse(String(init.body))); return new Response(null, { status: 200 }) } } }
+    assert.equal((await channelApi(req({ name: 'Channel', endpointId: 'sink', vaultId: vault.id, secretId: token.id, enabled: true, checkIds: [checkId] }), runtime as never, actor, '/admin/notifications/channels')).status, 201)
+    if (reason === 'credential') sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({ auth: { type: 'basic', basic: { vault: { vaultId: vault.id, secretId: login.id } } } }), checkId)
+    else sqlite.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(Date.now() - 1000, Date.now() + 60_000, Date.now(), Date.now())
+    globalThis.fetch = async () => new Response(null, { status })
+    await runChecks(now, reason === 'credential' ? { ...runtime, VAULT_ENCRYPTION_KEY: 'cd'.repeat(32) } as never : runtime as never)
+    assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM automation_transition_state').get()?.n, 0)
+    assert.equal(bodies.length, 0)
+    if (reason === 'maintenance') sqlite.prepare("UPDATE maintenance SET ends_at=? WHERE id='m'").run(Date.now() - 1)
+    await runChecks(now + 60_000, runtime as never)
+    assert.deepEqual(bodies.map(body => (body as { status: string }).status), status === 503 ? ['down'] : [])
+    assert.equal(sqlite.prepare('SELECT status FROM automation_transition_state WHERE check_id=?').get(checkId)?.status, status === 503 ? 'down' : 'up')
+    sqlite.close()
+  }
+})
+
+test('first observation after a configuration version change still establishes a baseline without alerting', async () => {
+  const { sqlite, now, env } = fixture()
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0008_vault.sql', import.meta.url), 'utf8'))
+  const checkId = '00000000-0000-4000-8000-000000000001'
+  sqlite.prepare('UPDATE http_checks SET id=?,config_version=2 WHERE id=?').run(checkId, 'check-0')
+  sqlite.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'up')").run(checkId)
+  sqlite.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
+  const actor = { id: 'admin', email: 'admin@example.test', version: 1 }, key = 'ab'.repeat(32)
+  const req = (body: unknown) => new Request('https://status.example/', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  const { vaultApi } = await import('../../worker/src/vault.ts')
+  const { channelApi } = await import('../../worker/src/channels.ts')
+  const vault = await (await vaultApi(req({ name: 'fixture' }), env.DB as never, key, actor, '/admin/vaults')).json() as { id: number }
+  const token = await (await vaultApi(req({ name: 'token', type: 'value', value: 'fixture-token' }), env.DB as never, key, actor, `/admin/vaults/${vault.id}/secrets`)).json() as { id: number }
+  const destinations = JSON.stringify([{ id: 'sink', name: 'Fixture', url: 'https://sink.internal/', binding: 'SINK', serviceId: 'sink-worker' }])
+  let deliveries = 0
+  const runtime = { ...env, VAULT_ENCRYPTION_KEY: key, CHANNELS_READY: 'true', CHANNEL_ENDPOINTS: destinations, SINK: { fetch: async () => { deliveries++; return new Response(null, { status: 200 }) } } }
+  await channelApi(req({ name: 'Channel', endpointId: 'sink', vaultId: vault.id, secretId: token.id, enabled: true, checkIds: [checkId] }), runtime as never, actor, '/admin/notifications/channels')
+  globalThis.fetch = async () => new Response(null, { status: 503 })
+  await runChecks(now, runtime as never)
+  assert.equal(deliveries, 0)
+  assert.deepEqual({ ...sqlite.prepare('SELECT check_version,status FROM automation_transition_state WHERE check_id=?').get(checkId) }, { check_version: 2, status: 'down' })
+  sqlite.close()
+})

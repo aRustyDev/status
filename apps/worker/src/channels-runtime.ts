@@ -19,7 +19,7 @@ export function enqueueTransition(db: D1Database, checkId: string, version: numb
     SELECT ? || ':' || c.id,c.id,c.version,h.id,h.config_version,?,?,?,?,COALESCE(ns.generation,0) + CASE WHEN ns.check_id IS NULL THEN 0 ELSE 1 END,? FROM notification_channels c
     JOIN notification_channel_checks cc ON cc.channel_id=c.id JOIN http_checks h ON h.id=cc.check_id
     LEFT JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version
-    WHERE c.enabled=1 AND h.id=? AND h.enabled=1 AND h.config_version=? AND ((ns.check_id IS NOT NULL AND ns.status<>?) OR (ns.check_id IS NULL AND h.last_scheduled_at IS NULL AND ? IN ('down','degraded') AND NOT EXISTS (SELECT 1 FROM automation_transition_state existing WHERE existing.check_id=h.id))) AND ${outsideMaintenance}
+    WHERE c.enabled=1 AND h.id=? AND h.enabled=1 AND h.config_version=? AND ((ns.check_id IS NOT NULL AND ns.status<>?) OR (ns.check_id IS NULL AND ? IN ('down','degraded') AND NOT EXISTS (SELECT 1 FROM automation_transition_state existing WHERE existing.check_id=h.id))) AND ${outsideMaintenance}
       AND (h.last_scheduled_at IS NULL OR h.last_scheduled_at<?)
       AND EXISTS (SELECT 1 FROM endpoint_registry WHERE endpoint_id=h.endpoint_id AND fingerprint=?)
       AND EXISTS (SELECT 1 FROM http_check_results WHERE check_id=h.id AND config_version=h.config_version AND scheduled_at=? AND COALESCE(effective_status,status)=?)`)
