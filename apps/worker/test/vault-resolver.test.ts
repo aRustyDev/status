@@ -70,3 +70,35 @@ test('runtime lookup is scoped to persisted integration and version, handles rot
   assert.equal(await resolveMonitorCredential(typedDb, key, 'check-a', 4), null)
   db.sqlite.close()
 })
+
+test('monitor header resolution uses only the saved version and fails closed for missing or wrongly typed secrets', async () => {
+  const { resolveMonitorHeaderSnapshots } = await import('../src/vault-resolver.ts')
+  const db = new Database(), key = 'b2'.repeat(32), actor = { id: 'admin', email: 'admin@example.test', version: 1 }
+  db.sqlite.exec(`CREATE TABLE users (id TEXT PRIMARY KEY, role TEXT, version INTEGER);
+    INSERT INTO users VALUES ('admin','admin',1);
+    CREATE TABLE audit_events (id TEXT PRIMARY KEY, actor_email TEXT, action TEXT, entity_type TEXT, entity_id TEXT, created_at INTEGER, details TEXT NOT NULL);
+    CREATE TABLE http_checks (id TEXT PRIMARY KEY, config_version INTEGER, advanced_config TEXT);`)
+  db.sqlite.exec(readFileSync(new URL('../migrations/0008_vault.sql', import.meta.url), 'utf8'))
+  const call = async (method: string, path: string, body?: object) => vaultApi(new Request(`https://example.test${path}`, {
+    method, headers: { 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}),
+  }), db as unknown as D1Database, key, actor, path)
+  const vault = await (await call('POST', '/admin/vaults', { name: 'Fixture' })).json() as { id: number }
+  const prefix = `/admin/vaults/${vault.id}/secrets`
+  const token = await (await call('POST', prefix, { name: 'Token', type: 'value', value: 'synthetic-token' })).json() as { id: number; version: number }
+  const userpass = await (await call('POST', prefix, { name: 'Login', type: 'userpass', userpass: { username: 'u', password: 'p' } })).json() as { id: number }
+  const ref = { vaultId: vault.id, secretId: token.id }
+  await db.prepare('INSERT INTO http_checks VALUES (?,?,?)').bind('check', 2, JSON.stringify({ vaultHeaders: { 'X-Token': ref } })).run()
+  const typedDb = db as unknown as D1Database
+  assert.equal((await resolveMonitorHeaderSnapshots(typedDb, key, 'check', 2))?.['X-Token']?.value, 'synthetic-token')
+  assert.equal(await resolveMonitorHeaderSnapshots(typedDb, key, 'check', 1), null)
+  assert.equal(await resolveMonitorHeaderSnapshots(typedDb, key, 'other', 2), null)
+  assert.equal(await resolveMonitorHeaderSnapshots(typedDb, 'ff'.repeat(32), 'check', 2), null)
+  await db.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').bind(JSON.stringify({vaultHeaders:{'X-Token':{vaultId:vault.id,secretId:userpass.id}}}), 'check').run()
+  assert.equal(await resolveMonitorHeaderSnapshots(typedDb, key, 'check', 2), null)
+  await db.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').bind(JSON.stringify({vaultHeaders:{'X-Token':ref}}), 'check').run()
+  assert.equal((await call('PATCH', `${prefix}/${token.id}`, { version: token.version, value: 'rotated-token' })).status, 200)
+  assert.equal((await resolveMonitorHeaderSnapshots(typedDb, key, 'check', 2))?.['X-Token']?.value, 'rotated-token')
+  assert.equal((await call('DELETE', `${prefix}/${token.id}`, { version: 2 })).status, 200)
+  assert.equal(await resolveMonitorHeaderSnapshots(typedDb, key, 'check', 2), null)
+  db.sqlite.close()
+})

@@ -1,7 +1,7 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose'
-import { endpointFingerprint, parseEndpoints } from './endpoint-config'
+import { endpointFingerprint, parseEndpoints, type Endpoint } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
-import { parsePersistedHttpConfig, parseVaultBasicAuth } from '../../probe/src/http-monitor'
+import { parsePersistedHttpConfig, parseVaultBasicAuth, requestAllowedForEndpoint } from '../../probe/src/http-monitor'
 import { ProbeTestTimeout, requestProbeTest } from './probe-test'
 import { getSystemHealthReport } from './system-health'
 import { vaultApi, vaultKeyReady, VaultError } from './vault'
@@ -17,6 +17,7 @@ interface Env extends EmailChannelEnv {
   DB: D1Database
   VAULT_ENCRYPTION_KEY?: string
   MONITOR_AUTH_READY?: string
+  MONITOR_REQUEST_READY?: string
   CHANNEL_ENDPOINTS?: string
   CHANNELS_READY?: string
   ACTION_ENDPOINTS?: string
@@ -52,9 +53,13 @@ const healthStatuses = ['operational', 'degraded', 'down']
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store' } })
 const bad = (message: string): never => { throw new HttpError(400, message) }
 const id = () => crypto.randomUUID()
-function serializeAdvancedConfig(value: unknown, endpointId: string, expectedStatus: number): string | null {
+function serializeAdvancedConfig(env: Env, value: unknown, endpointId: string, expectedStatus: number): string | null {
   if (value === null) return null
-  if (!parsePersistedHttpConfig(value, endpointId, 'validation', expectedStatus)) return bad('Invalid advanced check settings')
+  const config = parsePersistedHttpConfig(value, endpointId, 'validation', expectedStatus)
+  if (!config) return bad('Invalid advanced check settings')
+  const endpoint = parseEndpoints(env.ENDPOINTS).get(endpointId)
+  if (!endpoint || !requestAllowedForEndpoint(config, endpoint)) return bad('Request settings are not approved for this destination')
+  if ((config.headers || config.body !== undefined || config.vaultHeaders || config.method?.toUpperCase() === 'POST') && env.MONITOR_REQUEST_READY !== 'true') throw new HttpError(503, 'Monitor request settings are unavailable')
   const serialized = JSON.stringify(value)
   if (serialized.length > 32_000) return bad('Invalid advanced check settings')
   return serialized
@@ -62,7 +67,15 @@ function serializeAdvancedConfig(value: unknown, endpointId: string, expectedSta
 /** Only administrators can attach an existing user/password secret to an HTTPS check. */
 async function validateMonitorAuth(env: Env, value: unknown, endpointId: string): Promise<void> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return
-  const auth = (value as Record<string, unknown>).auth
+  const config = value as Record<string, unknown>
+  const vaultHeaders = config.vaultHeaders as Record<string, { vaultId: number; secretId: number }> | undefined
+  if (vaultHeaders && Object.keys(vaultHeaders).length) {
+    if (env.MONITOR_AUTH_READY !== 'true' || !await vaultKeyReady(env.DB, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Monitor credentials are unavailable')
+    for (const ref of Object.values(vaultHeaders)) {
+      if (!await stmt(env.DB, "SELECT id FROM vault_secrets WHERE id=? AND vault_id=? AND type='value'", ref.secretId, ref.vaultId).first()) return bad('Select an available Secure Value secret')
+    }
+  }
+  const auth = config.auth
   if (auth === undefined) return
   const parsed = parseVaultBasicAuth(auth)
   if (!parsed) return bad('Invalid monitor authentication')
@@ -347,7 +360,6 @@ function serializeMonitorTags(value: unknown): string {
   return JSON.stringify(tags)
 }
 
-type Endpoint = { id: string; name?: string }
 function approvedEndpoints(env: Env): Endpoint[] {
   try {
     return [...parseEndpoints(env.ENDPOINTS).values()]
@@ -392,7 +404,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
         } catch { return { ...check, advancedConfig: null, advancedConfigInvalid: true } }
       }))
     }
-    if (resource === 'endpoints' && !recordId) return json(approvedEndpoints(env).map(endpoint => ({ id: endpoint.id, name: endpoint.name ?? endpoint.id })))
+    if (resource === 'endpoints' && !recordId) return json(approvedEndpoints(env).map(endpoint => ({ id: endpoint.id, name: endpoint.name, ...(env.MONITOR_REQUEST_READY === 'true' && endpoint.requestPolicy ? { requestPolicy: endpoint.requestPolicy } : {}) })))
     throw new HttpError(404, 'Not found')
   }
   if (resource === 'components' && recordId && method !== 'GET' && await stmt(db, 'SELECT component_id FROM gatus_sources WHERE component_id=?', recordId).first()) throw new HttpError(403, 'Gatus-managed component is read-only')
@@ -533,7 +545,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (current.gatusComponent) throw new HttpError(403, 'Gatus-managed component is read-only')
     if (current.version !== submittedVersion) throw new HttpError(409, 'This record changed. Reload and try again.')
     const candidate = body.advancedConfig
-    const serialized = serializeAdvancedConfig(candidate, current.endpointId, current.expectedStatus)
+    const serialized = serializeAdvancedConfig(env, candidate, current.endpointId, current.expectedStatus)
     await validateMonitorAuth(env, candidate, current.endpointId)
     let unchanged = serialized === null && current.advancedConfig === null
     if (serialized !== null && current.advancedConfig !== null) {
@@ -556,6 +568,14 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (recordId && await stmt(db, 'SELECT c.id FROM http_checks c JOIN gatus_sources g ON g.component_id=c.component_id WHERE c.id=?', recordId).first()) throw new HttpError(403, 'Gatus-managed component is read-only')
     const endpointId = string(body.endpointId, 'endpointId', 100)
     if (!approvedEndpoints(env).some(endpoint => endpoint.id === endpointId)) bad('Unknown approved endpoint')
+    if (recordId) {
+      const existing = await stmt(db, 'SELECT endpoint_id, advanced_config FROM http_checks WHERE id=?', recordId).first<{ endpoint_id: string; advanced_config: string | null }>()
+      if (existing && existing.endpoint_id !== endpointId && existing.advanced_config) {
+        let previous: Json
+        try { previous = JSON.parse(existing.advanced_config) as Json } catch { return bad('Check settings are invalid') }
+        if (previous.headers || previous.body !== undefined || previous.vaultHeaders || String(previous.method ?? '').toUpperCase() === 'POST') return bad('Use the monitor editor to change the destination of a custom request')
+      }
+    }
     await validateComponents(db, [componentId])
     if (typeof body.enabled !== 'boolean') bad('Invalid enabled')
     if (body.intervalMinutes !== 1 && body.intervalMinutes !== 5) bad('Invalid intervalMinutes')
@@ -789,10 +809,10 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const endpointId = string(body.endpointId, 'endpointId', 100)
     if (!approvedEndpoints(env).some(endpoint => endpoint.id === endpointId)) return bad('Unknown approved endpoint')
     if (!Number.isInteger(body.expectedStatus) || Number(body.expectedStatus) < 100 || Number(body.expectedStatus) > 599) return bad('Invalid expectedStatus')
-    serializeAdvancedConfig(body.advancedConfig, endpointId, Number(body.expectedStatus))
+    serializeAdvancedConfig(env, body.advancedConfig, endpointId, Number(body.expectedStatus))
     const config = body.advancedConfig as Record<string, unknown> | null
     let payload: unknown = { endpointId, expectedStatus: body.expectedStatus, advancedConfig: body.advancedConfig }
-    if (config?.auth !== undefined) {
+    if (config?.auth !== undefined || (config?.vaultHeaders && Object.keys(config.vaultHeaders as object).length > 0)) {
       await validateMonitorAuth(env, config, endpointId)
       if (typeof body.checkId !== 'string' || !Number.isSafeInteger(body.checkVersion)) return bad('Save authentication settings before testing')
       const saved = await stmt(db, 'SELECT endpoint_id,expected_status,advanced_config FROM http_checks WHERE id=? AND config_version=?', body.checkId, body.checkVersion).first<{endpoint_id:string;expected_status:number;advanced_config:string | null}>()
@@ -852,7 +872,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       if (typeof input.enabled !== 'boolean' || (input.intervalMinutes !== 1 && input.intervalMinutes !== 5)) return bad('Invalid check settings')
       if (!Number.isInteger(input.expectedStatus) || Number(input.expectedStatus) < 100 || Number(input.expectedStatus) > 599) return bad('Invalid expectedStatus')
       const advanced = input.advancedConfig ?? null
-      const serialized = serializeAdvancedConfig(advanced, endpointId, Number(input.expectedStatus))
+      const serialized = serializeAdvancedConfig(env, advanced, endpointId, Number(input.expectedStatus))
       await validateMonitorAuth(env, advanced, endpointId)
       current = creating ? null : await stmt(db, 'SELECT * FROM http_checks WHERE component_id=?', componentId).first<StoredCheck>()
       if (current && (input.id !== current.id || input.version !== current.config_version)) throw new HttpError(409, 'This check changed. Reload and try again.')
@@ -904,7 +924,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
     const notificationsAvailable = await notificationsReady(env)
     const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
-    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })

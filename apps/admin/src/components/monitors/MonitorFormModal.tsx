@@ -53,6 +53,7 @@ function CloudflareMonitorFormModal({ monitor, allTags = [], onClose, onSaved, s
   const profile: CloudflareProfile = {
     isAdmin,
     monitorAuth: !!capabilities.monitorAuth,
+    monitorRequest: !!capabilities.monitorRequest,
     monitorAlerts: isAdmin && !!capabilities.notifications,
     alertChannels: alertChannels.data ?? [],
     alertChannelIds: initialComponent?.channelIds ?? [],

@@ -31,10 +31,66 @@ beforeEach(() => {
   vi.mocked(api.post).mockResolvedValue({})
 })
 
-function renderModal(value: Monitor | null, allTags: { label: string; color: string }[] = [], monitorAuth = false, notifications = false) {
+function renderModal(value: Monitor | null, allTags: { label: string; color: string }[] = [], monitorAuth = false, notifications = false, monitorRequest = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, monitorAuth, notifications }}><MonitorFormModal monitor={value} allTags={allTags} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
+  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, monitorAuth, notifications, monitorRequest }}><MonitorFormModal monitor={value} allTags={allTags} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
 }
+
+it('sends the same approved POST request to Test and Save', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [check]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API', requestPolicy: { allowPost: true, plaintextHeaders: ['x-probe'] } }]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  vi.mocked(api.post).mockResolvedValue({ overall: 'ok', steps: [], totalMs: 5 })
+  renderModal(monitor, [], false, false, true)
+  await user.selectOptions(await screen.findByLabelText('Method'), 'POST')
+  await user.click(screen.getByRole('button', { name: 'Request' }))
+  await user.click(screen.getByLabelText('x-probe'))
+  await user.type(screen.getByLabelText('x-probe value'), 'ready')
+  await user.click(screen.getByLabelText('Request Body (JSON)'))
+  await user.paste('{"ok":true}')
+  await user.click(screen.getByRole('button', { name: 'Test' }))
+  const settings = { method: 'POST', headers: { 'x-probe': 'ready' }, body: '{"ok":true}' }
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors/test', expect.objectContaining({ advancedConfig: expect.objectContaining(settings) }), expect.anything()))
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.objectContaining(settings) }) })))
+})
+
+it('requires saved Vault header references and retains them on reopen', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [{ ...check, advancedConfig: { vaultHeaders: { 'x-token': { vaultId: 1, secretId: 2 } } } }]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API', requestPolicy: { vaultHeaders: ['x-token'] } }]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    if (path === '/admin/vaults') return [{ id: 1, name: 'Credentials' }]
+    if (path === '/admin/vaults/1/secrets') return [{ id: 2, name: 'Probe token', type: 'value' }]
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor, [], true, false, true)
+  await user.click(await screen.findByRole('button', { name: 'Request' }))
+  expect(await screen.findByRole('option', { name: 'Probe token' })).toBeInTheDocument()
+  expect(screen.getByLabelText('x-token secret')).toHaveValue('2')
+  expect(screen.getByText('Save these settings before testing the request.')).toBeInTheDocument()
+})
+
+it('keeps a saved request unchanged while its capability is unavailable', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [{ ...check, advancedConfig: { method: 'POST', body: '{"ok":true}' } }]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor)
+  const name = await screen.findByLabelText('Name')
+  await user.clear(name)
+  await user.type(name, 'Renamed')
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', { name: 'Renamed', manualStatus: 'operational', position: 1, tags: [], version: 4 }))
+})
 
 it('shows unavailable upstream sidebar sections while keeping Checks usable', async () => {
   const user = userEvent.setup()

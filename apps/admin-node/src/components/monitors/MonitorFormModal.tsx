@@ -7,7 +7,7 @@ import { YamlViewModal } from '../YamlViewModal'
 import { AuthSection, readAuth } from './AuthSection'
 import { CloudflareSideTabStrip } from './CloudflareSideTabStrip'
 import { SidePanelFrame, SideTabStrip, type SideTab } from '@better-forge/ui'
-import { ActionsSection, ChannelsSection, CredentialsSection, DependenciesSection, PANEL_META, RequestSection, hasAccountCredentials, hasDatabaseCredentials, usesCredentials, type ChannelOption, type SidePanelKey } from './MonitorSidePanel'
+import { ActionsSection, ChannelsSection, CloudflareRequestSection, CredentialsSection, DependenciesSection, PANEL_META, RequestSection, hasAccountCredentials, hasDatabaseCredentials, usesCredentials, type ChannelOption, type RequestPolicy, type SidePanelKey } from './MonitorSidePanel'
 import { HttpAssertionsFields } from './HttpAssertionsFields'
 import { StatusRangesFields, statusRangesProblem, type StatusRange } from './StatusRangesFields'
 import { MonitorTypeConfigFields } from './MonitorTypeConfigFields'
@@ -25,6 +25,7 @@ import { Alert } from '@better-forge/ui'
 export interface CloudflareProfile {
   isAdmin: boolean
   monitorAuth?: boolean
+  monitorRequest?: boolean
   monitorAlerts?: boolean
   alertChannels?: ChannelOption<string>[]
   alertChannelIds?: string[]
@@ -34,7 +35,7 @@ export interface CloudflareProfile {
   settingsUnavailable?: boolean | undefined
   alertSettingsUnavailable?: boolean | undefined
   retrySettings?: (() => void) | undefined
-  endpoints: { id: string; name: string }[]
+  endpoints: { id: string; name: string; requestPolicy?: RequestPolicy }[]
   check?: { id: string; version: number; endpointId: string; enabled: boolean | number; intervalMinutes: number; expectedStatus: number; advancedConfig?: Record<string, unknown> | null; advancedConfigInvalid?: boolean } | undefined
   manualStatus: string
   position: number
@@ -164,8 +165,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
     if (!cloudflare?.monitorAuth || !cloudflare.listVaults) return
     cloudflare.listVaults().then(setVaults).catch(() => setVaultError(true))
     const auth = cloudflare.check?.advancedConfig?.auth as {basic?: {vault?: {vaultId?: number}}} | undefined
-    const vaultId = auth?.basic?.vault?.vaultId
-    if (vaultId && cloudflare.listVaultSecrets) cloudflare.listVaultSecrets(vaultId).then(secrets => setSecretsByVault(prev => ({ ...prev, [vaultId]: secrets }))).catch(() => setVaultError(true))
+    const refs = cloudflare.check?.advancedConfig?.vaultHeaders as Record<string, {vaultId: number}> | undefined
+    const vaultIds = new Set([auth?.basic?.vault?.vaultId, ...Object.values(refs ?? {}).map(ref => ref.vaultId)])
+    for (const vaultId of vaultIds) if (vaultId && cloudflare.listVaultSecrets) cloudflare.listVaultSecrets(vaultId).then(secrets => setSecretsByVault(prev => ({ ...prev, [vaultId]: secrets }))).catch(() => setVaultError(true))
   // Initial configuration and picker state belong to this editor instance.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -252,6 +254,8 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   async function handleTest() {
     if (!isTestable) return
     if (cloudflare) {
+      const requestError = requestProblem()
+      if (requestError) { setError(requestError); setSidePanel('request'); return }
       const problem = statusRangesProblem((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? [])
       if (problem) { setError(problem); setSidePanel('checks'); return }
       if (config['method'] === 'HEAD' && (config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).some(assertion => assertion.type === 'json'))) {
@@ -293,6 +297,39 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
     return { ...advanced, timeoutMs, attempts: retries }
   }
 
+  function requestProblem(): string | null {
+    if (!cloudflare) return null
+    if (!cloudflare.monitorRequest && initialCloudflareCheck) {
+      const previous = initialCloudflareCheck
+      const previousAdvanced = { method: 'GET', ...previous.advancedConfig, timeoutMs: Number(previous.advancedConfig?.timeoutMs ?? (previous.advancedConfig == null ? 5000 : 10000)), attempts: Number(previous.advancedConfig?.attempts ?? 1) }
+      if (endpointId === previous.endpointId && enabled === Boolean(previous.enabled) && intervalSecs === previous.intervalMinutes * 60 && Number(config['expectedStatus'] ?? 200) === previous.expectedStatus && comparable(cloudflareConfig()) === comparable(previousAdvanced)) return null
+    }
+    const method = String(config['method'] ?? 'GET').toUpperCase()
+    const policy = cloudflare.endpoints.find(endpoint => endpoint.id === endpointId)?.requestPolicy
+    const headers = (config['headers'] as Record<string, string> | undefined) ?? {}
+    const refs = (config['vaultHeaders'] as Record<string, {vaultId: number; secretId: number}> | undefined) ?? {}
+    const body = config['body'] as string | undefined
+    if (method === 'POST' && !policy?.allowPost) return 'POST is unavailable for this destination.'
+    if (method === 'POST' && retries !== 1) return 'POST checks require one attempt.'
+    if (body !== undefined) {
+      if (method !== 'POST') return 'Remove the request body or select POST.'
+      if (new TextEncoder().encode(body).length > 16 * 1024) return 'The request body must be at most 16 KiB.'
+      try { JSON.parse(body) } catch { return 'Enter a valid JSON request body.' }
+    }
+    const allowed = (name: string, names: string[] | undefined) => names?.some(item => item.toLowerCase() === name.toLowerCase())
+    if (Object.keys(headers).some(name => !allowed(name, policy?.plaintextHeaders))) return 'Remove plaintext headers that are unavailable for this destination.'
+    if (Object.keys(refs).some(name => !allowed(name, policy?.vaultHeaders))) return 'Remove Vault headers that are unavailable for this destination.'
+    if (Object.values(refs).some(ref => !ref.vaultId || !ref.secretId)) return 'Select a Secure Value Vault secret for every Vault header.'
+    if (config['auth'] && Object.keys(refs).some(name => name.toLowerCase() === 'authorization')) return 'Choose Basic authentication or an Authorization Vault header.'
+    const values = Object.values(headers)
+    if (values.some(value => Array.from(value).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127))) return 'Header values cannot contain control characters.'
+    const sizes = values.map(value => new TextEncoder().encode(value).length)
+    if (sizes.some(size => size > 2048)) return 'Each header value must be at most 2 KiB.'
+    if (sizes.reduce((total, size) => total + size, 0) > 8192) return 'Header values must total at most 8 KiB.'
+    if (body !== undefined && Object.entries(headers).some(([name, value]) => name.toLowerCase() === 'content-type' && value.toLowerCase() !== 'application/json')) return 'A JSON body requires Content-Type application/json.'
+    return null
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     // "Done" after webhook creation — just close and refresh
@@ -303,11 +340,13 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
       setLoading(true)
       try {
         const advanced = cloudflareConfig()
+        const requestError = requestProblem()
+        if (requestError) { setSidePanel('request'); throw new Error(requestError) }
         const basicAuth = advanced.auth as { type?: string; basic?: { vault?: { vaultId?: number; secretId?: number } } } | undefined
         if (basicAuth && (!basicAuth.basic?.vault?.vaultId || !basicAuth.basic.vault.secretId)) { setSidePanel('auth'); throw new Error('Select a User / Password Vault secret.') }
         const rangeProblem = statusRangesProblem((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? [])
         if (rangeProblem) { setSidePanel('checks'); throw new Error(rangeProblem) }
-        if (cloudflare.isAdmin && !endpointId && (config['auth'] || ((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []).length || config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).length || config['degradedAboveMs'] !== undefined)) {
+        if (cloudflare.isAdmin && !endpointId && (config['auth'] || config['headers'] || config['vaultHeaders'] || config['body'] || ((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []).length || config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).length || config['degradedAboveMs'] !== undefined)) {
           throw new Error('Select an approved destination to save check settings.')
         }
         if (timeoutMs * retries > 10000) throw new Error('Timeout multiplied by attempts must not exceed 10,000 ms.')
@@ -434,7 +473,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
             {cloudflare.isAdmin && <>
               <Field label="Approved destination"><select value={endpointId} onChange={e => { invalidateCloudflareTest(); setEndpointId(e.target.value) }} className="input-sig"><option value="">No check</option>{cloudflare.endpoints.map(endpoint => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>
               {endpointId && <>
-                <div className="grid grid-cols-2 gap-3"><Field label="Method"><select value={String(config['method'] ?? 'GET')} onChange={e => updateConfig('method', e.target.value)} className="input-sig"><option>GET</option><option>HEAD</option></select></Field>
+                <div className="grid grid-cols-2 gap-3"><Field label="Method"><select value={String(config['method'] ?? 'GET')} onChange={e => updateConfig('method', e.target.value)} className="input-sig"><option>GET</option><option>HEAD</option>{(cloudflare.monitorRequest && cloudflare.endpoints.find(endpoint => endpoint.id === endpointId)?.requestPolicy?.allowPost || config['method'] === 'POST') && <option>POST</option>}</select></Field>
                 <Field label="Expected status"><input type="number" min={100} max={599} required disabled={Array.isArray(config['acceptedStatusRanges']) && config['acceptedStatusRanges'].length > 0} value={Number(config['expectedStatus'] ?? 200)} onChange={e => updateConfig('expectedStatus', Number(e.target.value))} className="input-sig" /></Field></div>
                 {Array.isArray(config['acceptedStatusRanges']) && config['acceptedStatusRanges'].length > 0 && <div className="text-sm space-y-2">
                   <p>This check accepts status ranges: {config['acceptedStatusRanges'].map((range: { min: number; max: number }) => `${range.min}–${range.max}`).join(', ')}. The expected status is not used while these ranges are configured.</p>
@@ -497,11 +536,11 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
       {/* ── Side panel ─────────────────────────────────────────────────── */}
       <SidePanelFrame meta={PANEL_META[sidePanel ?? 'tags']} layout="responsive" className={!sidePanel || cloudflare?.statusUnavailable ? 'hidden' : undefined}>
-          {sidePanel === 'request' && <RequestSection config={config} updateConfig={updateConfig} />}
+          {sidePanel === 'request' && (cloudflare ? <CloudflareRequestSection config={config} updateConfig={updateConfig} policy={cloudflare.endpoints.find(endpoint => endpoint.id === endpointId)?.requestPolicy} vaultPicker={vaultPicker} vaultReady={!!cloudflare.monitorAuth} vaultError={vaultError} /> : <RequestSection config={config} updateConfig={updateConfig} />)}
           {sidePanel === 'checks' && (
             <>
             {cloudflare && <StatusRangesFields ranges={(config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []} onChange={ranges => updateConfig('acceptedStatusRanges', ranges.length ? ranges : undefined)} />}
-            {cloudflare && <p className="text-xs">HEAD responses have no body, so keyword and JSON checks require GET. Redirects are not followed.</p>}
+            {cloudflare && <p className="text-xs">HEAD responses have no body, so keyword and JSON checks require GET or POST. Redirects are not followed.</p>}
             <HttpAssertionsFields
               keyword={keyword}
               onKeywordChange={(value) => updateConfig('keyword', value)}
@@ -541,7 +580,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
       {/* ── Vertical tab strip ──────────────────────────────────────────── */}
       {cloudflare
-        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} canEditAuth={cloudflare.isAdmin && !!cloudflare.monitorAuth} canEditAlerts={cloudflare.isAdmin && !!cloudflare.monitorAlerts} checkCount={checkCount} tagCount={tags.length} alertCount={selectedAlertChannelIds.size} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
+        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} canEditAuth={cloudflare.isAdmin && !!cloudflare.monitorAuth} canEditRequest={cloudflare.isAdmin && !!cloudflare.monitorRequest} canEditAlerts={cloudflare.isAdmin && !!cloudflare.monitorAlerts} checkCount={checkCount} tagCount={tags.length} alertCount={selectedAlertChannelIds.size} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
         : <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" />}
 
       </div>{/* outer flex row */}

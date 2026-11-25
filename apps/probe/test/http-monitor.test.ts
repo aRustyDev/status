@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { endpointFingerprint, parseEndpoints } from '../../worker/src/endpoint-config.ts'
 import { evaluateHttpMonitor, parsePersistedHttpConfig, type HttpMonitorConfig, type HttpMonitorEnvironment } from '../src/http-monitor.ts'
 
-const endpoints = parseEndpoints(JSON.stringify([{ id: 'approved', name: 'Approved', url: 'https://example.test/status' }]))
+const endpoints = parseEndpoints(JSON.stringify([{ id: 'approved', name: 'Approved', url: 'https://example.test/status', requestPolicy: { allowPost: true, plaintextHeaders: ['content-type', 'x-test'], vaultHeaders: ['authorization'] } }]))
 const registered = endpoints.get('approved')!
 const fingerprint = await endpointFingerprint(registered)
 const base = (): HttpMonitorConfig => ({ endpointId: 'approved', registryFingerprint: fingerprint })
@@ -22,7 +22,7 @@ test('allows only the registry target with a matching fingerprint', async () => 
 })
 
 test('supports request methods, explicit status ranges and header/body assertions', async () => {
-  const config: HttpMonitorConfig = { ...base(), method: 'POST', headers: { Authorization: 'Bearer test-secret', 'Content-Type': 'application/json' }, body: '{"ping":true}', acceptedStatusRanges: [{ min: 200, max: 204 }, { min: 210, max: 211 }], keyword: 'ready', assertions: [
+  const config: HttpMonitorConfig = { ...base(), method: 'POST', headers: { 'X-Test': 'safe-value', 'Content-Type': 'application/json' }, body: '{"ping":true}', acceptedStatusRanges: [{ min: 200, max: 204 }, { min: 210, max: 211 }], keyword: 'ready', assertions: [
     { type: 'header', name: 'x-ready', op: 'equals', value: 'yes' },
     { type: 'json', path: '$.nested[0].value', op: 'gt', value: 2 },
   ] }
@@ -30,14 +30,14 @@ test('supports request methods, explicit status ranges and header/body assertion
     assert.equal(url, registered.url)
     assert.equal(init.method, 'POST')
     assert.equal(init.body, '{"ping":true}')
-    assert.equal((init.headers as Record<string, string>).Authorization, 'Bearer test-secret')
+    assert.equal((init.headers as Record<string, string>)['X-Test'], 'safe-value')
     assert.equal(init.redirect, 'manual')
     return new Response(JSON.stringify({ nested: [{ value: 3 }], health: 'ready' }), { status: 201, headers: { 'x-ready': 'yes' } })
   })
   const result = await evaluateHttpMonitor(config, env)
   assert.equal(result.status, 'up')
   assert.equal(result.httpStatus, 201)
-  assert.ok(!JSON.stringify(result).includes('test-secret'))
+  assert.ok(!JSON.stringify(result).includes('safe-value'))
 })
 
 test('defaults to exact 200; retries only down outcomes and never degraded ones', async () => {
@@ -136,13 +136,14 @@ test('body read shares the deadline and cancels a stalled stream', async () => {
   assert.equal(cancelled, true)
 })
 
-test('post responses may be retried but configured credential material never enters errors', async () => {
-  const secret = 'Bearer credential-which-must-not-appear'
-  const result = await evaluateHttpMonitor({ ...base(), method: 'POST', body: 'private body', headers: { Authorization: secret }, attempts: 2 }, environment(async () => { throw new Error(secret) }))
+test('POST errors are redacted and retries are rejected', async () => {
+  const secret = 'credential-which-must-not-appear'
+  const result = await evaluateHttpMonitor({ ...base(), method: 'POST', body: JSON.stringify({ sample: secret }) }, environment(async () => { throw new Error(secret) }))
   assert.equal(result.status, 'down')
-  assert.equal(result.attempts, 2)
+  assert.equal(result.attempts, 1)
   assert.ok(!JSON.stringify(result).includes(secret))
-  assert.ok(!JSON.stringify(result).includes('private body'))
+  const invalid = await evaluateHttpMonitor({ ...base(), method: 'POST', attempts: 2 }, environment(async () => { throw new Error('unexpected') }))
+  assert.deepEqual(invalid.reasons, ['invalid_configuration'])
 })
 
 test('evaluates upstream-compatible JSON path and missing-value semantics', async () => {
@@ -184,7 +185,7 @@ test('declared oversized JSON is not treated as a passing assertion', async () =
 })
 
 test('accepts case-insensitive upstream method names', async () => {
-  const result = await evaluateHttpMonitor({ ...base(), method: 'pOsT', body: 'payload' }, environment(async (_url, init) => {
+  const result = await evaluateHttpMonitor({ ...base(), method: 'pOsT', body: JSON.stringify('payload') }, environment(async (_url, init) => {
     assert.equal(init.method, 'POST')
     return new Response(null, { status: 200 })
   }))
@@ -213,4 +214,34 @@ test('persisted scheduled checks cap the total timeout and retry budget', () => 
   assert.equal(parse({ timeoutMs: 5001, attempts: 2 }), null)
   assert.equal(parse({ attempts: 2 }), null)
   assert.equal(parse({ timeoutMs: 300000, attempts: 1 }), null)
+})
+
+
+test('request policy rejects disallowed headers, credentials, and methods before transmission', async () => {
+  let calls = 0
+  const env = environment(async () => { calls++; return new Response() })
+  for (const config of [
+    { headers: { Authorization: 'secret' } },
+    { headers: { 'X-Test': 'a', 'x-test': 'b' } },
+    { vaultHeaders: { authorization: { vaultId: 1, secretId: 2 } }, auth: { type: 'basic', basic: { vault: { vaultId: 1, secretId: 3 } } } },
+    { method: 'POST', body: 'bad json' },
+    { method: 'POST', body: JSON.stringify('x'.repeat(16384)) },
+  ]) {
+    assert.equal(parsePersistedHttpConfig(config, 'approved', fingerprint, 200), null)
+    assert.deepEqual((await evaluateHttpMonitor({ ...base(), ...config } as HttpMonitorConfig, env)).reasons, ['invalid_configuration'])
+  }
+  assert.deepEqual((await evaluateHttpMonitor({ ...base(), headers: { 'X-Other': 'value' } }, env)).reasons, ['invalid_configuration'])
+  assert.equal(calls, 0)
+})
+
+test('request policy is normalized into the fingerprint while legacy fingerprints remain stable', async () => {
+  const make = (policy?: object) => parseEndpoints(JSON.stringify([{ id: 'a', name: 'A', url: 'https://example.test/', ...(policy ? { requestPolicy: policy } : {}) }])).get('a')!
+  const legacy = make()
+  const unchanged = { id: 'a', name: 'other', url: 'https://example.test/' }
+  assert.equal(await endpointFingerprint(legacy), await endpointFingerprint(unchanged))
+  const one = make({ allowPost: true, plaintextHeaders: ['X-B', 'x-a'] })
+  const two = make({ plaintextHeaders: ['x-A', 'x-b'], allowPost: true })
+  assert.equal(await endpointFingerprint(one), await endpointFingerprint(two))
+  assert.notEqual(await endpointFingerprint(one), await endpointFingerprint(legacy))
+  assert.throws(() => make({ plaintextHeaders: ['X-Test', 'x-test'] }), /Invalid request policy/)
 })
