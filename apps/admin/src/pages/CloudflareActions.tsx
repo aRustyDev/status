@@ -1,7 +1,7 @@
 // Adapts the upstream Actions page and Vault picker to the supported Workers webhook provider.
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Modal, ModalFooter } from '@better-forge/ui'
+import { ApiError, Modal, ModalFooter } from '@better-forge/ui'
 import { api } from '../api/client'
 
 type Action = { id:string; name:string; endpointId:string; triggerStatus:string; vaultId:number; secretId:number; enabled:number; version:number; checkIds:string[] }
@@ -67,7 +67,11 @@ function ActionForm({action,onClose,onSaved}:{action:Action|null;onClose:()=>voi
       if (action) await api.patch(`/admin/actions/${action.id}`,payload)
       else await api.post('/admin/actions',payload)
       await onSaved()
-    } catch { setError('Could not save action. Check your selections and reload if it was changed.') }
+    } catch (error) {
+      setError(error instanceof ApiError && error.status===409 && error.message==='Monitor choices are out of date. Refresh the page and try again.'
+        ? 'Monitor choices are out of date. Refresh the page and try again.'
+        : 'Could not save action. Check your selections and reload if it was changed.')
+    }
     finally { setBusy(false) }
   }
   return <Modal icon="actions" title={action?'Edit action':'Add Action'} onClose={onClose}><form onSubmit={event=>void submit(event)}><div className="p-6 space-y-3">

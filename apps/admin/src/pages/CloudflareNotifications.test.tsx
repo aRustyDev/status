@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { ApiError } from '@better-forge/ui'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../api/client'
 import CloudflareNotifications from './CloudflareNotifications'
@@ -66,5 +67,17 @@ describe('Cloudflare notification channels',()=>{
     await user.click(within(form).getByRole('button',{name:'Save Channel'}))
     await waitFor(()=>expect(api.patch).toHaveBeenCalledWith(`/admin/notifications/channels/${channel.id}`,expect.objectContaining({version:3,checkIds:[checkId],expectedChecks:[{id:checkId,componentId:'component',version:7}]})))
     expect(await within(form).findByRole('alert')).toHaveTextContent('Could not save channel')
+  })
+  it.each([
+    {error:new ApiError('Monitor choices are out of date. Refresh the page and try again.',409),expected:'Monitor choices are out of date. Refresh the page and try again.'},
+    {error:new ApiError('private provider details',409),expected:'Could not save channel.'},
+    {error:new ApiError('Monitor choices are out of date. Refresh the page and try again.',500),expected:'Could not save channel.'},
+  ])('shows only the known refresh conflict',async({error,expected})=>{
+    const user=setup();await user.click(await screen.findByRole('button',{name:'Edit'}));const form=screen.getByRole('dialog')
+    await waitFor(()=>expect(within(form).getByRole('button',{name:'Save Channel'})).toBeEnabled())
+    vi.mocked(api.patch).mockRejectedValueOnce(error)
+    await user.click(within(form).getByRole('button',{name:'Save Channel'}))
+    expect(await within(form).findByRole('alert')).toHaveTextContent(expected)
+    expect(within(form).getByRole('alert')).not.toHaveTextContent('private provider details')
   })
 })

@@ -1,7 +1,7 @@
 // Adapts the upstream Notifications page and Vault picker to the supported Workers webhook provider.
 import { useEffect, useState, type FormEvent } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Modal, ModalFooter } from '@better-forge/ui'
+import { ApiError, Modal, ModalFooter } from '@better-forge/ui'
 import { api } from '../api/client'
 
 type Channel = { id:string; name:string; endpointId:string; vaultId:number; secretId:number; enabled:number; version:number; checkIds:string[] }
@@ -75,7 +75,11 @@ function ChannelForm({channel,onClose,onSaved}:{channel:Channel|null;onClose:()=
       if (channel) await api.patch(`/admin/notifications/channels/${channel.id}`,payload)
       else await api.post('/admin/notifications/channels',payload)
       await onSaved()
-    } catch { setError('Could not save channel. Check your selections and reload if it was changed.') }
+    } catch (error) {
+      setError(error instanceof ApiError && error.status===409 && error.message==='Monitor choices are out of date. Refresh the page and try again.'
+        ? 'Monitor choices are out of date. Refresh the page and try again.'
+        : 'Could not save channel. Check your selections and reload if it was changed.')
+    }
     finally { setBusy(false) }
   }
   return <Modal icon="notifications" title={channel?'Edit channel':'Add Channel'} onClose={onClose}><form onSubmit={event=>void submit(event)}><div className="p-6 space-y-3">
