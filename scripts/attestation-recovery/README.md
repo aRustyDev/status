@@ -18,8 +18,11 @@ The preload supplies the recovered JSON only to pacote's fetch of those three
 exact HTTPS URLs, after a fresh live response exactly matches the broken bytes.
 It requires the lockfile and live registry version, integrity, and advertised
 provenance metadata to match the pinned values and requires exactly one publish
-and one SLSA statement with the expected subject. All other requests and
-responses pass through. npm's normal audit still verifies the registry signatures,
+and one SLSA statement with the expected subject. Other requests and non-200
+responses pass through. Successful responses at the three target URLs are read
+once (with a 4 MiB limit) and replayed to npm unless they match the sentinel;
+this avoids a deadlock in npm's cloned response streams. Oversized responses
+fail closed. npm's normal audit still verifies the registry signatures,
 subjects, publisher keys, Sigstore signatures, certificate chains and log proofs.
 Transport errors, altered metadata, invalid signatures, and all other unexpected
 responses still fail the audit.
