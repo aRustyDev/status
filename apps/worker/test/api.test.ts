@@ -97,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0016_dependency_observations.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -120,10 +120,13 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0009_channels.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0009_actions.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0010_monitor_alert_links.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0010_notification_transition_state.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0011_email_channels.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0012_notification_delivery_state.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0013_notification_unlink_cancel.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0014_monitor_alert_channel_limit.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0015_monitor_dependencies.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0016_dependency_observations.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -902,6 +905,8 @@ test('Gatus inventory is read-only, preserves aliases and incidents, and fails c
     const monitor = body.monitors.find(item => item.uuid === component)
     assert.ok(monitor)
     assert.deepEqual([monitor.source, monitor.type, monitor.group, monitor.currentStatus], ['gatus', 'gatus', 'Fixture group', 'up'])
+    const rejectedDependency = await request('/api/v1/bsp/admin/monitors', adminToken, 'POST', { name: 'Gatus dependency rejected', manualStatus: 'operational', dependsOnIds: [monitor.id] }, 'https://status.example', `${Date.now()}.${crypto.randomUUID()}`)
+    assert.equal(rejectedDependency.response.status, 400)
     assert.doesNotMatch(JSON.stringify(body), /never-expose\.example|fixture_service/)
     const publicAgain = await request('/api/v1/bsp/public/status', viewerToken)
     assert.equal((publicAgain.body as unknown as {monitors:Array<{id:number;uuid:string}>}).monitors.find(item => item.uuid === component)?.id, monitor.id)
@@ -1793,4 +1798,33 @@ test('atomic monitor check edits increment exactly once and fence stale results'
     assert.equal((await save({})).response.status,200)
     current=await getCheck(); assert.equal(current!.config_version,beforeNullOther+1)
   } finally { env.ENDPOINTS='[]' }
+})
+
+
+test('monitor dependencies are versioned, cycle checked, and administrator controlled', async () => {
+  const path = '/api/v1/bsp/admin/monitors'
+  const mutation = () => `${Date.now()}.${crypto.randomUUID()}`
+  const create = async (name: string, dependsOnIds: number[] = []) => request(path, adminToken, 'POST', { name, manualStatus: 'operational', position: 0, dependsOnIds }, 'https://status.example', mutation())
+  const first = await create('Dependency first')
+  assert.equal(first.response.status, 201)
+  const a = first.body.id as number
+  const second = await create('Dependency second', [a])
+  assert.equal(second.response.status, 201)
+  const b = second.body.id as number
+  const list = await request(path, adminToken)
+  const rows = list.body as unknown as Array<{id:number;dependsOnIds:number[]}>
+  assert.deepEqual(rows.find(row => row.id === b)?.dependsOnIds, [a])
+  const edit = { name: 'Dependency first', manualStatus: 'operational', position: 0, version: 1, dependsOnIds: [b] }
+  assert.equal((await request(`${path}/${a}`, operatorToken, 'PATCH', edit, 'https://status.example', mutation())).response.status, 403)
+  assert.equal((await request(`${path}/${a}`, adminToken, 'PATCH', edit, 'https://status.example', mutation())).response.status, 400)
+  const unchanged = await request(path, adminToken)
+  assert.deepEqual((unchanged.body as unknown as Array<{id:number;dependsOnIds:number[]}>).find(row => row.id === b)?.dependsOnIds, [a])
+  assert.equal((await request(`${path}/${b}`, adminToken, 'PATCH', { name: 'Dependency second', manualStatus: 'operational', position: 0, version: 1, dependsOnIds: [] }, 'https://status.example', mutation())).response.status, 200)
+  assert.equal((await request(`${path}/${a}`, adminToken, 'PATCH', { ...edit, dependsOnIds: [a] }, 'https://status.example', mutation())).response.status, 400)
+  assert.equal((await request(`${path}/${a}`, adminToken, 'PATCH', { ...edit, dependsOnIds: [b, b] }, 'https://status.example', mutation())).response.status, 400)
+  const concurrent = await Promise.all([
+    request(`${path}/${a}`, adminToken, 'PATCH', edit, 'https://status.example', mutation()),
+    request(`${path}/${b}`, adminToken, 'PATCH', { name: 'Dependency second', manualStatus: 'operational', position: 0, version: 2, dependsOnIds: [a] }, 'https://status.example', mutation()),
+  ])
+  assert.deepEqual(concurrent.map(result => result.response.status).sort(), [200, 400])
 })

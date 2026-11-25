@@ -7,10 +7,12 @@ import { api } from '../../api/client'
 import { CapabilitiesContext } from '../../capabilities'
 import MonitorFormModal from './MonitorFormModal'
 
+const currentUser = vi.hoisted(() => ({ role: 'admin' }))
+
 vi.mock('../../api/client', () => ({ api: { get: vi.fn(), post: vi.fn(), patch: vi.fn() } }))
 vi.mock('@better-forge/ui', async () => {
   const actual = await vi.importActual<typeof import('@better-forge/ui')>('@better-forge/ui')
-  return { ...actual, getCurrentUser: () => ({ role: 'admin', email: 'operator@example.com' }) }
+  return { ...actual, getCurrentUser: () => ({ role: currentUser.role, email: 'operator@example.com' }) }
 })
 
 const monitor = { id: 7, uuid: 'component-uuid', name: 'API', manualStatus: 'operational', position: 1, version: 4 } as unknown as Monitor
@@ -18,6 +20,7 @@ const check = { id: 'check-uuid', componentId: 'component-uuid', endpointId: 'ap
 
 beforeEach(() => {
   sessionStorage.clear()
+  currentUser.role = 'admin'
   vi.clearAllMocks()
   vi.mocked(api.get).mockImplementation(async path => {
     if (path === '/admin/checks') return [check]
@@ -566,4 +569,52 @@ it('tests a sparse saved Vault check using effective defaults without changing i
   await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7',{
     name:'API',manualStatus:'operational',position:1,tags:[],version:4,
   }))
+})
+
+it('edits Cloudflare dependencies with the upstream selector and saves the selection', async () => {
+  const user = userEvent.setup()
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const saved = { ...monitor, dependsOnIds: [8] } as Monitor
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [check]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API' }]
+    if (path === '/admin/monitors') return [saved, { id: 8, name: 'Database' }, { id: 9, name: 'Cache' }, { id: 10, name: 'Gatus', source: 'gatus' }]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, dependencies: true }}><MonitorFormModal monitor={saved} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
+  await user.click(await screen.findByRole('button', { name: 'Depends on' }))
+  expect(screen.getByRole('checkbox', { name: 'Database' })).toBeChecked()
+  expect(screen.queryByRole('checkbox', { name: 'Gatus' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('checkbox', { name: 'API' })).not.toBeInTheDocument()
+  await user.click(screen.getByRole('checkbox', { name: 'Database' }))
+  await user.click(screen.getByRole('checkbox', { name: 'Cache' }))
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ version: 4, dependsOnIds: [9] })))
+})
+
+it('creates a monitor with its chosen dependency', async () => {
+  const user = userEvent.setup()
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return []
+    if (path === '/admin/endpoints') return []
+    if (path === '/admin/monitors') return [{ id: 8, name: 'Database' }]
+    throw new Error(`Unexpected request ${path}`)
+  })
+  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, dependencies: true }}><MonitorFormModal monitor={null} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
+  await user.type(await screen.findByLabelText('Name'), 'New service')
+  await user.click(screen.getByRole('button', { name: 'Depends on' }))
+  await user.click(screen.getByRole('checkbox', { name: 'Database' }))
+  await user.click(screen.getByRole('button', { name: 'Create Monitor' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors', expect.objectContaining({ name: 'New service', dependsOnIds: [8] })))
+})
+
+
+it('keeps dependency editing unavailable to operators', async () => {
+  currentUser.role = 'operator'
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  render(<QueryClientProvider client={client}><CapabilitiesContext.Provider value={{ supportedRoutes: [], monitorModal: true, dependencies: true }}><MonitorFormModal monitor={monitor} onClose={() => {}} onSaved={() => {}} /></CapabilitiesContext.Provider></QueryClientProvider>)
+  expect(await screen.findByRole('button', { name: 'Depends on' })).toBeDisabled()
+  expect(vi.mocked(api.get).mock.calls.some(([path]) => path === '/admin/monitors')).toBe(false)
 })
