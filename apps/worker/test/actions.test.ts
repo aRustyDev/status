@@ -740,3 +740,23 @@ test('the maximum delay is not expired before it becomes due',async()=>{
   now+=60_000;await flushActions(x.env);assert.equal(x.calls.length,1)
  } finally {Date.now=actual}
 })
+
+test('unrelated monitor edits cannot revive legacy jobs invalidated by destination or credential changes',async()=>{
+ for (const change of ['destination','credential'] as const) {
+  const x=await monitorFixture()
+  const endpoints=JSON.parse(destinations) as {id:string;name:string;url:string;binding:string;serviceId:string}[]
+  endpoints.push({...endpoints[0]!,id:'other',name:'Other destination',url:'https://other.example.test/run'})
+  x.env.ACTION_ENDPOINTS=JSON.stringify(endpoints)
+  await queue(x,'down',100)
+  const replacement=change==='credential' ? await (await vaultApi(request('POST',{name:'replacement',type:'value',value:'another-token'}),x.db,key,actor,`/admin/vaults/${x.vault.id}/secrets`)).json() as {id:number} : undefined
+  const updated={...x.actionBody,version:x.action.version,checkSnapshots:[{id:checkId,componentId:monitorId,configVersion:1}],...(replacement?{secretId:replacement.id}:{endpointId:'other'})}
+  await actionApi(request('PATCH',updated),x.env,actor,`/admin/actions/${x.action.id}`)
+  assert.equal(x.local.db.prepare('SELECT action_version FROM worker_action_outbox').get()?.action_version,1)
+  const other=await (await actionApi(request('POST',{...x.actionBody,name:'Additional action',checkIds:[],checkSnapshots:[]}),x.env,actor,'/admin/actions')).json() as {id:string}
+  const current=await x.get()
+  await x.put([...current.links,{actionId:other.id,onStatus:'down',delayMinutes:0,cooldownMinutes:0}],current.version)
+  await flushActions(x.env)
+  assert.equal(x.calls.length,0,`${change} change must invalidate the old action job`)
+  assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox').get()?.state,'unavailable')
+ }
+})

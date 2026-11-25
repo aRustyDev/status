@@ -116,8 +116,8 @@ async function monitorActionApi(request:Request, db:D1Database, actor:Actor, com
   operations.push(statement(db, `UPDATE worker_action_outbox AS o SET link_id=(SELECT l.id FROM monitor_action_links l JOIN http_checks h ON h.component_id=l.component_id WHERE h.id=o.check_id AND l.action_id=o.action_id AND l.on_status=o.status AND l.delay_minutes=0 AND l.cooldown_minutes=0),
     action_version=(SELECT a.version FROM worker_actions a WHERE a.id=o.action_id)
     WHERE o.link_id IS NULL AND o.state IN ('pending','executing') AND o.check_id IN (SELECT id FROM http_checks WHERE component_id=?) AND ${guard}
-      AND EXISTS (SELECT 1 FROM worker_actions a WHERE a.id=o.action_id AND a.version IN (o.action_version,o.action_version+1))
-      AND EXISTS (SELECT 1 FROM monitor_action_links l JOIN http_checks h ON h.component_id=l.component_id WHERE h.id=o.check_id AND l.action_id=o.action_id AND l.on_status=o.status AND l.delay_minutes=0 AND l.cooldown_minutes=0)`,componentId,componentId,token))
+      AND EXISTS (SELECT 1 FROM worker_actions a WHERE a.id=o.action_id AND (a.version=o.action_version OR (a.version=o.action_version+1 AND a.id IN (SELECT value FROM json_each(?)))))
+      AND EXISTS (SELECT 1 FROM monitor_action_links l JOIN http_checks h ON h.component_id=l.component_id WHERE h.id=o.check_id AND l.action_id=o.action_id AND l.on_status=o.status AND l.delay_minutes=0 AND l.cooldown_minutes=0)`,componentId,componentId,token,changed))
   operations.push(statement(db, `INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) SELECT ?,?,'update','monitor-actions',?,?, '{}' WHERE ${guard}`,crypto.randomUUID(),actor.email,componentId,Date.now(),componentId,token))
   const results=await db.batch(operations)
   if (!results[1].meta.changes) return fail(409,'Monitor actions or identity changed. Reload and try again.')
