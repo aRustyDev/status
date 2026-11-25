@@ -17,7 +17,7 @@ function fixture(count = 1, withAutomation = true) {
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0005_gatus_sources.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0009_monitor_auth.sql', import.meta.url), 'utf8'))
-  if (withAutomation) for (const file of ['0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_action_links.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`, import.meta.url), 'utf8'))
+  if (withAutomation) for (const file of ['0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql', '0017_monitor_action_links.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`, import.meta.url), 'utf8'))
   const now = 1_800_000_000_000
   const endpoints = []
   for (let i = 0; i < count; i++) {
@@ -875,6 +875,7 @@ test('first observation after a configuration version change still establishes a
   const checkId = '00000000-0000-4000-8000-000000000001'
   sqlite.prepare('UPDATE http_checks SET id=?,config_version=2 WHERE id=?').run(checkId, 'check-0')
   sqlite.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES (?,1,'up')").run(checkId)
+  sqlite.prepare("INSERT INTO notification_transition_state (check_id,check_version,status) VALUES (?,1,'up')").run(checkId)
   sqlite.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
   const actor = { id: 'admin', email: 'admin@example.test', version: 1 }, key = 'ab'.repeat(32)
   const req = (body: unknown) => new Request('https://status.example/', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
@@ -892,4 +893,82 @@ test('first observation after a configuration version change still establishes a
   assert.equal(deliveries, 0)
   assert.deepEqual({ ...sqlite.prepare('SELECT check_version,status FROM automation_transition_state WHERE check_id=?').get(checkId) }, { check_version: 2, status: 'down' })
   sqlite.close()
+})
+
+
+test('dependencies order checks and preserve raw observations across transitive outages and recovery', async () => {
+  const { sqlite, now, env } = fixture(3)
+  sqlite.prepare('INSERT INTO monitor_dependencies (dependent_id,depends_on_id) VALUES (?,?)').run('component-0', 'component-1')
+  sqlite.prepare('INSERT INTO monitor_dependencies (dependent_id,depends_on_id) VALUES (?,?)').run('component-1', 'component-2')
+  let rootDown = true
+  const visited: string[] = []
+  globalThis.fetch = async input => {
+    const path = new URL(String(input)).pathname
+    visited.push(path)
+    return new Response(null, { status: path === '/2' && rootDown ? 503 : 200 })
+  }
+  await runChecks(now, env as never)
+  assert.deepEqual(visited, ['/2', '/1', '/0'])
+  assert.deepEqual({ ...sqlite.prepare('SELECT last_status,dependency_affected,dependency_causes FROM http_checks WHERE id=?').get('check-0') }, {
+    last_status: 'up', dependency_affected: 1, dependency_causes: '["component-1"]',
+  })
+  assert.equal(sqlite.prepare('SELECT status FROM notification_transition_state WHERE check_id=?').get('check-0')?.status, 'affected')
+  rootDown = false
+  await runChecks(now + 60_000, env as never)
+  assert.equal(sqlite.prepare('SELECT dependency_affected FROM http_checks WHERE id=?').get('check-0')?.dependency_affected, 0)
+  assert.equal(sqlite.prepare('SELECT status FROM notification_transition_state WHERE check_id=?').get('check-0')?.status, 'up')
+  sqlite.close()
+})
+
+test('dependency outages suppress notifications and recovery respects acknowledged outages', async () => {
+  const { sqlite, env } = fixture(2)
+  const tick = Math.floor(Date.now() / 60_000) * 60_000
+  sqlite.prepare('INSERT INTO monitor_dependencies (dependent_id,depends_on_id) VALUES (?,?)').run('component-0', 'component-1')
+  sqlite.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,created_at,updated_at) VALUES ('channel','Channel','sink','fingerprint',1,1,1,0,0)").run()
+  sqlite.prepare("INSERT INTO notification_channel_checks (channel_id,check_id) VALUES ('channel','check-0')").run()
+  const runtime = { ...env, CHANNELS_READY: 'true', CHANNEL_ENDPOINTS: JSON.stringify([{ id: 'sink', name: 'Sink', url: 'https://sink.test/' }]) }
+  let rootDown = true
+  let childDown = true
+  globalThis.fetch = async input => new Response(null, { status: new URL(String(input)).pathname === '/1' ? (rootDown ? 503 : 200) : (childDown ? 503 : 200) })
+  const realNow = Date.now
+  try {
+    Date.now = () => tick
+    await runChecks(tick, runtime as never)
+    assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get()?.n, 0)
+    rootDown = false
+    Date.now = () => tick + 60_000
+    await runChecks(tick + 60_000, runtime as never)
+    assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM notification_outbox WHERE status='down'").get()?.n, 1)
+    sqlite.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES ('channel','check-0',1,1,'down')").run()
+    rootDown = true
+    childDown = false
+    Date.now = () => tick + 120_000
+    await runChecks(tick + 120_000, runtime as never)
+    assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM notification_outbox WHERE status='up'").get()?.n, 0)
+    rootDown = false
+    Date.now = () => tick + 180_000
+    await runChecks(tick + 180_000, runtime as never)
+    assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM notification_outbox WHERE status='up'").get()?.n, 1)
+  } finally { Date.now = realNow; sqlite.close() }
+})
+
+test('disabled and stale dependency checks cannot suppress a fresh outage', async () => {
+  const { sqlite, env } = fixture(2)
+  const tick = Math.floor(Date.now() / 60_000) * 60_000
+  sqlite.prepare('INSERT INTO monitor_dependencies (dependent_id,depends_on_id) VALUES (?,?)').run('component-0', 'component-1')
+  sqlite.prepare("UPDATE http_checks SET last_status='down',last_effective_status='down',last_scheduled_at=?,last_effective_scheduled_at=?,last_result_at=? WHERE id='check-1'").run(tick - 300_000, tick - 300_000, tick - 300_000)
+  globalThis.fetch = async () => new Response(null, { status: 503 })
+  const realNow = Date.now
+  try {
+    Date.now = () => tick
+    sqlite.prepare("UPDATE http_checks SET interval_minutes=5 WHERE id='check-1'").run()
+    // This observation is older than three minutes but still inside the five-minute check interval.
+    sqlite.prepare("UPDATE http_checks SET last_scheduled_at=?,last_effective_scheduled_at=?,last_result_at=? WHERE id='check-1'").run(tick - 240_000, tick - 240_000, tick - 1_000_000)
+    await runChecks(tick, env as never)
+    assert.equal(sqlite.prepare("SELECT dependency_affected FROM http_checks WHERE id='check-0'").get()?.dependency_affected, 0)
+    sqlite.prepare("UPDATE http_checks SET enabled=0 WHERE id='check-1'").run()
+    Date.now = () => tick + 60_000
+    await runChecks(tick + 60_000, env as never)
+    assert.equal(sqlite.prepare("SELECT dependency_affected FROM http_checks WHERE id='check-0'").get()?.dependency_affected, 0)
+  } finally { Date.now = realNow; sqlite.close() }
 })

@@ -19,11 +19,11 @@ export function enqueueTransition(db: D1Database, checkId: string, version: numb
   return db.prepare(`INSERT OR IGNORE INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,created_at,updated_at,transition_generation,observed_at)
     SELECT ? || ':' || c.id,c.id,c.version,h.id,h.config_version,?,?,?,?,COALESCE(ns.generation,0) + CASE WHEN ns.check_id IS NULL THEN 0 ELSE 1 END,? FROM notification_channels c
     JOIN notification_channel_checks cc ON cc.channel_id=c.id JOIN http_checks h ON h.id=cc.check_id
-    LEFT JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version
-    WHERE c.enabled=1 AND h.id=? AND h.enabled=1 AND h.config_version=? AND ((ns.check_id IS NOT NULL AND ns.status<>?) OR (ns.check_id IS NULL AND ? IN ('down','degraded') AND NOT EXISTS (SELECT 1 FROM automation_transition_state existing WHERE existing.check_id=h.id))) AND ${outsideMaintenance}
+    LEFT JOIN notification_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version
+    WHERE c.enabled=1 AND h.id=? AND h.enabled=1 AND h.config_version=? AND ((ns.check_id IS NOT NULL AND ns.status<>?) OR (ns.check_id IS NULL AND ? IN ('down','degraded') AND NOT EXISTS (SELECT 1 FROM notification_transition_state existing WHERE existing.check_id=h.id))) AND ${outsideMaintenance}
       AND (h.last_scheduled_at IS NULL OR h.last_scheduled_at<?)
       AND EXISTS (SELECT 1 FROM endpoint_registry WHERE endpoint_id=h.endpoint_id AND fingerprint=?)
-      AND EXISTS (SELECT 1 FROM http_check_results WHERE check_id=h.id AND config_version=h.config_version AND scheduled_at=? AND COALESCE(effective_status,status)=?)`)
+      AND EXISTS (SELECT 1 FROM http_check_results WHERE check_id=h.id AND config_version=h.config_version AND scheduled_at=? AND COALESCE(effective_status,status)=? AND dependency_affected=0)`)
     .bind(crypto.randomUUID(),scheduledAt,status,now,now,observedAt,checkId,version,status,status,observedAt,observedAt,scheduledAt,fingerprint,scheduledAt,status)
 }
 
@@ -48,13 +48,13 @@ export async function sendChannel(env: ChannelEnvironment, channelId: string, ve
       if (!event.status || !Number.isSafeInteger(event.scheduledAt) || !event.deliveryId || !event.leaseToken) return 'unavailable'
       const monitor = await env.DB.prepare(`SELECT c.name FROM notification_outbox o JOIN http_checks h ON h.id=o.check_id
         JOIN components c ON c.id=h.component_id JOIN notification_channel_checks cc ON cc.check_id=h.id AND cc.channel_id=o.channel_id
-        JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version AND ns.generation=o.transition_generation
+        JOIN notification_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version AND ns.generation=o.transition_generation
         WHERE o.id=? AND o.channel_id=? AND o.state='sending' AND o.lease_token=? AND h.enabled=1 AND h.config_version=? AND h.transition_suppressed=0 AND ${maintenanceBarrier}`)
         .bind(event.deliveryId,channelId,event.leaseToken,event.checkVersion,Date.now(),Date.now()).first<{name:string}>()
       if (!monitor) return 'deferred'
       return sendApprovedEmail(env,channel.recipient_id,channel.email_fingerprint,{monitorName:monitor.name,status:event.status,scheduledAt:event.scheduledAt!},async () => {
         const checkedAt = Date.now()
-        const lease = await env.DB.prepare(`SELECT o.created_at AS createdAt,o.lease_until AS leaseUntil,${overlappedMaintenance} AS maintenanceExempt,${nextMaintenanceStart} AS nextMaintenance FROM notification_outbox o JOIN http_checks h ON h.id=o.check_id JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version AND ns.generation=o.transition_generation JOIN notification_channels c ON c.id=o.channel_id JOIN notification_channel_checks cc ON cc.channel_id=c.id AND cc.check_id=h.id WHERE o.id=? AND o.state='sending' AND o.lease_token=? AND c.id=? AND c.enabled=1 AND c.version=? AND h.enabled=1 AND h.config_version=? AND h.transition_suppressed=0 AND ${maintenanceBarrier}`)
+        const lease = await env.DB.prepare(`SELECT o.created_at AS createdAt,o.lease_until AS leaseUntil,${overlappedMaintenance} AS maintenanceExempt,${nextMaintenanceStart} AS nextMaintenance FROM notification_outbox o JOIN http_checks h ON h.id=o.check_id JOIN notification_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version AND ns.generation=o.transition_generation JOIN notification_channels c ON c.id=o.channel_id JOIN notification_channel_checks cc ON cc.channel_id=c.id AND cc.check_id=h.id WHERE o.id=? AND o.state='sending' AND o.lease_token=? AND c.id=? AND c.enabled=1 AND c.version=? AND h.enabled=1 AND h.config_version=? AND h.transition_suppressed=0 AND ${maintenanceBarrier}`)
           .bind(checkedAt,checkedAt,event.deliveryId,event.leaseToken,channelId,version,event.checkVersion,checkedAt,checkedAt).first<{createdAt:number;leaseUntil:number;maintenanceExempt:number;nextMaintenance:number|null}>()
         const readyAt = Date.now()
         // Email sends have no timeout or idempotency key. An expired claim is failed,
@@ -73,7 +73,7 @@ export async function sendChannel(env: ChannelEnvironment, channelId: string, ve
     if (event.deliveryId) {
       const checkedAt=Date.now()
       const lease=await env.DB.prepare(`SELECT o.created_at AS createdAt,o.lease_until AS leaseUntil,${overlappedMaintenance} AS maintenanceExempt,${nextMaintenanceStart} AS nextMaintenance FROM notification_outbox o JOIN http_checks h ON h.id=o.check_id
-      JOIN automation_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version AND ns.generation=o.transition_generation
+      JOIN notification_transition_state ns ON ns.check_id=h.id AND ns.check_version=h.config_version AND ns.generation=o.transition_generation
       JOIN notification_channels c ON c.id=o.channel_id JOIN notification_channel_checks cc ON cc.channel_id=c.id AND cc.check_id=h.id
       JOIN vault_secrets v ON v.id=c.secret_id AND v.vault_id=c.vault_id AND v.type='value'
       WHERE o.id=? AND o.state='sending' AND o.lease_token=? AND c.id=? AND c.version=? AND c.enabled=1
@@ -106,7 +106,7 @@ export async function flushChannelDeliveries(env: ChannelEnvironment): Promise<v
     // Supersede older transitions, including down→up→down cycles.
     await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='unavailable',updated_at=?
       WHERE o.state='pending' AND EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND h.transition_suppressed=0 AND ${maintenanceBarrier}
-        AND NOT EXISTS (SELECT 1 FROM automation_transition_state ns WHERE ns.check_id=h.id AND ns.check_version=o.check_version AND ns.generation=o.transition_generation))`)
+        AND NOT EXISTS (SELECT 1 FROM notification_transition_state ns WHERE ns.check_id=h.id AND ns.check_version=o.check_version AND ns.generation=o.transition_generation))`)
       .bind(now,now,now).run()
     // Do not repeat the last acknowledged status; defer the decision while an earlier send is in flight.
     await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='unavailable',updated_at=? WHERE o.state='pending'
