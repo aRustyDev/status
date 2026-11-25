@@ -293,8 +293,24 @@ async function listComponents(db: D1Database, incidents: Json[], maintenance: Js
       if (severity[impact] > severity[state]) state = impact
     }
     const underMaintenance = maintenance.some(window => window.state === 'active' && (!(window.componentIds as string[]).length || (window.componentIds as string[]).includes(String(row.id))))
-    return { id: row.id, name: row.name, position: row.position, manualStatus: row.manual_status, status: state, checkStatus, lastCheckedAt: isGatus ? source?.lastCheckedAt ?? null : matches ? row.last_result_at ?? null : null, underMaintenance, version: row.version, ...(isGatus ? { source: 'gatus', group: row.source_group } : {}) }
+    return { id: row.id, name: row.name, position: row.position, manualStatus: row.manual_status, tags: isGatus ? [] : JSON.parse(String(row.tags)), status: state, checkStatus, lastCheckedAt: isGatus ? source?.lastCheckedAt ?? null : matches ? row.last_result_at ?? null : null, underMaintenance, version: row.version, ...(isGatus ? { source: 'gatus', group: row.source_group } : {}) }
   })
+}
+
+function serializeMonitorTags(value: unknown): string {
+  if (!Array.isArray(value) || value.length > 20) return bad('Invalid tags')
+  const labels = new Set<string>()
+  const tags = value.map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return bad('Invalid tag')
+    const tag = item as Json
+    if (typeof tag.label !== 'string' || !tag.label.trim() || tag.label.trim().length > 40 ||
+      typeof tag.color !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(tag.color)) return bad('Invalid tag')
+    const label = tag.label.trim()
+    if (labels.has(label)) return bad('Duplicate tag')
+    labels.add(label)
+    return { label, color: tag.color }
+  })
+  return JSON.stringify(tags)
 }
 
 type Endpoint = { id: string; name?: string }
@@ -637,7 +653,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
         position: component.position,
         intervalSecs: check ? check.interval_minutes * 60 : null,
         config: { url: check ? endpoints.get(check.endpoint_id)?.name ?? '' : '' },
-        tags: [],
+        tags: component.tags,
         group: component.source === 'gatus' ? component.group : null,
         activity: { maintenance: component.underMaintenance, windows: [], incident: null },
         health: {
@@ -680,6 +696,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const manualStatus = choice(body.manualStatus ?? 'operational', 'manualStatus', healthStatuses)
     const position = body.position === undefined ? 0 : timestamp(body.position, 'position')
     const creating = method === 'POST'
+    const tags = body.tags === undefined ? (creating ? '[]' : null) : serializeMonitorTags(body.tags)
     const componentId = creating ? id() : uuidId('component', route.split('/').at(-1))
     if (!creating && await stmt(db, 'SELECT component_id FROM gatus_sources WHERE component_id=?', componentId).first()) throw new HttpError(403, 'Gatus-managed component is read-only')
     const componentVersion = creating ? 0 : version(body)
@@ -710,8 +727,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       db.prepare('DELETE FROM mutation_receipts WHERE rowid IN (SELECT rowid FROM mutation_receipts WHERE expires_at<=? LIMIT 100)').bind(Date.now()),
       receiptClaim(db, receipt, token),
     ]
-    if (creating) operations.push(stmt(db, 'INSERT INTO components (id,name,position,manual_status,updated_at,mutation_key) VALUES (?,?,?,?,?,?)', componentId, name, position, manualStatus, Date.now(), token))
-    else operations.push(stmt(db, `UPDATE components SET name=?,manual_status=?,position=?,updated_at=?,version=version+1,mutation_key=? WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=components.id)${checkGuard}`, name, manualStatus, position, Date.now(), token, componentId, componentVersion, ...guardValues))
+    if (creating) operations.push(stmt(db, 'INSERT INTO components (id,name,position,manual_status,updated_at,mutation_key,tags) VALUES (?,?,?,?,?,?,?)', componentId, name, position, manualStatus, Date.now(), token, tags))
+    else operations.push(stmt(db, `UPDATE components SET name=?,manual_status=?,position=?,updated_at=?,version=version+1,mutation_key=?,tags=COALESCE(?,tags) WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=components.id)${checkGuard}`, name, manualStatus, position, Date.now(), token, tags, componentId, componentVersion, ...guardValues))
     if (checkData && checkData.changed) {
       if (!current) operations.push(stmt(db, `INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,advanced_config) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.id, componentId, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, componentId, token))
       else operations.push(stmt(db, `UPDATE http_checks SET endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,advanced_config=?, config_version=config_version + CASE WHEN advanced_config IS ? THEN 1 ELSE 0 END,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, checkData.advancedConfig, token, current.id, current.config_version, componentId, token))

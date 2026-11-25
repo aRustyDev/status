@@ -32,7 +32,7 @@ export interface CloudflareProfile {
   manualStatus: string
   position: number
   history?: React.ReactNode
-  save: (draft: { name: string; manualStatus: string; position: number; check?: Record<string, unknown> }) => Promise<void>
+  save: (draft: { name: string; manualStatus: string; position: number; tags: MonitorTag[]; check?: Record<string, unknown> }) => Promise<void>
   test: (draft: { endpointId: string; expectedStatus: number; advancedConfig: Record<string, unknown> }) => Promise<TestResult>
 }
 
@@ -297,7 +297,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         const basicUnchanged = previous && endpointId === previous.endpointId && enabled === Boolean(previous.enabled) && intervalSecs === previous.intervalMinutes * 60 && Number(config['expectedStatus'] ?? 200) === previous.expectedStatus
         if (previous?.advancedConfigInvalid && !(basicUnchanged && advancedUnchanged)) throw new Error('Check settings are invalid. Contact an administrator to review the configuration.')
         const check = cloudflare.isAdmin && endpointId && !(basicUnchanged && advancedUnchanged) ? { ...(previous ? { id: previous.id, version: previous.version } : {}), endpointId, enabled, intervalMinutes: intervalSecs / 60, expectedStatus: Number(config['expectedStatus'] ?? 200), advancedConfig: previous && advancedUnchanged ? previous.advancedConfig ?? null : advanced } : undefined
-        await cloudflare.save({ name, manualStatus, position, ...(check ? { check } : {}) })
+        await cloudflare.save({ name, manualStatus, position, tags, ...(check ? { check } : {}) })
         onSaved()
       } catch (err) { setError(err instanceof Error ? err.message : 'Save failed') } finally { setLoading(false) }
       return
@@ -472,8 +472,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
       </div>{/* inner scrollable column */}
 
       {/* ── Side panel ─────────────────────────────────────────────────── */}
-      {sidePanel && (
-        <SidePanelFrame meta={PANEL_META[sidePanel]} layout="responsive" className={cloudflare?.statusUnavailable ? 'hidden' : undefined}>
+      <SidePanelFrame meta={PANEL_META[sidePanel ?? 'tags']} layout="responsive" className={!sidePanel || cloudflare?.statusUnavailable ? 'hidden' : undefined}>
           {sidePanel === 'request' && <RequestSection config={config} updateConfig={updateConfig} />}
           {sidePanel === 'checks' && (
             <>
@@ -492,7 +491,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
           )}
           {sidePanel === 'credentials' && <CredentialsSection config={config} updateConfig={updateConfig} vaultPicker={vaultPicker} userKey={isDatabaseType(type) ? 'user' : 'username'} />}
           {sidePanel === 'auth' && <AuthSection auth={auth} onChange={(next) => updateConfig('auth', next)} vaultPicker={vaultPicker} />}
-          {sidePanel === 'tags' && <TagsSection tags={tags} allTags={allTags} onChange={setTags} />}
+          <div className={sidePanel === 'tags' ? undefined : 'hidden'}><TagsSection tags={tags} allTags={allTags} onChange={setTags} limits={cloudflare ? { count: 20, labelLength: 40 } : undefined} /></div>
           {sidePanel === 'channels' && <ChannelsSection channels={channels} selected={selectedChannelIds} onChange={setSelectedChannelIds} />}
           {sidePanel === 'actions' && availableActions !== null && actionLinks !== null && (
             <ActionsSection actions={availableActions} links={actionLinks} onChange={setActionLinks} />
@@ -510,12 +509,11 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
           {sidePanel === 'latency' && (
             <LatencyAlertSection values={latencyAlert} onChange={(p) => setLatencyAlert((prev) => ({ ...prev, ...p }))} baselineMs={monitor?.latencyBaselineP95 ?? null} />
           )}
-        </SidePanelFrame>
-      )}
+      </SidePanelFrame>
 
       {/* ── Vertical tab strip ──────────────────────────────────────────── */}
       {cloudflare
-        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} checkCount={checkCount} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
+        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} checkCount={checkCount} tagCount={tags.length} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
         : <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" />}
 
       </div>{/* outer flex row */}

@@ -7,6 +7,7 @@ The project follows [Semantic Versioning](https://semver.org/); while it is belo
 
 ### Added
 
+- **Cloudflare monitor tags**: add coloured labels in the monitor editor, reuse existing labels, and filter the admin monitor list by tag. [Cloudflare deployment](cloudflare-deployment.md).
 - **Cloudflare monitor status ranges**: configure accepted HTTP status ranges in the monitor Checks panel. [Cloudflare deployment](cloudflare-deployment.md).
 - **Monitor groups**: a monitor can be put in a **group** (a name of up to 60 characters, set in the monitor form, in the API as `group`, in configuration files and through MCP). The Monitors page lists the monitors in collapsible sections, one per group, with the ungrouped ones last. See [Monitors](monitors.md#groups). ([#165](https://github.com/BElluu/BetterStatusPage/issues/165))
 

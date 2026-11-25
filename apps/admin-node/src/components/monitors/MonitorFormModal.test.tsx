@@ -640,6 +640,14 @@ describe('MonitorFormModal', () => {
     ])
   })
 
+  it('does not impose Cloudflare label limits on the Node profile', async () => {
+    const user = userEvent.setup()
+    renderModal()
+    await user.click(screen.getByTitle('Tags'))
+    await user.type(screen.getByLabelText('Tag label'), `${'x'.repeat(41)}{Enter}`)
+    expect(screen.getByRole('button', { name: `Remove tag ${'x'.repeat(41)}` })).toBeInTheDocument()
+  })
+
   it('pre-fills an existing monitor and saves it with PATCH', async () => {
     const user = userEvent.setup()
     mockGets({
