@@ -97,7 +97,15 @@ export async function flushActions(env:ActionEnvironment):Promise<void> {
     const claim=await env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='executing',claimed_at=?,updated_at=? WHERE o.id=? AND o.state='pending'
       AND (o.created_at>=? OR EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance}))`).bind(claimedAt,claimedAt,job.id,claimedAt-3_600_000,claimedAt).run()
     if(!claim.meta.changes) continue
-    const result=await executeAction(env,job,claimedAt)
+    let result=await executeAction(env,job,claimedAt)
+    if(result==='unavailable') {
+      // A cosmetic rename can carry this exact claim to a new action version.
+      // Only a pre-send unavailable result may be safely returned to pending.
+      const renamed=await env.DB.prepare(`SELECT 1 FROM worker_action_outbox o JOIN worker_actions a ON a.id=o.action_id
+        WHERE o.id=? AND o.state='executing' AND o.claimed_at=? AND o.action_version<>? AND a.version=o.action_version`)
+        .bind(job.id,claimedAt,job.action_version).first()
+      if(renamed) result='deferred'
+    }
     await env.DB.prepare("UPDATE worker_action_outbox SET state=?,claimed_at=CASE WHEN ?='deferred' THEN NULL ELSE claimed_at END,updated_at=? WHERE id=? AND state='executing' AND claimed_at=?").bind(result==='deferred'?'pending':result,result,Date.now(),job.id,claimedAt).run()
   }
 }

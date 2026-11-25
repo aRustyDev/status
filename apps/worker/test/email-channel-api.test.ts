@@ -196,7 +196,7 @@ test('channel saves reject a check moved after its catalog snapshot', async () =
   assert.equal((local.db.prepare('SELECT COUNT(*) AS n FROM monitor_notification_channels WHERE channel_id=?').get(channel.id) as {n:number}).n,0)
 })
 
-test('a rename preserves history only while monitor associations are unchanged', async () => {
+test('a rename preserves retained history while cancelling removed monitor deliveries', async () => {
   const {local,env}=setup()
   const snapshots=[{id:checkA,componentId:'component-a',version:1},{id:checkB,componentId:'component-b',version:1}]
   const payload={name:'Original name',type:'email',recipientId:'ops',enabled:true,checkIds:[checkA,checkB],expectedChecks:snapshots}
@@ -218,11 +218,11 @@ test('a rename preserves history only while monitor associations are unchanged',
   const edited=await channelApi(request('PATCH',{...payload,name:'Renamed again',checkIds:[checkA],expectedChecks:[snapshots[0]],version:afterRename.version,expectedCheckIds:[checkA,checkB],expectedAssociationVersion:afterRename.associationVersion}),env,actor,`/admin/notifications/channels/${channel.id}`)
   const after=await edited.json() as {version:number;associationVersion:number}
   assert.equal(after.version,afterRename.version+1)
-  assert.deepEqual(local.db.prepare('SELECT check_id,channel_version FROM notification_delivery_state WHERE channel_id=?').all(channel.id).map(row=>({...row})),[{check_id:checkA,channel_version:afterRename.version}])
+  assert.deepEqual(local.db.prepare('SELECT check_id,channel_version FROM notification_delivery_state WHERE channel_id=?').all(channel.id).map(row=>({...row})),[{check_id:checkA,channel_version:after.version}])
   const jobs=local.db.prepare('SELECT id,state,channel_version,lease_token FROM notification_outbox ORDER BY id').all().map(row=>({...row}))
   assert.deepEqual(jobs,[
-    {id:'keep-pending',state:'pending',channel_version:afterRename.version,lease_token:null},
-    {id:'keep-sending',state:'sending',channel_version:afterRename.version,lease_token:'active'},
+    {id:'keep-pending',state:'pending',channel_version:after.version,lease_token:null},
+    {id:'keep-sending',state:'sending',channel_version:after.version,lease_token:'active'},
     {id:'older',state:'pending',channel_version:0,lease_token:null},
     {id:'removed',state:'failed',channel_version:afterRename.version,lease_token:null},
     {id:'sent',state:'sent',channel_version:channel.version,lease_token:null},
@@ -230,11 +230,11 @@ test('a rename preserves history only while monitor associations are unchanged',
   const changedEnv={...env,EMAIL_DESTINATIONS:JSON.stringify([{id:'ops',name:'Operations',address:'ops@example.test'},{id:'backup',name:'Backup',address:'backup@example.test'}])}
   const changed=await channelApi(request('PATCH',{...payload,name:'Renamed again',recipientId:'backup',checkIds:[checkA],expectedChecks:[snapshots[0]],version:after.version,expectedCheckIds:[checkA],expectedAssociationVersion:after.associationVersion}),changedEnv,actor,`/admin/notifications/channels/${channel.id}`)
   assert.equal((await changed.json() as {version:number}).version,after.version+1)
-  assert.equal((local.db.prepare('SELECT channel_version FROM notification_outbox WHERE id=?').get('keep-pending') as {channel_version:number}).channel_version,afterRename.version)
-  assert.equal((local.db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkA) as {channel_version:number}).channel_version,afterRename.version)
+  assert.equal((local.db.prepare('SELECT channel_version FROM notification_outbox WHERE id=?').get('keep-pending') as {channel_version:number}).channel_version,after.version)
+  assert.equal((local.db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkA) as {channel_version:number}).channel_version,after.version)
 })
 
-test('a rename combined with a new monitor does not carry prior deliveries', async () => {
+test('a rename with a new monitor carries retained history but creates none for the new monitor', async () => {
   const {local,env}=setup()
   const a={id:checkA,componentId:'component-a',version:1}, b={id:checkB,componentId:'component-b',version:1}
   const payload={name:'Original',type:'email',recipientId:'ops',enabled:true,checkIds:[checkA],expectedChecks:[a]}
@@ -244,6 +244,93 @@ test('a rename combined with a new monitor does not carry prior deliveries', asy
   const response=await channelApi(request('PATCH',{...payload,name:'Renamed',checkIds:[checkA,checkB],expectedChecks:[a,b],version:channel.version,expectedCheckIds:[checkA],expectedAssociationVersion:channel.associationVersion}),env,actor,`/admin/notifications/channels/${channel.id}`)
   const edited=await response.json() as {version:number}
   assert.equal(edited.version,channel.version+1)
-  assert.equal((local.db.prepare("SELECT channel_version FROM notification_outbox WHERE id='pending'").get() as {channel_version:number}).channel_version,channel.version)
-  assert.equal((local.db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkA) as {channel_version:number}).channel_version,channel.version)
+  assert.equal((local.db.prepare("SELECT channel_version FROM notification_outbox WHERE id='pending'").get() as {channel_version:number}).channel_version,edited.version)
+  assert.equal((local.db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkA) as {channel_version:number}).channel_version,edited.version)
+  assert.equal(local.db.prepare('SELECT 1 FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkB),undefined)
+})
+
+test('concurrent stale channel edits cannot retarget or revive an unlinked monitor', async () => {
+  const {local,env}=setup()
+  const a={id:checkA,componentId:'component-a',version:1}, b={id:checkB,componentId:'component-b',version:1}
+  const payload={name:'Original',type:'email',recipientId:'ops',enabled:true,checkIds:[checkA],expectedChecks:[a]}
+  const channel=await (await channelApi(request('POST',payload),env,actor,'/admin/notifications/channels')).json() as {id:string;version:number;associationVersion:number}
+  local.db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,state,lease_token,lease_until,created_at,updated_at) VALUES ('claimed',?,?,?,1,100,'down','sending','lease',9999999999999,100,100)").run(channel.id,channel.version,checkA)
+  local.db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,?,'down')").run(channel.id,checkA,channel.version)
+  const baseline={...payload,version:channel.version,expectedCheckIds:[checkA],expectedAssociationVersion:channel.associationVersion}
+  const edits=await Promise.allSettled([
+    channelApi(request('PATCH',{...baseline,name:'Add',checkIds:[checkA,checkB],expectedChecks:[a,b]}),env,actor,`/admin/notifications/channels/${channel.id}`),
+    channelApi(request('PATCH',{...baseline,name:'Remove',checkIds:[],expectedChecks:[]}),env,actor,`/admin/notifications/channels/${channel.id}`),
+  ])
+  const accepted=edits.filter(result=>result.status==='fulfilled')
+  const rejected=edits.filter(result=>result.status==='rejected') as PromiseRejectedResult[]
+  assert.equal(accepted.length,1)
+  assert.equal(rejected.length,1)
+  assert.ok(rejected[0].reason instanceof ChannelError && rejected[0].reason.status===409)
+  const current=local.db.prepare('SELECT name,version FROM notification_channels WHERE id=?').get(channel.id) as {name:string;version:number}
+  const job=local.db.prepare("SELECT state,channel_version,lease_token FROM notification_outbox WHERE id='claimed'").get() as {state:string;channel_version:number;lease_token:string|null}
+  const acknowledged=local.db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkA) as {channel_version:number}|undefined
+  if (current.name==='Add') {
+    assert.deepEqual({...job},{state:'sending',channel_version:current.version,lease_token:'lease'})
+    assert.equal(acknowledged?.channel_version,current.version)
+    assert.equal(local.db.prepare('SELECT 1 FROM notification_delivery_state WHERE channel_id=? AND check_id=?').get(channel.id,checkB),undefined)
+  } else {
+    assert.equal(current.name,'Remove')
+    assert.deepEqual({...job},{state:'failed',channel_version:channel.version,lease_token:null})
+    assert.equal(acknowledged,undefined)
+  }
+})
+
+test('Workerd D1 serializes concurrent rename and association edits', {skip:!process.env['USE_WORKERS_D1']}, async () => {
+  const {Miniflare,convertV4MiniflareOptions}=await import('miniflare')
+  const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response()}}',d1Databases:['DB']}))
+  try {
+    const db=await mf.getD1Database('DB') as unknown as D1Database
+    for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0010_monitor_alert_links.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0014_monitor_alert_channel_limit.sql']) {
+      const sql=readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8').replace(/^\s*--[^\n]*$/gm,'')
+      const parts=sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
+      const statements=parts.shift()!.split(';').map(value=>value.trim()).filter(Boolean)
+      for(const part of parts) if(part.trim()) statements.push(part.trim())
+      for(const statement of statements) await db.prepare(statement).run()
+    }
+    await db.batch([
+      db.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')"),
+      db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component-a','A',0),('component-b','B',0)"),
+      db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status) VALUES (?,'component-a','check',0,1,200)").bind(checkA),
+      db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status) VALUES (?,'component-b','check',0,1,200)").bind(checkB),
+    ])
+    const env={DB:db,CHANNELS_READY:'true',EMAIL_READY:'true',EMAIL_FROM:'sender@example.test',EMAIL_DESTINATIONS:JSON.stringify([{id:'ops',name:'Operations',address:'ops@example.test'}]),EMAIL:{send:async()=>({messageId:'test'})}} as unknown as ChannelEnvironment
+    const a={id:checkA,componentId:'component-a',version:1},b={id:checkB,componentId:'component-b',version:1}
+    const payload={name:'Original',type:'email',recipientId:'ops',enabled:true,checkIds:[checkA],expectedChecks:[a]}
+    const channel=await (await channelApi(request('POST',payload),env,actor,'/admin/notifications/channels')).json() as {id:string;version:number;associationVersion:number}
+    await db.batch([
+      db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,state,lease_token,lease_until,created_at,updated_at) VALUES ('claimed',?,?,?,1,100,'down','sending','lease',9999999999999,100,100)").bind(channel.id,channel.version,checkA),
+      db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,?,'down')").bind(channel.id,checkA,channel.version),
+    ])
+    const baseline={...payload,version:channel.version,expectedCheckIds:[checkA],expectedAssociationVersion:channel.associationVersion}
+    const results=await Promise.allSettled([
+      channelApi(request('PATCH',{...baseline,name:'Add',checkIds:[checkA,checkB],expectedChecks:[a,b]}),env,actor,`/admin/notifications/channels/${channel.id}`),
+      channelApi(request('PATCH',{...baseline,name:'Remove',checkIds:[],expectedChecks:[]}),env,actor,`/admin/notifications/channels/${channel.id}`),
+    ])
+    const accepted=results.filter(item=>item.status==='fulfilled'), rejected=results.filter(item=>item.status==='rejected') as PromiseRejectedResult[]
+    assert.equal(accepted.length,1);assert.equal(rejected.length,1);assert.ok(rejected[0].reason instanceof ChannelError && rejected[0].reason.status===409)
+    const current=await db.prepare('SELECT name,version FROM notification_channels WHERE id=?').bind(channel.id).first<{name:string;version:number}>()
+    const job=await db.prepare("SELECT state,channel_version,lease_token FROM notification_outbox WHERE id='claimed'").first<{state:string;channel_version:number;lease_token:string|null}>()
+    const acknowledged=await db.prepare('SELECT channel_version FROM notification_delivery_state WHERE channel_id=? AND check_id=?').bind(channel.id,checkA).first<{channel_version:number}>()
+    if(current?.name==='Add') {
+      assert.deepEqual(job,{state:'sending',channel_version:current.version,lease_token:'lease'});assert.equal(acknowledged?.channel_version,current.version)
+      assert.equal(await db.prepare('SELECT 1 FROM notification_delivery_state WHERE channel_id=? AND check_id=?').bind(channel.id,checkB).first(),null)
+    } else {
+      assert.equal(current?.name,'Remove');assert.deepEqual(job,{state:'failed',channel_version:channel.version,lease_token:null});assert.equal(acknowledged,null)
+    }
+    const monitorChannel=await (await channelApi(request('POST',{...payload,name:'Monitor side'}),env,actor,'/admin/notifications/channels')).json() as {id:string;version:number}
+    await db.batch([
+      db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,state,lease_token,lease_until,created_at,updated_at) VALUES ('monitor-side',?,?,?,1,100,'down','sending','lease',9999999999999,100,100)").bind(monitorChannel.id,monitorChannel.version,checkA),
+      db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,?,'down')").bind(monitorChannel.id,checkA,monitorChannel.version),
+      db.prepare('DELETE FROM monitor_notification_channels WHERE component_id=? AND channel_id=?').bind('component-a',monitorChannel.id),
+      db.prepare('INSERT INTO monitor_notification_channels (component_id,channel_id) VALUES (?,?)').bind('component-a',monitorChannel.id),
+    ])
+    const unlinked=await db.prepare("SELECT state,lease_token FROM notification_outbox WHERE id='monitor-side'").first<{state:string;lease_token:string|null}>()
+    assert.deepEqual(unlinked,{state:'failed',lease_token:null})
+    assert.equal(await db.prepare('SELECT 1 FROM notification_delivery_state WHERE channel_id=? AND check_id=?').bind(monitorChannel.id,checkA).first(),null)
+  } finally { await mf.dispose() }
 })

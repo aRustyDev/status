@@ -548,3 +548,124 @@ test('a maintenance window or credential fault beginning during validation defer
   assert.deepEqual({...x.local.db.prepare('SELECT state,attempts,error_code FROM notification_outbox').get()},{state:'pending',attempts:0,error_code:null},reason)
  }
 })
+
+test('channel no-op and rename preserve pending delivery and acknowledged history',async()=>{
+  const x=await setup();await queueTimingEvent(x)
+  x.local.db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,1,'up')").run(x.channel.id,checkId)
+  const noop=await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  assert.equal((await noop.json() as {version:number}).version,1)
+  const renamed=await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Renamed',version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  assert.equal((await renamed.json() as {version:number}).version,2)
+  assert.deepEqual({...x.local.db.prepare('SELECT state,channel_version FROM notification_outbox').get()},{state:'pending',channel_version:2})
+  assert.equal(x.local.db.prepare('SELECT channel_version FROM notification_delivery_state').get()?.channel_version,2)
+  await flushChannelDeliveries(x.env)
+  assert.equal(x.calls.length,1)
+  assert.equal(x.local.db.prepare('SELECT state FROM notification_outbox').get()?.state,'sent')
+})
+
+test('channel create and update reject a monitor moved or changed before the transaction',async()=>{
+  for (const method of ['POST','PATCH'] as const) for (const change of ['component','version'] as const) {
+    const x=await setup()
+    x.local.db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('other','Other monitor',0)").run()
+    const choices=await (await channelApi(request('GET'),x.env,actor,'/admin/notifications/checks')).json() as {id:string;componentId:string;version:number}[]
+    assert.deepEqual(choices.map(({id,componentId,version})=>({id,componentId,version})),x.channelBody.expectedChecks)
+    let changed=false
+    const db={prepare:(sql:string)=>x.db.prepare(sql),async batch(statements: D1PreparedStatement[]) {
+      if (!changed) {
+        changed=true
+        if (change==='component') x.local.db.prepare('UPDATE http_checks SET component_id=? WHERE id=?').run('other',checkId)
+        else x.local.db.prepare('UPDATE http_checks SET config_version=config_version+1 WHERE id=?').run(checkId)
+      }
+      return x.db.batch(statements)
+    }} as D1Database
+    const input=method==='POST' ? {...x.channelBody,name:'Second'} : {...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Changed',version:1}
+    const route=method==='POST' ? '/admin/notifications/channels' : `/admin/notifications/channels/${x.channel.id}`
+    const audits=x.local.db.prepare('SELECT COUNT(*) AS n FROM audit_events').get()?.n
+    await assert.rejects(channelApi(request(method,input),{...x.env,DB:db},actor,route),(e:unknown)=>e instanceof ChannelError && e.status===409)
+    assert.equal(changed,true)
+    assert.equal(x.local.db.prepare('SELECT name FROM notification_channels WHERE id=?').get(x.channel.id)?.name,'Fixture')
+    assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_channel_checks WHERE channel_id=?').get(x.channel.id)?.n,change==='component'?0:1)
+    assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM audit_events').get()?.n,audits)
+  }
+})
+
+test('an old channel editor must refresh; malformed monitor snapshots remain invalid',async()=>{
+  const x=await setup(), legacy:Record<string,unknown>={...x.channelBody}
+  delete legacy.expectedChecks
+  for (const method of ['POST','PATCH'] as const) {
+    const route=method==='POST' ? '/admin/notifications/channels' : `/admin/notifications/channels/${x.channel.id}`
+    const input=method==='POST' ? {...legacy,name:'Second'} : {...legacy,version:1}
+    await assert.rejects(channelApi(request(method,input),x.env,actor,route),(e:unknown)=>e instanceof ChannelError && e.status===409 && /refresh/i.test(e.message))
+    await assert.rejects(channelApi(request(method,{...input,expectedChecks:null}),x.env,actor,route),(e:unknown)=>e instanceof ChannelError && e.status===400)
+  }
+  assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_channels').get()?.n,1)
+  assert.equal(x.local.db.prepare('SELECT version FROM notification_channels WHERE id=?').get(x.channel.id)?.version,1)
+})
+
+test('removing a monitor still invokes integrated unlink cancellation',async()=>{
+  const x=await setup();await queueTimingEvent(x)
+  x.local.db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,1,'down')").run(x.channel.id,checkId)
+  await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,checkIds:[],expectedChecks:[],version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  assert.equal(x.local.db.prepare('SELECT state FROM notification_outbox').get()?.state,'failed')
+  assert.equal(x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_delivery_state').get()?.n,0)
+  await flushChannelDeliveries(x.env)
+  assert.equal(x.calls.length,0)
+})
+
+test('functional channel edits do not carry pending work or delivery history',async()=>{
+  const x=await setup();await queueTimingEvent(x)
+  x.local.db.prepare("INSERT INTO notification_delivery_state (channel_id,check_id,check_version,channel_version,status) VALUES (?,?,1,1,'down')").run(x.channel.id,checkId)
+  const response=await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,enabled:false,version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  assert.equal((await response.json() as {version:number}).version,2)
+  assert.equal(x.local.db.prepare('SELECT channel_version FROM notification_outbox').get()?.channel_version,1)
+  assert.equal(x.local.db.prepare('SELECT channel_version FROM notification_delivery_state').get()?.channel_version,1)
+  await flushChannelDeliveries(x.env)
+  assert.equal(x.calls.length,0)
+})
+
+test('concurrent channel rename and functional edits have one version winner',async()=>{
+  const x=await setup();await queueTimingEvent(x)
+  const path=`/admin/notifications/channels/${x.channel.id}`
+  const results=await Promise.allSettled([
+    channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Renamed',version:1}),x.env,actor,path),
+    channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,enabled:false,version:1}),x.env,actor,path),
+  ])
+  assert.equal(results.filter(result=>result.status==='fulfilled').length,1)
+  const failure=results.find(result=>result.status==='rejected') as PromiseRejectedResult
+  assert.ok(failure.reason instanceof ChannelError && failure.reason.status===409)
+  const row=x.local.db.prepare('SELECT name,enabled,version FROM notification_channels').get() as {name:string;enabled:number;version:number}
+  assert.equal(row.version,2)
+  assert.equal(x.local.db.prepare('SELECT channel_version FROM notification_outbox').get()?.channel_version,row.name==='Renamed'?2:1)
+})
+
+test('channel rename does not retry an in-flight send and retains its acknowledgement',async()=>{
+  const x=await setup();await queueTimingEvent(x)
+  let start!:()=>void, release!:()=>void
+  const started=new Promise<void>(resolve=>{start=resolve}), blocked=new Promise<void>(resolve=>{release=resolve})
+  const env={...x.env,OUTBOUND:{fetch:async()=>{start();await blocked;return new Response(null,{status:200})}}}
+  const flushing=flushChannelDeliveries(env);await started
+  await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Renamed',version:1}),env,actor,`/admin/notifications/channels/${x.channel.id}`)
+  assert.deepEqual({...x.local.db.prepare('SELECT state,channel_version FROM notification_outbox').get()},{state:'sending',channel_version:2})
+  release();await flushing
+  assert.equal(x.local.db.prepare('SELECT state FROM notification_outbox').get()?.state,'sent')
+  assert.equal(x.local.db.prepare('SELECT channel_version FROM notification_delivery_state').get()?.channel_version,2)
+})
+
+test('channel rename during claimed pre-send validation defers rather than discarding',async()=>{
+  const x=await setup();await queueTimingEvent(x)
+  let renamed=false
+  const db={...x.db,prepare(sql:string){
+    const statement=x.db.prepare(sql)
+    if(renamed || !sql.includes('SELECT 1 AS present FROM notification_channels WHERE')) return statement
+    return {bind(...values:unknown[]){statement.bind(...values);return this},async first(){
+      renamed=true
+      await channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Renamed',version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+      return statement.first()
+    }} as D1PreparedStatement
+  }} as D1Database
+  await flushChannelDeliveries({...x.env,DB:db})
+  assert.deepEqual({...x.local.db.prepare('SELECT state,channel_version FROM notification_outbox').get()},{state:'pending',channel_version:2})
+  assert.equal(x.calls.length,0)
+  await flushChannelDeliveries(x.env)
+  assert.equal(x.calls.length,1)
+})

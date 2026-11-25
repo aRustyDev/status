@@ -150,6 +150,14 @@ export async function flushChannelDeliveries(env: ChannelEnvironment): Promise<v
     // Keep the claim, channel version, and association fences: an unlink or reconfigure
     // must never be revived by this readiness check.
     if (result === 'unavailable') {
+      // A cosmetic rename carries the same claim to the new channel version.
+      // Retry only when no request was sent and this exact lease still owns it.
+      const renamed = await env.DB.prepare(`SELECT 1 FROM notification_outbox o JOIN notification_channels c ON c.id=o.channel_id
+        WHERE o.id=? AND o.state='sending' AND o.lease_token=? AND o.channel_version<>? AND c.version=o.channel_version`)
+        .bind(job.id,lease,job.channel_version).first()
+      if (renamed) result = 'deferred'
+    }
+    if (result === 'unavailable') {
       const blockedAt = Date.now()
       const blocked = await env.DB.prepare(`SELECT 1 FROM notification_outbox o
         JOIN http_checks h ON h.id=o.check_id
