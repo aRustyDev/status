@@ -1,6 +1,6 @@
 # Temporary npm attestation recovery
 
-The npm registry's attestation endpoints for `@better-forge/contracts@0.2.0`,
+The npm registry's attestation endpoints for `@better-forge/audit@0.2.0`, `@better-forge/contracts@0.2.0`,
 `@better-forge/db@0.2.0`, and `@better-forge/ui@0.4.0` currently respond with
 HTTP 200 and `OK\r\n` instead of their advertised attestation JSON. This breaks
 `npm audit signatures`. Remove this workaround when the registry returns the
@@ -14,12 +14,12 @@ corresponding public Rekor entry. The entries can be found by querying
 `https://rekor.sigstore.dev/api/v1/index/retrieve` using the package's SHA-512.
 The bundles have been verified with npm's Sigstore verifier.
 
-The preload supplies the recovered JSON only to pacote's fetch of those three
+The preload supplies the recovered JSON only to pacote's fetch of those four
 exact HTTPS URLs, after a fresh live response exactly matches the broken bytes.
 It requires the lockfile and live registry version, integrity, and advertised
 provenance metadata to match the pinned values and requires exactly one publish
 and one SLSA statement with the expected subject. Other requests and non-200
-responses pass through. Successful responses at the three target URLs are read
+responses pass through. Successful responses at the four target URLs are read
 once (with a 4 MiB limit) and replayed to npm unless they match the sentinel;
 this avoids a deadlock in npm's cloned response streams. Oversized responses
 fail closed. npm's normal audit still verifies the registry signatures,

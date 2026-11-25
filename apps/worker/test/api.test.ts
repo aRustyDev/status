@@ -6,6 +6,7 @@ import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 import worker from '../src/index.ts'
 import { getSystemHealthReport } from '../src/system-health.ts'
+import { vaultApi, vaultKeyReady } from '../src/vault.ts'
 import probeWorker from '../../probe/src/index.ts'
 import { endpointFingerprint } from '../src/endpoint-config.ts'
 import { syncGatusCatalog } from '../src/gatus-catalog.ts'
@@ -70,7 +71,7 @@ let db: TestDatabase = sqlite
 let miniflare: Miniflare | undefined
 const issuer = 'https://test.cloudflareaccess.com'
 const audience = 'status-test'
-const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
+const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; CHANNELS_READY?: string; CHANNEL_ENDPOINTS?: string; ACTIONS_READY?: string; ACTION_ENDPOINTS?: string } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
 const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
@@ -96,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -114,6 +115,10 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0007_idempotency.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0008_monitor_tags.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0008_vault.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0009_monitor_auth.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0009_channels.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0009_actions.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -570,6 +575,56 @@ test('check configuration requires an approved endpoint and rejects stale change
   assert.equal((await request(`/api/v1/admin/checks/${created.body.id}`, adminToken, 'PATCH', { ...config, endpointId: 'api', version: 1 })).response.status, 409)
   assert.equal(Number((await db.prepare('SELECT count(*) AS count FROM audit_events').first())?.count), audits)
   assert.equal(Number((await db.prepare('SELECT expected_status FROM http_checks WHERE id=?').bind(created.body.id).first())?.expected_status), 204)
+})
+
+test('moving a check with actions or channels is rejected atomically until they are unlinked', async () => {
+  const previousEndpoints=env.ENDPOINTS
+  const endpoint = { id:'action-move-endpoint', name:'Action move endpoint', url:'https://api.example/action-move' }
+  env.ENDPOINTS=JSON.stringify([endpoint])
+  await db.prepare('INSERT INTO endpoint_registry(endpoint_id,fingerprint) VALUES (?,?)').bind(endpoint.id,await endpointFingerprint(endpoint)).run()
+  const first = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Action move original' })
+  const second = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Action move target' })
+  const config = { componentId:first.body.id, endpointId:endpoint.id, enabled:true, intervalMinutes:1, expectedStatus:200 }
+  const check = await request('/api/v1/admin/checks', adminToken, 'POST', config)
+  assert.equal(check.response.status, 201)
+  const checkId = check.body.id
+  await db.batch([
+    db.prepare("INSERT INTO worker_actions (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,trigger_status,created_at,updated_at) VALUES ('move-action','Move guard action','api','fingerprint',1,1,'all',0,0)"),
+    db.prepare('INSERT INTO worker_action_checks (action_id,check_id) VALUES (?,?)').bind('move-action',checkId),
+    db.prepare("INSERT INTO worker_action_outbox (id,action_id,action_version,check_id,check_version,scheduled_at,status,state,created_at,updated_at) VALUES ('move-job','move-action',1,?,1,100,'down','pending',0,0)").bind(checkId),
+    db.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,created_at,updated_at) VALUES ('move-channel','Move guard channel','api','fingerprint',1,1,0,0)"),
+    db.prepare('INSERT INTO notification_channel_checks (channel_id,check_id) VALUES (?,?)').bind('move-channel',checkId),
+    db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,state,created_at,updated_at) VALUES ('move-notification','move-channel',1,?,1,100,'down','pending',0,0)").bind(checkId),
+  ])
+  const auditsBefore=Number((await db.prepare("SELECT count(*) AS count FROM audit_events WHERE entity_type='check' AND entity_id=?").bind(checkId).first())?.count)
+  const moved=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:1})
+  assert.equal(moved.response.status,409)
+  assert.match((moved.body as unknown as {error:string}).error,/Unlink notification channels and actions before moving/)
+  const keyedMove=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:1},'https://status.example',`${Date.now()}.${crypto.randomUUID()}`)
+  assert.equal(keyedMove.response.status,409)
+  assert.match((keyedMove.body as unknown as {error:string}).error,/Unlink notification channels and actions before moving/)
+  const after=await db.prepare('SELECT component_id,config_version FROM http_checks WHERE id=?').bind(checkId).first<{component_id:string;config_version:number}>()
+  assert.equal(after?.component_id,first.body.id);assert.equal(after?.config_version,1)
+  assert.equal(Number((await db.prepare("SELECT count(*) AS count FROM audit_events WHERE entity_type='check' AND entity_id=?").bind(checkId).first())?.count),auditsBefore)
+  assert.equal((await db.prepare("SELECT state FROM worker_action_outbox WHERE id='move-job'").first())?.state,'pending')
+  assert.equal((await db.prepare("SELECT state FROM notification_outbox WHERE id='move-notification'").first())?.state,'pending')
+  const edited=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,expectedStatus:204,version:1})
+  assert.equal(edited.response.status,200)
+  const staleMove=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:1})
+  assert.equal(staleMove.response.status,409)
+  assert.equal((staleMove.body as unknown as {error:string}).error,'This record changed. Reload and try again.')
+  await db.prepare('DELETE FROM worker_action_checks WHERE action_id=? AND check_id=?').bind('move-action',checkId).run()
+  const retryKey=`${Date.now()}.${crypto.randomUUID()}`
+  const channelStillLinked=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:2},'https://status.example',retryKey)
+  assert.equal(channelStillLinked.response.status,409)
+  assert.match((channelStillLinked.body as unknown as {error:string}).error,/Unlink notification channels and actions before moving/)
+  await db.prepare('DELETE FROM notification_channel_checks WHERE channel_id=? AND check_id=?').bind('move-channel',checkId).run()
+  const unlinkedMove=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:2},'https://status.example',retryKey)
+  assert.equal(unlinkedMove.response.status,200)
+  await db.prepare('DELETE FROM worker_actions WHERE id=?').bind('move-action').run()
+  await db.prepare('DELETE FROM notification_channels WHERE id=?').bind('move-channel').run()
+  await db.prepare('DELETE FROM http_checks WHERE id=?').bind(checkId).run()
+  env.ENDPOINTS=previousEndpoints
 })
 
 test('component status retains the worst manual, check and published incident impact', async () => {
@@ -1261,4 +1316,230 @@ test('monitor tags round trip atomically and reject invalid or stale writes', as
   assert.deepEqual((await find(path))?.tags, [])
   const forbidden = await request(path, viewerToken, 'POST', { name: 'Forbidden', tags }, 'https://status.example', key())
   assert.equal(forbidden.response.status, 403)
+})
+
+test('concurrent vault key initialization binds one winner and rejects the other', async () => {
+  const keys = ['ab'.repeat(32), 'cd'.repeat(32)]
+  const results = await Promise.all(keys.map(key => vaultKeyReady(db as never, key)))
+  assert.equal(results.filter(Boolean).length, 1)
+  assert.deepEqual(await Promise.all(keys.map(key => vaultKeyReady(db as never,key))), results)
+  await db.prepare('DELETE FROM vault_key_verifier').run()
+})
+
+test('local vault authorizes admins, encrypts values, rotates and deletes without exposing credentials', async () => {
+  const base = '/api/v1/bsp/admin/vaults'
+  const secret = 'sensitive-fixture-not-for-output'
+  const rotated = 'replacement-fixture-not-for-output'
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  try {
+    assert.equal((await request(base, viewerToken)).response.status, 403)
+    assert.equal((await request(base, operatorToken)).response.status, 403)
+    assert.equal((await request(base, operatorToken, 'POST', {name:'bad'})).response.status, 403)
+    assert.equal((await request(base, adminToken, 'POST', {name:'bad',type:'hashicorp'})).response.status, 400)
+    const actor = await db.prepare("SELECT id,email,version FROM users WHERE subject='admin-id'").first<{id:string;email:string;version:number}>()
+    assert.ok(actor)
+    await assert.rejects(vaultApi(new Request('https://status.example', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'revoked'})}), db as never, env.VAULT_ENCRYPTION_KEY, {...actor,version:actor.version - 1}, '/admin/vaults'))
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM vaults WHERE name='revoked'").first<{count:number}>())?.count,0)
+    const v = await request(base, adminToken, 'POST', {name:'test vault'})
+    assert.equal(v.response.status, 201)
+    const vault = v.body as unknown as { id:number }
+    assert.equal((await request(base,adminToken,'POST',{name:'test vault'})).response.status,409)
+    const other = (await request(base,adminToken,'POST',{name:'other vault'})).body as unknown as {id:number}
+    assert.equal((await request(`${base}//secrets`,adminToken)).response.status,404)
+    assert.equal((await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'bad',type:'userpass',userpass:{username:'alice'}})).response.status,400)
+    assert.equal((await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'bad',type:'json',json:'['})).response.status,400)
+    const pair = await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'pair',type:'userpass',userpass:{username:'alice',password:secret}})
+    assert.equal(pair.response.status,201)
+    const structured = await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'structured',type:'json',json:JSON.stringify({credential:secret})})
+    assert.equal(structured.response.status,201)
+    const c = await request(`${base}/${vault.id}/secrets`, adminToken, 'POST', {name:'test credential',type:'value',value:secret})
+    assert.equal(c.response.status, 201)
+    const metadata = c.body as unknown as {id:number;version:number}
+    assert.equal((await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'test credential',type:'value',value:secret})).response.status,409)
+    assert.equal((await request(`${base}/${other.id}/secrets/${metadata.id}`,adminToken,'DELETE')).response.status,404)
+    assert.equal((await request(`${base}/${other.id}`,adminToken,'DELETE')).response.status,200)
+    assert.equal(metadata.version,1)
+    assert.doesNotMatch(JSON.stringify(c.body), /sensitive-fixture/)
+    const stored = await db.prepare('SELECT ciphertext,nonce FROM vault_secrets WHERE id=?').bind(metadata.id).first<{ciphertext:string;nonce:string}>()
+    assert.ok(stored)
+    assert.doesNotMatch(JSON.stringify(stored), /sensitive-fixture/)
+    assert.doesNotMatch(JSON.stringify((await request(`${base}/${vault.id}/secrets`, adminToken)).body), /sensitive-fixture/)
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}/reveal`,adminToken)).response.status,404)
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'PATCH',{version:2,value:rotated})).response.status,409)
+    const update = await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'PATCH',{version:1,value:rotated})
+    assert.equal(update.response.status,200)
+    assert.doesNotMatch(JSON.stringify(update.body), /replacement-fixture/)
+    const after = await db.prepare('SELECT ciphertext,nonce FROM vault_secrets WHERE id=?').bind(metadata.id).first<{ciphertext:string;nonce:string}>()
+    assert.ok(after)
+    assert.notEqual(after.ciphertext,stored.ciphertext)
+    assert.notEqual(after.nonce,stored.nonce)
+    const bytes = Uint8Array.from(atob(after.ciphertext), c => c.charCodeAt(0))
+    const nonce = Uint8Array.from(atob(after.nonce), c => c.charCodeAt(0))
+    const key = await crypto.subtle.importKey('raw', new Uint8Array(32).fill(0xab), 'AES-GCM', false, ['decrypt'])
+    const plain = await crypto.subtle.decrypt({name:'AES-GCM',iv:nonce,additionalData:new TextEncoder().encode(`status-vault-v1:${vault.id}:${metadata.id}:value`)},key,bytes)
+    assert.equal(JSON.parse(new TextDecoder().decode(plain)).value,rotated)
+    const audit = await db.prepare("SELECT details FROM audit_events WHERE entity_type IN ('vault','vault_secret')").all<{details:string}>()
+    assert.doesNotMatch(JSON.stringify(audit), /sensitive-fixture|replacement-fixture/)
+    const verifier = await db.prepare('SELECT nonce,ciphertext FROM vault_key_verifier WHERE id=1').first<{nonce:string;ciphertext:string}>()
+    assert.ok(verifier)
+    await db.prepare('DELETE FROM vault_key_verifier').run()
+    assert.equal(await vaultKeyReady(db as never, 'cd'.repeat(32)),false)
+    assert.equal(await db.prepare('SELECT id FROM vault_key_verifier').first(),null)
+    await db.prepare('INSERT INTO vault_key_verifier (id,nonce,ciphertext) VALUES (1,?,?)').bind(verifier.nonce,verifier.ciphertext).run()
+    env.VAULT_ENCRYPTION_KEY = 'cd'.repeat(32)
+    const caps = (await request('/api/v1/bsp/capabilities',adminToken)).body as unknown as {vault:boolean; supportedRoutes:string[]}
+    assert.equal(caps.vault,false)
+    assert.ok(!caps.supportedRoutes.includes('/admin/vault'))
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'PATCH',{version:2,value:'unrecoverable'})).response.status,503)
+    assert.deepEqual(await db.prepare('SELECT ciphertext,nonce FROM vault_secrets WHERE id=?').bind(metadata.id).first(),after)
+    env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'DELETE',{version:1})).response.status,409)
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'DELETE',{version:2})).response.status,200)
+    assert.equal((await request(`${base}/${vault.id}`,adminToken,'DELETE')).response.status,200)
+    assert.equal((await request(`${base}/${vault.id}/secrets`,adminToken)).response.status,404)
+  } finally { delete env.VAULT_ENCRYPTION_KEY }
+  assert.equal((await request(base,adminToken)).response.status,503)
+})
+
+test('monitor Vault Basic auth accepts only saved, authorized HTTPS references and tests the saved version', async () => {
+  const key = () => `${Date.now()}.${crypto.randomUUID()}`
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  env.MONITOR_AUTH_READY = 'true'
+  env.ENDPOINTS = JSON.stringify([{ id:'basic-target', name:'Approved', url:'https://basic.example/' }, { id:'insecure-target', name:'Insecure', url:'http://private.internal/', binding:'PRIVATE',serviceId:'private-service' }])
+  const base = '/api/v1/bsp/admin/vaults'
+  try {
+    const vault = await request(base,adminToken,'POST',{name:'monitor basic fixture'})
+    assert.equal(vault.response.status,201)
+    const vaultId = (vault.body as unknown as {id:number}).id
+    const secret = await request(`${base}/${vaultId}/secrets`,adminToken,'POST',{name:'monitor auth',type:'userpass',userpass:{username:'synthetic',password:'noncredential-value'}})
+    const secretId = (secret.body as unknown as {id:number}).id
+    assert.equal(secret.response.status,201)
+    const advanced = {method:'GET',timeoutMs:5000,attempts:1,auth:{type:'basic',basic:{vault:{vaultId,secretId}}}}
+    const body = {name:'Basic check fixture',check:{endpointId:'basic-target',enabled:false,intervalMinutes:1,expectedStatus:200,advancedConfig:advanced}}
+    assert.equal((await request('/api/v1/bsp/admin/monitors',operatorToken,'POST',body,'https://status.example',key())).response.status,403)
+    const invalid = structuredClone(body); (invalid.check.advancedConfig.auth.basic as Record<string,unknown>).password = 'must-not-store'
+    assert.equal((await request('/api/v1/bsp/admin/monitors',adminToken,'POST',invalid,'https://status.example',key())).response.status,400)
+    const insecure = structuredClone(body); insecure.check.endpointId = 'insecure-target'
+    assert.equal((await request('/api/v1/bsp/admin/monitors',adminToken,'POST',insecure,'https://status.example',key())).response.status,400)
+    const created = await request('/api/v1/bsp/admin/monitors',adminToken,'POST',body,'https://status.example',key())
+    assert.equal(created.response.status,201)
+    const alias = (created.body as unknown as {id:number}).id
+    const check = await db.prepare("SELECT h.id,h.config_version,h.advanced_config FROM http_checks h JOIN entity_aliases a ON a.entity_id=h.component_id WHERE a.entity_type='component' AND a.alias=?").bind(alias).first<{id:string;config_version:number;advanced_config:string}>()
+    assert.ok(check)
+    assert.deepEqual(JSON.parse(check.advanced_config),advanced)
+    assert.doesNotMatch(JSON.stringify((await request('/api/v1/bsp/admin/checks',adminToken)).body),/noncredential-value/)
+    const audits=await db.prepare("SELECT details FROM audit_events WHERE entity_type='check' AND entity_id=?").bind(check.id).all<{details:string}>()
+    assert.doesNotMatch(JSON.stringify(audits),/noncredential-value|synthetic/)
+    let forwarded: unknown
+    env.PROBE = { fetch: async r => { forwarded = await r.json(); return Response.json({overall:'ok',steps:[],totalMs:1}) } }
+    const test = {endpointId:'basic-target',expectedStatus:200,advancedConfig:advanced,checkId:check.id,checkVersion:check.config_version}
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',viewerToken,'POST',test)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...test,checkVersion:check.config_version+1})).response.status,409)
+    const passed = await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',test)
+    assert.equal(passed.response.status,200)
+    assert.deepEqual(forwarded,{checkId:check.id,checkVersion:check.config_version})
+    assert.doesNotMatch(JSON.stringify(forwarded),/vaultId|secretId|noncredential/)
+
+    // The editor supplies effective defaults even when the saved config is sparse.
+    // These equivalent settings test the stored version without allowing draft edits.
+    const otherSecret = await request(`${base}/${vaultId}/secrets`,adminToken,'POST',{name:'other auth',type:'userpass',userpass:{username:'other',password:'other-fixture'}})
+    assert.equal(otherSecret.response.status,201)
+    const otherSecretId=(otherSecret.body as unknown as {id:number}).id
+    const sparse = { auth: advanced.auth }
+    await db.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').bind(JSON.stringify(sparse),check.id).run()
+    const sparseVersion=(await db.prepare('SELECT config_version FROM http_checks WHERE id=?').bind(check.id).first<{config_version:number}>())!.config_version
+    const normalized = {...test,checkVersion:sparseVersion,advancedConfig:{...sparse,method:'GET',timeoutMs:10_000,attempts:1}}
+    forwarded = undefined
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',normalized)).response.status,200)
+    assert.deepEqual(forwarded,{checkId:check.id,checkVersion:sparseVersion})
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,checkVersion:sparseVersion-1})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,advancedConfig:{...normalized.advancedConfig,keyword:'unsaved'}})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,advancedConfig:{...normalized.advancedConfig,timeoutMs:5000}})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,expectedStatus:201})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,advancedConfig:{...normalized.advancedConfig,method:'HEAD'}})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,advancedConfig:{...normalized.advancedConfig,auth:{type:'basic',basic:{vault:{vaultId,secretId:otherSecretId}}}}})).response.status,409)
+    assert.deepEqual(forwarded,{checkId:check.id,checkVersion:sparseVersion})
+    await assert.rejects(db.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').bind(JSON.stringify({auth:{type:'basic',basic:{username:'not-allowed'}}}),check.id).run())
+  } finally { delete env.PROBE; delete env.VAULT_ENCRYPTION_KEY; delete env.MONITOR_AUTH_READY; env.ENDPOINTS='[]' }
+})
+
+test('notifications capability and routes require explicit readiness and an Access administrator', async () => {
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  env.CHANNEL_ENDPOINTS = JSON.stringify([{id:'sink',name:'Approved sink',url:'https://sink.example/'}])
+  try {
+    const capabilities = () => request('/api/v1/bsp/capabilities',adminToken)
+    assert.equal((await capabilities()).body.notifications,false)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',adminToken)).response.status,503)
+    env.CHANNELS_READY = 'true'
+    assert.equal((await capabilities()).body.notifications,true)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',viewerToken)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',operatorToken)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{},'https://cross-origin.example')).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',adminToken)).response.status,200)
+    assert.equal((await request('/api/v1/bsp/admin/notifications/channels',adminToken,'POST',{})).response.status,400)
+  } finally { delete env.VAULT_ENCRYPTION_KEY; delete env.CHANNEL_ENDPOINTS; delete env.CHANNELS_READY }
+})
+
+
+test('actions capability and routes require explicit readiness and an Access administrator', async () => {
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  env.ACTION_ENDPOINTS = JSON.stringify([{id:'sink',name:'Approved action',url:'https://sink.example/'}])
+  try {
+    const capabilities = () => request('/api/v1/bsp/capabilities',adminToken)
+    assert.equal((await capabilities()).body.actions,false)
+    assert.equal((await request('/api/v1/bsp/admin/actions',adminToken)).response.status,503)
+    env.ACTIONS_READY = 'true'
+    assert.equal((await capabilities()).body.actions,true)
+    assert.equal((await request('/api/v1/bsp/admin/actions',viewerToken)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/actions',operatorToken)).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/actions',adminToken,'POST',{},'https://cross-origin.example')).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/actions',adminToken)).response.status,200)
+    assert.equal((await request('/api/v1/bsp/admin/actions',adminToken,'POST',{})).response.status,400)
+  } finally { delete env.VAULT_ENCRYPTION_KEY; delete env.ACTION_ENDPOINTS; delete env.ACTIONS_READY }
+})
+
+test('atomic monitor check edits increment exactly once and fence stale results', async () => {
+  const key=()=>`${Date.now()}.${crypto.randomUUID()}`
+  const path='/api/v1/bsp/admin/monitors'
+  env.ENDPOINTS=JSON.stringify([{id:'fence-a',name:'A',url:'https://a.example/'},{id:'fence-b',name:'B',url:'https://b.example/'}])
+  try {
+    await db.prepare('UPDATE http_checks SET enabled=0').run()
+    const draft={endpointId:'fence-a',enabled:true,intervalMinutes:1,expectedStatus:200,advancedConfig:null as null | Record<string,unknown>}
+    const created=await request(path,adminToken,'POST',{name:'Version fence fixture',check:draft},'https://status.example',key())
+    assert.equal(created.response.status,201)
+    const alias=(created.body as unknown as {id:number;version:number}).id
+    let componentVersion=1
+    const getCheck=()=>db.prepare("SELECT h.id,h.config_version,h.last_status FROM http_checks h JOIN entity_aliases a ON a.entity_id=h.component_id WHERE a.entity_type='component' AND a.alias=?").bind(alias).first<{id:string;config_version:number;last_status:string | null}>()
+    let current=await getCheck(); assert.ok(current)
+    const checkId=current.id
+    const save=async (changes:Partial<typeof draft>, checkVersion=current!.config_version) => {
+      const body={name:'Version fence fixture',version:componentVersion,check:{...draft,...changes,id:checkId,version:checkVersion}}
+      const result=await request(`${path}/${alias}`,adminToken,'PATCH',body,'https://status.example',key())
+      if(result.response.status===200) { componentVersion++; Object.assign(draft,changes) }
+      return result
+    }
+    const initialVersion=current.config_version
+    await db.prepare("UPDATE http_checks SET last_status='up',last_result_at=1,last_scheduled_at=1 WHERE id=?").bind(checkId).run()
+    assert.equal((await save({advancedConfig:{method:'GET',keyword:'one'}})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,initialVersion+1); assert.equal(current!.last_status,null)
+    const staleResult=await db.prepare(`INSERT OR IGNORE INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status)
+      SELECT id,config_version,100,100,'up' FROM http_checks WHERE id=? AND enabled=1 AND config_version=?`).bind(checkId,initialVersion).run() as {meta:{changes:number}}
+    assert.equal(staleResult.meta.changes,0)
+    const beforeStale=current!.config_version
+    assert.equal((await save({expectedStatus:201},initialVersion)).response.status,409)
+    current=await getCheck(); assert.equal(current!.config_version,beforeStale)
+    assert.equal((await save({advancedConfig:{method:'GET',keyword:'two'},expectedStatus:201})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeStale+1)
+    const beforeEndpoint=current!.config_version
+    assert.equal((await save({endpointId:'fence-b'})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeEndpoint+1)
+    const beforeNull=current!.config_version
+    assert.equal((await save({advancedConfig:null})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeNull+1)
+    const beforeNullOther=current!.config_version
+    assert.equal((await save({intervalMinutes:5})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeNullOther+1)
+    assert.equal((await save({})).response.status,200)
+    current=await getCheck(); assert.equal(current!.config_version,beforeNullOther+1)
+  } finally { env.ENDPOINTS='[]' }
 })

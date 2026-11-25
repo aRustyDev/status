@@ -24,6 +24,9 @@ import { Alert } from '@better-forge/ui'
 
 export interface CloudflareProfile {
   isAdmin: boolean
+  monitorAuth?: boolean
+  listVaults?: () => Promise<VaultSummary[]>
+  listVaultSecrets?: (vaultId: number) => Promise<SecretSummary[]>
   statusUnavailable?: boolean | undefined
   settingsUnavailable?: boolean | undefined
   retrySettings?: (() => void) | undefined
@@ -33,7 +36,7 @@ export interface CloudflareProfile {
   position: number
   history?: React.ReactNode
   save: (draft: { name: string; manualStatus: string; position: number; tags: MonitorTag[]; check?: Record<string, unknown> }) => Promise<void>
-  test: (draft: { endpointId: string; expectedStatus: number; advancedConfig: Record<string, unknown> }) => Promise<TestResult>
+  test: (draft: { endpointId: string; expectedStatus: number; advancedConfig: Record<string, unknown>; checkId?: string; checkVersion?: number }) => Promise<TestResult>
 }
 
 interface Props {
@@ -125,6 +128,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
   const [vaults, setVaults]                 = useState<VaultSummary[]>([])
   const [secretsByVault, setSecretsByVault] = useState<Record<number, SecretSummary[]>>({})
+  const [vaultError, setVaultError] = useState(false)
   const [channels, setChannels]             = useState<NotificationChannel[]>([])
   const [selectedChannelIds, setSelectedChannelIds] = useState<Set<number>>(new Set())
   // Actions are managed by admins only: for anyone else the list does not load and the tab stays hidden.
@@ -150,6 +154,16 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
     }
   }, [monitor, cloudflare])
 
+  useEffect(() => {
+    if (!cloudflare?.monitorAuth || !cloudflare.listVaults) return
+    cloudflare.listVaults().then(setVaults).catch(() => setVaultError(true))
+    const auth = cloudflare.check?.advancedConfig?.auth as {basic?: {vault?: {vaultId?: number}}} | undefined
+    const vaultId = auth?.basic?.vault?.vaultId
+    if (vaultId && cloudflare.listVaultSecrets) cloudflare.listVaultSecrets(vaultId).then(secrets => setSecretsByVault(prev => ({ ...prev, [vaultId]: secrets }))).catch(() => setVaultError(true))
+  // Initial configuration and picker state belong to this editor instance.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Pre-load secrets for any vault already configured in the monitor being edited
   // The initial monitor configuration is immutable for the lifetime of the modal.
   useEffect(() => {
@@ -172,9 +186,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   async function loadSecrets(vaultId: number) {
     if (secretsByVault[vaultId]) return
     try {
-      const secrets = await api.get<SecretSummary[]>(`/admin/vaults/${vaultId}/secrets`)
+      const secrets = cloudflare?.listVaultSecrets ? await cloudflare.listVaultSecrets(vaultId) : await api.get<SecretSummary[]>(`/admin/vaults/${vaultId}/secrets`)
       setSecretsByVault((prev) => ({ ...prev, [vaultId]: secrets }))
-    } catch { /* ignore */ }
+    } catch { if (cloudflare) setVaultError(true) }
   }
 
   function handleTypeChange(newType: MonitorType) {
@@ -246,7 +260,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
     setTestResult(null)
     try {
       // monitorId lets the server test with the stored value of a secret the form only shows masked.
-      const result = cloudflare ? await cloudflare.test({ endpointId, expectedStatus: Number(config['expectedStatus'] ?? 200), advancedConfig: cloudflareConfig() }) : await api.post<TestResult>('/admin/monitors/test', { type, config, timeoutMs, ...(isEdit ? { monitorId: monitor.id } : {}) })
+      const result = cloudflare ? await cloudflare.test({ endpointId, expectedStatus: Number(config['expectedStatus'] ?? 200), advancedConfig: cloudflareConfig(), ...(initialCloudflareCheck ? { checkId: initialCloudflareCheck.id, checkVersion: initialCloudflareCheck.version } : {}) }) : await api.post<TestResult>('/admin/monitors/test', { type, config, timeoutMs, ...(isEdit ? { monitorId: monitor.id } : {}) })
       if (!cloudflare || revision === testRevision.current) setTestResult(result)
     } catch (err) {
       if (!cloudflare || revision === testRevision.current) setTestResult({ overall: 'error', steps: [{ label: 'Test request failed', status: 'error', detail: err instanceof Error ? err.message : String(err) }], totalMs: 0 })
@@ -283,9 +297,11 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
       setLoading(true)
       try {
         const advanced = cloudflareConfig()
+        const basicAuth = advanced.auth as { type?: string; basic?: { vault?: { vaultId?: number; secretId?: number } } } | undefined
+        if (basicAuth && (!basicAuth.basic?.vault?.vaultId || !basicAuth.basic.vault.secretId)) { setSidePanel('auth'); throw new Error('Select a User / Password Vault secret.') }
         const rangeProblem = statusRangesProblem((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? [])
         if (rangeProblem) { setSidePanel('checks'); throw new Error(rangeProblem) }
-        if (cloudflare.isAdmin && !endpointId && (((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []).length || config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).length || config['degradedAboveMs'] !== undefined)) {
+        if (cloudflare.isAdmin && !endpointId && (config['auth'] || ((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []).length || config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).length || config['degradedAboveMs'] !== undefined)) {
           throw new Error('Select an approved destination to save check settings.')
         }
         if (timeoutMs * retries > 10000) throw new Error('Timeout multiplied by attempts must not exceed 10,000 ms.')
@@ -490,7 +506,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
             </>
           )}
           {sidePanel === 'credentials' && <CredentialsSection config={config} updateConfig={updateConfig} vaultPicker={vaultPicker} userKey={isDatabaseType(type) ? 'user' : 'username'} />}
-          {sidePanel === 'auth' && <AuthSection auth={auth} onChange={(next) => updateConfig('auth', next)} vaultPicker={vaultPicker} />}
+          {sidePanel === 'auth' && <AuthSection auth={auth} onChange={(next) => updateConfig('auth', cloudflare && next.type === 'none' ? undefined : next)} vaultPicker={vaultPicker} cloudflare={!!cloudflare} vaultError={vaultError} />}
           <div className={sidePanel === 'tags' ? undefined : 'hidden'}><TagsSection tags={tags} allTags={allTags} onChange={setTags} limits={cloudflare ? { count: 20, labelLength: 40 } : undefined} /></div>
           {sidePanel === 'channels' && <ChannelsSection channels={channels} selected={selectedChannelIds} onChange={setSelectedChannelIds} />}
           {sidePanel === 'actions' && availableActions !== null && actionLinks !== null && (
@@ -513,7 +529,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
       {/* ── Vertical tab strip ──────────────────────────────────────────── */}
       {cloudflare
-        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} checkCount={checkCount} tagCount={tags.length} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
+        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} canEditAuth={cloudflare.isAdmin && !!cloudflare.monitorAuth} checkCount={checkCount} tagCount={tags.length} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
         : <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" />}
 
       </div>{/* outer flex row */}

@@ -6,6 +6,7 @@ const path = require('node:path');
 const SLSA = 'https://slsa.dev/provenance/v1';
 const PUBLISH = 'https://github.com/npm/attestation/tree/main/specs/publish/v0.1';
 const packages = {
+  audit: ['0.2.0', 'sha512-RhuZWBVe0ojL7Ypc2LQ28bDxG8dn4Qrb3TFWqyJKM97eOUGivjY1SzMjXZ4v4rWlCeEwcz6PfbNK1TkweAsgSQ=='],
   contracts: ['0.2.0', 'sha512-0LafsRZIqKlapw4obJZZESsUmMUjej0xYmb0KCaiQ3oC8PeBAMfjmBhA+BcQ3IprvvhV2psC9awqS5ZKR4AKVg=='],
   db: ['0.2.0', 'sha512-ZgpzbDj6p5uO9yr2LTbi0V4qfShDx0NuNVDrT18j7efGM/AcC6OB9yZw+2UYVg4pwEvXTEDRRia5Awc1HReOkA=='],
   ui: ['0.4.0', 'sha512-fmWXxELM1fUUDRd6U6CJpUL8QkcU/99QK4pO1JKNcPLroLWxAib+9MOmTTCai//k7LpCI8l8nd4rzRwM+qccrQ=='],

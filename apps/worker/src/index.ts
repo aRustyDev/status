@@ -1,13 +1,24 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose'
 import { endpointFingerprint, parseEndpoints } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
-import { parsePersistedHttpConfig } from '../../probe/src/http-monitor'
+import { parsePersistedHttpConfig, parseVaultBasicAuth } from '../../probe/src/http-monitor'
 import { ProbeTestTimeout, requestProbeTest } from './probe-test'
 import { getSystemHealthReport } from './system-health'
+import { vaultApi, vaultKeyReady, VaultError } from './vault'
+import { channelApi, ChannelError } from './channels'
+import { channelEndpoints, type ChannelEnvironment } from './channels-runtime'
+import { actionApi, ActionError } from './actions'
+import { actionEndpoints, type ActionEnvironment } from './actions-runtime'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
 interface Env {
   DB: D1Database
+  VAULT_ENCRYPTION_KEY?: string
+  MONITOR_AUTH_READY?: string
+  CHANNEL_ENDPOINTS?: string
+  CHANNELS_READY?: string
+  ACTION_ENDPOINTS?: string
+  ACTIONS_READY?: string
   ASSETS: Fetcher
   PROBE?: Fetcher
   MONITOR_MODAL?: string
@@ -41,6 +52,19 @@ function serializeAdvancedConfig(value: unknown, endpointId: string, expectedSta
   const serialized = JSON.stringify(value)
   if (serialized.length > 32_000) return bad('Invalid advanced check settings')
   return serialized
+}
+/** Only administrators can attach an existing user/password secret to an HTTPS check. */
+async function validateMonitorAuth(env: Env, value: unknown, endpointId: string): Promise<void> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return
+  const auth = (value as Record<string, unknown>).auth
+  if (auth === undefined) return
+  const parsed = parseVaultBasicAuth(auth)
+  if (!parsed) return bad('Invalid monitor authentication')
+  if (env.MONITOR_AUTH_READY !== 'true') throw new HttpError(503, 'Monitor authentication is unavailable')
+  const endpoint = parseEndpoints(env.ENDPOINTS).get(endpointId)
+  if (!endpoint || new URL(endpoint.url).protocol !== 'https:') return bad('Monitor authentication requires an approved HTTPS destination')
+  const ref = parsed.basic.vault
+  if (!await stmt(env.DB, "SELECT id FROM vault_secrets WHERE id=? AND vault_id=? AND type='userpass'", ref.secretId, ref.vaultId).first()) return bad('Select an available user/password secret')
 }
 // Reuse jose's issuer-scoped JWKS cache across requests in this isolate. The
 // resolver retains jose's freshness and key-rotation behavior; it never stores
@@ -91,6 +115,10 @@ function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
   if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson((value as Json)[key])}`).join(',')}}`
   return JSON.stringify(value)
+}
+/** Compare a saved check with a test draft using the probe's effective defaults. */
+function effectiveTestConfig(value: Json): Json {
+  return { ...value, method: typeof value.method === 'string' ? value.method.toUpperCase() : 'GET', timeoutMs: value.timeoutMs ?? 10_000, attempts: value.attempts ?? 1 }
 }
 async function authenticate(request: Request, env: Env): Promise<User> {
   const token = request.headers.get('Cf-Access-Jwt-Assertion')
@@ -500,6 +528,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (current.version !== submittedVersion) throw new HttpError(409, 'This record changed. Reload and try again.')
     const candidate = body.advancedConfig
     const serialized = serializeAdvancedConfig(candidate, current.endpointId, current.expectedStatus)
+    await validateMonitorAuth(env, candidate, current.endpointId)
     let unchanged = serialized === null && current.advancedConfig === null
     if (serialized !== null && current.advancedConfig !== null) {
       try { unchanged = stableJson(candidate) === stableJson(JSON.parse(current.advancedConfig)) } catch { unchanged = false }
@@ -531,10 +560,22 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:checkId,version:1},201)
     }
-    const token = id()
-    const replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=?',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,version(body)),[audit(db,user,'update','check',recordId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus},{table:'http_checks',token})],receipt,recordId,Number(body.version)+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
+    const token = id(), submittedVersion = version(body)
+    // Links identify checks, not their owners. Do not let a move silently
+    // retarget an action or channel; guard inside the same transaction as the edit.
+    let replay: Receipt | null
+    try {
+      replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND (component_id=? OR (NOT EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=http_checks.id) AND NOT EXISTS (SELECT 1 FROM notification_channel_checks WHERE check_id=http_checks.id)))',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,submittedVersion,componentId),[audit(db,user,'update','check',recordId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus},{table:'http_checks',token})],receipt,recordId,submittedVersion+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 409 && error.message === 'This record changed. Reload and try again.') {
+        const linked = await stmt(db, `SELECT 1 AS present FROM http_checks h WHERE h.id=? AND h.config_version=? AND h.component_id<>? AND
+          (EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=h.id) OR EXISTS (SELECT 1 FROM notification_channel_checks WHERE check_id=h.id))`,recordId,submittedVersion,componentId).first()
+        if (linked) throw new HttpError(409,'Unlink notification channels and actions before moving this check to another monitor.')
+      }
+      throw error
+    }
     if (replay) return replayReceipt(db, receipt!, replay)
-    return json({id:recordId,version:Number(body.version)+1})
+    return json({id:recordId,version:submittedVersion+1})
   }
 
   if (resource === 'users' && method === 'PATCH' && recordId && !action) {
@@ -562,6 +603,37 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   if (route === '/admin/system-health' && method === 'GET') {
     requireRole(user, 'admin')
     return json(await getSystemHealthReport(env))
+  }
+  if (route === '/admin/actions' || route.startsWith('/admin/actions/')) {
+    requireRole(user, 'admin')
+    if (env.ACTIONS_READY !== 'true' || !actionEndpoints(env.ACTION_ENDPOINTS).size || !await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Actions are unavailable')
+    try { return await actionApi(request, env as unknown as ActionEnvironment, user, route) }
+    catch (error) {
+      if (error instanceof ActionError || error instanceof ReceiptError) throw error
+      if (error instanceof Error && error.message.includes('NOT NULL constraint failed: audit_events.details')) throw new HttpError(403, 'Identity changed; refresh and try again')
+      throw new HttpError(500, 'Action operation failed')
+    }
+  }
+  if (route === '/admin/notifications' || route.startsWith('/admin/notifications/')) {
+    requireRole(user, 'admin')
+    if (env.CHANNELS_READY !== 'true' || !channelEndpoints(env.CHANNEL_ENDPOINTS).size || !await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Notifications are unavailable')
+    try { return await channelApi(request, env as unknown as ChannelEnvironment, user, route) }
+    catch (error) {
+      if (error instanceof ChannelError || error instanceof ReceiptError) throw error
+      if (error instanceof Error && error.message.includes('NOT NULL constraint failed: audit_events.details')) throw new HttpError(403, 'Identity changed; refresh and try again')
+      throw new HttpError(500, 'Notification operation failed')
+    }
+  }
+  if (route === '/admin/vaults' || route.startsWith('/admin/vaults/')) {
+    requireRole(user, 'admin')
+    try { return await vaultApi(request, db, env.VAULT_ENCRYPTION_KEY, user, route) }
+    catch (error) {
+      if (error instanceof VaultError || error instanceof ReceiptError) throw error
+      if (error instanceof Error && error.message.includes('NOT NULL constraint failed: audit_events.details')) throw new HttpError(403, 'Identity changed; refresh and try again')
+      if (error instanceof Error && error.message.includes('UNIQUE constraint failed: vault')) throw new HttpError(409, 'A vault or secret with this name already exists')
+      // Never log provider, request or database errors from secret handling.
+      throw new HttpError(500, 'Vault operation failed')
+    }
   }
   if (route === '/admin/audit-log' && method === 'GET') {
     requireRole(user, 'admin')
@@ -684,8 +756,26 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     if (!approvedEndpoints(env).some(endpoint => endpoint.id === endpointId)) return bad('Unknown approved endpoint')
     if (!Number.isInteger(body.expectedStatus) || Number(body.expectedStatus) < 100 || Number(body.expectedStatus) > 599) return bad('Invalid expectedStatus')
     serializeAdvancedConfig(body.advancedConfig, endpointId, Number(body.expectedStatus))
+    const config = body.advancedConfig as Record<string, unknown> | null
+    let payload: unknown = { endpointId, expectedStatus: body.expectedStatus, advancedConfig: body.advancedConfig }
+    if (config?.auth !== undefined) {
+      await validateMonitorAuth(env, config, endpointId)
+      if (typeof body.checkId !== 'string' || !Number.isSafeInteger(body.checkVersion)) return bad('Save authentication settings before testing')
+      const saved = await stmt(db, 'SELECT endpoint_id,expected_status,advanced_config FROM http_checks WHERE id=? AND config_version=?', body.checkId, body.checkVersion).first<{endpoint_id:string;expected_status:number;advanced_config:string | null}>()
+      let same = false
+      try {
+        if (saved && saved.endpoint_id === endpointId && saved.expected_status === body.expectedStatus && saved.advanced_config !== null) {
+          const stored: unknown = JSON.parse(saved.advanced_config)
+          if (stored && typeof stored === 'object' && !Array.isArray(stored) && parsePersistedHttpConfig(stored, endpointId, 'validation', Number(body.expectedStatus))) {
+            same = stableJson(effectiveTestConfig(stored as Json)) === stableJson(effectiveTestConfig(config))
+          }
+        }
+      } catch { /* invalid stored configuration */ }
+      if (!same) throw new HttpError(409, 'Save authentication settings before testing')
+      payload = { checkId: body.checkId, checkVersion: body.checkVersion }
+    }
     if (!env.PROBE) throw new HttpError(503, 'Monitor testing is unavailable')
-    try { return await requestProbeTest(env.PROBE, { endpointId, expectedStatus: body.expectedStatus, advancedConfig: body.advancedConfig }, request.signal) }
+    try { return await requestProbeTest(env.PROBE, payload, request.signal) }
     catch (error) { if (error instanceof ProbeTestTimeout) throw new HttpError(504, 'Monitor test timed out'); throw error }
   }
   if ((route === '/admin/monitors' && method === 'POST') || (/^\/admin\/monitors\/[^/]+$/.test(route) && method === 'PATCH')) {
@@ -715,6 +805,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       if (!Number.isInteger(input.expectedStatus) || Number(input.expectedStatus) < 100 || Number(input.expectedStatus) > 599) return bad('Invalid expectedStatus')
       const advanced = input.advancedConfig ?? null
       const serialized = serializeAdvancedConfig(advanced, endpointId, Number(input.expectedStatus))
+      await validateMonitorAuth(env, advanced, endpointId)
       current = creating ? null : await stmt(db, 'SELECT * FROM http_checks WHERE component_id=?', componentId).first<StoredCheck>()
       if (current && (input.id !== current.id || input.version !== current.config_version)) throw new HttpError(409, 'This check changed. Reload and try again.')
       if (!current && (input.id !== undefined || input.version !== undefined)) throw new HttpError(409, 'This check changed. Reload and try again.')
@@ -731,6 +822,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     else operations.push(stmt(db, `UPDATE components SET name=?,manual_status=?,position=?,updated_at=?,version=version+1,mutation_key=?,tags=COALESCE(?,tags) WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM gatus_sources WHERE component_id=components.id)${checkGuard}`, name, manualStatus, position, Date.now(), token, tags, componentId, componentVersion, ...guardValues))
     if (checkData && checkData.changed) {
       if (!current) operations.push(stmt(db, `INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status,advanced_config) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.id, componentId, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, componentId, token))
+      // The advanced-config trigger increments when its value changes. Increment here only
+      // when it is unchanged and another check field changed, so every edit increments once.
       else operations.push(stmt(db, `UPDATE http_checks SET endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,advanced_config=?, config_version=config_version + CASE WHEN advanced_config IS ? THEN 1 ELSE 0 END,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND EXISTS (SELECT 1 FROM components WHERE id=? AND mutation_key=?)`, checkData.endpointId, checkData.enabled ? 1 : 0, checkData.intervalMinutes, checkData.expectedStatus, checkData.advancedConfig, checkData.advancedConfig, token, current.id, current.config_version, componentId, token))
       operations.push(audit(db, user, current ? 'update' : 'create', 'check', checkData.id, { componentId, enabled: checkData.enabled, intervalMinutes: checkData.intervalMinutes, expectedStatus: checkData.expectedStatus }, { table: 'components', id: componentId, token }))
     }
@@ -747,7 +840,12 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     return json({ id: saved.result_alias, version: saved.result_version }, saved.status)
   }
   if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now() })
-  if (route === '/capabilities' && method === 'GET') return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : [])], subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+  if (route === '/capabilities' && method === 'GET') {
+    const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
+    const notificationsAvailable = vaultAvailable && env.CHANNELS_READY === 'true' && channelEndpoints(env.CHANNEL_ENDPOINTS).size > 0
+    const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+  }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
   if (method === 'GET' && route === '/public/access') return json({ private: true, signedIn: true, email: user.email, role: user.role, passwordChangeRequired: false, branding: null })
@@ -909,6 +1007,9 @@ export default {
       const fallback = new URL('/',url)
       return env.ASSETS.fetch(new Request(fallback,request))
     } catch (error) {
+      if (error instanceof ActionError) return json({error:error.message},error.status)
+      if (error instanceof ChannelError) return json({error:error.message},error.status)
+      if (error instanceof VaultError) return json({error:error.message},error.status)
       if (error instanceof ReceiptError) return json({error:error.message,...(error.code ? {code:error.code} : {})},error.status)
       if (error instanceof HttpError) return json({error:error.message},error.status)
       if (error instanceof Error && error.message.includes('Inactive Gatus source cannot be associated')) return json({error:'Inactive Gatus source cannot be associated'},409)
