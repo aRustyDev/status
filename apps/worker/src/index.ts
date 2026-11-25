@@ -4,10 +4,12 @@ import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './g
 import { parsePersistedHttpConfig } from '../../probe/src/http-monitor'
 import { ProbeTestTimeout, requestProbeTest } from './probe-test'
 import { getSystemHealthReport } from './system-health'
+import { vaultApi, vaultKeyReady, VaultError } from './vault'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
 interface Env {
   DB: D1Database
+  VAULT_ENCRYPTION_KEY?: string
   ASSETS: Fetcher
   PROBE?: Fetcher
   MONITOR_MODAL?: string
@@ -563,6 +565,17 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     requireRole(user, 'admin')
     return json(await getSystemHealthReport(env))
   }
+  if (route === '/admin/vaults' || route.startsWith('/admin/vaults/')) {
+    requireRole(user, 'admin')
+    try { return await vaultApi(request, db, env.VAULT_ENCRYPTION_KEY, user, route) }
+    catch (error) {
+      if (error instanceof VaultError || error instanceof ReceiptError) throw error
+      if (error instanceof Error && error.message.includes('NOT NULL constraint failed: audit_events.details')) throw new HttpError(403, 'Identity changed; refresh and try again')
+      if (error instanceof Error && error.message.includes('UNIQUE constraint failed: vault')) throw new HttpError(409, 'A vault or secret with this name already exists')
+      // Never log provider, request or database errors from secret handling.
+      throw new HttpError(500, 'Vault operation failed')
+    }
+  }
   if (route === '/admin/audit-log' && method === 'GET') {
     requireRole(user, 'admin')
     return auditPage(db, request)
@@ -747,7 +760,10 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     return json({ id: saved.result_alias, version: saved.result_version }, saved.status)
   }
   if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now() })
-  if (route === '/capabilities' && method === 'GET') return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : [])], subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+  if (route === '/capabilities' && method === 'GET') {
+    const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : [])], vault: vaultAvailable, subscriptions: false, notifications: false, dependencies: false, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+  }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
   if (method === 'GET' && route === '/public/access') return json({ private: true, signedIn: true, email: user.email, role: user.role, passwordChangeRequired: false, branding: null })
@@ -909,6 +925,7 @@ export default {
       const fallback = new URL('/',url)
       return env.ASSETS.fetch(new Request(fallback,request))
     } catch (error) {
+      if (error instanceof VaultError) return json({error:error.message},error.status)
       if (error instanceof ReceiptError) return json({error:error.message,...(error.code ? {code:error.code} : {})},error.status)
       if (error instanceof HttpError) return json({error:error.message},error.status)
       if (error instanceof Error && error.message.includes('Inactive Gatus source cannot be associated')) return json({error:'Inactive Gatus source cannot be associated'},409)

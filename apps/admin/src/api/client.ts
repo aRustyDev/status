@@ -53,7 +53,7 @@ export const api = {
   post: <T>(path: string, body: unknown = {}, options?: { timeoutMs?: number }) => request<T>('POST', path, body, options?.timeoutMs),
   patch: <T>(path: string, body: unknown) => request<T>('PATCH', path, body),
   put: <T>(path: string, body: unknown) => request<T>('PUT', path, body),
-  delete: (path: string) => request<void>('DELETE', path),
+  delete: (path: string, body?: unknown) => request<void>('DELETE', path, body),
   getText: async (path: string) => {
     const response = await fetch(`/api/v1/bsp${path}`, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
     if (!response.ok) throw new ApiError('Request failed', response.status)

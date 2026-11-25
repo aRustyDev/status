@@ -13,6 +13,7 @@ const Incidents = lazy(() => import('./pages/Incidents'))
 const Maintenance = lazy(() => import('./pages/Maintenance'))
 const Users = lazy(() => import('./pages/Users'))
 const Audit = lazy(() => import('./pages/AuditLog'))
+const Vault = lazy(() => import('./pages/Vault'))
 const Backups = lazy(() => import('./pages/Backups'))
 const SystemHealth = lazy(() => import('./pages/SystemHealth'))
 
@@ -134,6 +135,7 @@ export default function App() {
             <Route path="monitors/:id" element={capabilities.supportedRoutes.includes("/admin/monitors") ? <MonitorDetails /> : <Unavailable />} />
             <Route path="incidents" element={capabilities.supportedRoutes.includes("/admin/incidents") ? <Incidents /> : <Unavailable />} />
             <Route path="maintenance" element={capabilities.supportedRoutes.includes("/admin/maintenance") ? <Maintenance /> : <Unavailable />} />
+            <Route path="vault" element={identity.role === 'admin' && capabilities.supportedRoutes.includes("/admin/vault") ? <Vault /> : <Unavailable />} />
             <Route path="users" element={identity.role === 'admin' ? <Users /> : <Unavailable />} />
             <Route path="audit-log" element={identity.role === 'admin' ? <Audit /> : <Unavailable />} />
             <Route path="backups" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/backups') ? <Backups /> : <Unavailable />} />

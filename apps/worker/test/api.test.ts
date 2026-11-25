@@ -6,6 +6,7 @@ import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 import worker from '../src/index.ts'
 import { getSystemHealthReport } from '../src/system-health.ts'
+import { vaultApi, vaultKeyReady } from '../src/vault.ts'
 import probeWorker from '../../probe/src/index.ts'
 import { endpointFingerprint } from '../src/endpoint-config.ts'
 import { syncGatusCatalog } from '../src/gatus-catalog.ts'
@@ -70,7 +71,7 @@ let db: TestDatabase = sqlite
 let miniflare: Miniflare | undefined
 const issuer = 'https://test.cloudflareaccess.com'
 const audience = 'status-test'
-const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
+const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string; VAULT_ENCRYPTION_KEY?: string } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
 const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
@@ -96,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -114,6 +115,7 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0007_idempotency.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0008_monitor_tags.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0008_vault.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -1255,4 +1257,87 @@ test('monitor tags round trip atomically and reject invalid or stale writes', as
   assert.deepEqual((await find(path))?.tags, [])
   const forbidden = await request(path, viewerToken, 'POST', { name: 'Forbidden', tags }, 'https://status.example', key())
   assert.equal(forbidden.response.status, 403)
+})
+
+test('concurrent vault key initialization binds one winner and rejects the other', async () => {
+  const keys = ['ab'.repeat(32), 'cd'.repeat(32)]
+  const results = await Promise.all(keys.map(key => vaultKeyReady(db as never, key)))
+  assert.equal(results.filter(Boolean).length, 1)
+  assert.deepEqual(await Promise.all(keys.map(key => vaultKeyReady(db as never,key))), results)
+  await db.prepare('DELETE FROM vault_key_verifier').run()
+})
+
+test('local vault authorizes admins, encrypts values, rotates and deletes without exposing credentials', async () => {
+  const base = '/api/v1/bsp/admin/vaults'
+  const secret = 'sensitive-fixture-not-for-output'
+  const rotated = 'replacement-fixture-not-for-output'
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  try {
+    assert.equal((await request(base, viewerToken)).response.status, 403)
+    assert.equal((await request(base, operatorToken)).response.status, 403)
+    assert.equal((await request(base, operatorToken, 'POST', {name:'bad'})).response.status, 403)
+    assert.equal((await request(base, adminToken, 'POST', {name:'bad',type:'hashicorp'})).response.status, 400)
+    const actor = await db.prepare("SELECT id,email,version FROM users WHERE subject='admin-id'").first<{id:string;email:string;version:number}>()
+    assert.ok(actor)
+    await assert.rejects(vaultApi(new Request('https://status.example', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'revoked'})}), db as never, env.VAULT_ENCRYPTION_KEY, {...actor,version:actor.version - 1}, '/admin/vaults'))
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM vaults WHERE name='revoked'").first<{count:number}>())?.count,0)
+    const v = await request(base, adminToken, 'POST', {name:'test vault'})
+    assert.equal(v.response.status, 201)
+    const vault = v.body as unknown as { id:number }
+    assert.equal((await request(base,adminToken,'POST',{name:'test vault'})).response.status,409)
+    const other = (await request(base,adminToken,'POST',{name:'other vault'})).body as unknown as {id:number}
+    assert.equal((await request(`${base}//secrets`,adminToken)).response.status,404)
+    assert.equal((await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'bad',type:'userpass',userpass:{username:'alice'}})).response.status,400)
+    assert.equal((await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'bad',type:'json',json:'['})).response.status,400)
+    const pair = await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'pair',type:'userpass',userpass:{username:'alice',password:secret}})
+    assert.equal(pair.response.status,201)
+    const structured = await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'structured',type:'json',json:JSON.stringify({credential:secret})})
+    assert.equal(structured.response.status,201)
+    const c = await request(`${base}/${vault.id}/secrets`, adminToken, 'POST', {name:'test credential',type:'value',value:secret})
+    assert.equal(c.response.status, 201)
+    const metadata = c.body as unknown as {id:number;version:number}
+    assert.equal((await request(`${base}/${vault.id}/secrets`,adminToken,'POST',{name:'test credential',type:'value',value:secret})).response.status,409)
+    assert.equal((await request(`${base}/${other.id}/secrets/${metadata.id}`,adminToken,'DELETE')).response.status,404)
+    assert.equal((await request(`${base}/${other.id}`,adminToken,'DELETE')).response.status,200)
+    assert.equal(metadata.version,1)
+    assert.doesNotMatch(JSON.stringify(c.body), /sensitive-fixture/)
+    const stored = await db.prepare('SELECT ciphertext,nonce FROM vault_secrets WHERE id=?').bind(metadata.id).first<{ciphertext:string;nonce:string}>()
+    assert.ok(stored)
+    assert.doesNotMatch(JSON.stringify(stored), /sensitive-fixture/)
+    assert.doesNotMatch(JSON.stringify((await request(`${base}/${vault.id}/secrets`, adminToken)).body), /sensitive-fixture/)
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}/reveal`,adminToken)).response.status,404)
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'PATCH',{version:2,value:rotated})).response.status,409)
+    const update = await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'PATCH',{version:1,value:rotated})
+    assert.equal(update.response.status,200)
+    assert.doesNotMatch(JSON.stringify(update.body), /replacement-fixture/)
+    const after = await db.prepare('SELECT ciphertext,nonce FROM vault_secrets WHERE id=?').bind(metadata.id).first<{ciphertext:string;nonce:string}>()
+    assert.ok(after)
+    assert.notEqual(after.ciphertext,stored.ciphertext)
+    assert.notEqual(after.nonce,stored.nonce)
+    const bytes = Uint8Array.from(atob(after.ciphertext), c => c.charCodeAt(0))
+    const nonce = Uint8Array.from(atob(after.nonce), c => c.charCodeAt(0))
+    const key = await crypto.subtle.importKey('raw', new Uint8Array(32).fill(0xab), 'AES-GCM', false, ['decrypt'])
+    const plain = await crypto.subtle.decrypt({name:'AES-GCM',iv:nonce,additionalData:new TextEncoder().encode(`status-vault-v1:${vault.id}:${metadata.id}:value`)},key,bytes)
+    assert.equal(JSON.parse(new TextDecoder().decode(plain)).value,rotated)
+    const audit = await db.prepare("SELECT details FROM audit_events WHERE entity_type IN ('vault','vault_secret')").all<{details:string}>()
+    assert.doesNotMatch(JSON.stringify(audit), /sensitive-fixture|replacement-fixture/)
+    const verifier = await db.prepare('SELECT nonce,ciphertext FROM vault_key_verifier WHERE id=1').first<{nonce:string;ciphertext:string}>()
+    assert.ok(verifier)
+    await db.prepare('DELETE FROM vault_key_verifier').run()
+    assert.equal(await vaultKeyReady(db as never, 'cd'.repeat(32)),false)
+    assert.equal(await db.prepare('SELECT id FROM vault_key_verifier').first(),null)
+    await db.prepare('INSERT INTO vault_key_verifier (id,nonce,ciphertext) VALUES (1,?,?)').bind(verifier.nonce,verifier.ciphertext).run()
+    env.VAULT_ENCRYPTION_KEY = 'cd'.repeat(32)
+    const caps = (await request('/api/v1/bsp/capabilities',adminToken)).body as unknown as {vault:boolean; supportedRoutes:string[]}
+    assert.equal(caps.vault,false)
+    assert.ok(!caps.supportedRoutes.includes('/admin/vault'))
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'PATCH',{version:2,value:'unrecoverable'})).response.status,503)
+    assert.deepEqual(await db.prepare('SELECT ciphertext,nonce FROM vault_secrets WHERE id=?').bind(metadata.id).first(),after)
+    env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'DELETE',{version:1})).response.status,409)
+    assert.equal((await request(`${base}/${vault.id}/secrets/${metadata.id}`,adminToken,'DELETE',{version:2})).response.status,200)
+    assert.equal((await request(`${base}/${vault.id}`,adminToken,'DELETE')).response.status,200)
+    assert.equal((await request(`${base}/${vault.id}/secrets`,adminToken)).response.status,404)
+  } finally { delete env.VAULT_ENCRYPTION_KEY }
+  assert.equal((await request(base,adminToken)).response.status,503)
 })
