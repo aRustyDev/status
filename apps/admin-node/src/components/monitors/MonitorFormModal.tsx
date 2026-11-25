@@ -491,7 +491,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
           )}
           {sidePanel === 'credentials' && <CredentialsSection config={config} updateConfig={updateConfig} vaultPicker={vaultPicker} userKey={isDatabaseType(type) ? 'user' : 'username'} />}
           {sidePanel === 'auth' && <AuthSection auth={auth} onChange={(next) => updateConfig('auth', next)} vaultPicker={vaultPicker} />}
-          <div className={sidePanel === 'tags' ? undefined : 'hidden'}><TagsSection tags={tags} allTags={allTags} onChange={setTags} /></div>
+          <div className={sidePanel === 'tags' ? undefined : 'hidden'}><TagsSection tags={tags} allTags={allTags} onChange={setTags} limits={cloudflare ? { count: 20, labelLength: 40 } : undefined} /></div>
           {sidePanel === 'channels' && <ChannelsSection channels={channels} selected={selectedChannelIds} onChange={setSelectedChannelIds} />}
           {sidePanel === 'actions' && availableActions !== null && actionLinks !== null && (
             <ActionsSection actions={availableActions} links={actionLinks} onChange={setActionLinks} />

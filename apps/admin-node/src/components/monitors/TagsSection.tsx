@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import type { MonitorTag } from '@bsp/shared'
 
 /** Tags currently on the monitor, removable, plus a row to add new or existing ones. */
-export function TagsSection({ tags, allTags, onChange }: { tags: MonitorTag[]; allTags: MonitorTag[]; onChange: (tags: MonitorTag[]) => void }) {
+export function TagsSection({ tags, allTags, onChange, limits }: { tags: MonitorTag[]; allTags: MonitorTag[]; onChange: (tags: MonitorTag[]) => void; limits?: { count: number; labelLength: number } | undefined }) {
   return (
     <div className="space-y-3">
       {tags.length === 0 && <p className="text-xs" style={{ color: 'var(--m3-secondary)' }}>No tags yet.</p>}
@@ -19,6 +19,8 @@ export function TagsSection({ tags, allTags, onChange }: { tags: MonitorTag[]; a
       )}
       <AddTagRow
         existingTags={allTags.filter((t) => !tags.find((cur) => cur.label === t.label))}
+        limits={limits}
+        atLimit={!!limits && tags.length >= limits.count}
         onAdd={(tag) => { if (!tags.find((t) => t.label === tag.label)) onChange([...tags, tag]) }}
       />
     </div>
@@ -35,11 +37,14 @@ const TAG_COLOUR_NAMES: Record<string, string> = {
   '#f59e0b': 'Amber', '#10b981': 'Emerald', '#14b8a6': 'Teal', '#06b6d4': 'Cyan', '#3b82f6': 'Blue',
 }
 
-function AddTagRow({ onAdd, existingTags = [] }: { onAdd: (t: MonitorTag) => void; existingTags?: MonitorTag[] }) {
+function AddTagRow({ onAdd, existingTags = [], limits, atLimit = false }: { onAdd: (t: MonitorTag) => void; existingTags?: MonitorTag[]; limits?: { count: number; labelLength: number } | undefined; atLimit?: boolean }) {
   const [label, setLabel] = useState('')
   const [color, setColor] = useState(TAG_PALETTE[0]!)
   const [open, setOpen] = useState(false)
+  const limitMessageId = useId()
 
+  const tooLong = !!limits && label.trim().length > limits.labelLength
+  const problem = limits && atLimit ? `A monitor can have at most ${limits.count} tags.` : limits && tooLong ? `Tag labels can be at most ${limits.labelLength} characters.` : null
   const suggestions = label.trim()
     ? existingTags.filter((t) => t.label.toLowerCase().includes(label.toLowerCase()))
     : []
@@ -51,13 +56,14 @@ function AddTagRow({ onAdd, existingTags = [] }: { onAdd: (t: MonitorTag) => voi
   }
 
   function add() {
-    if (!label.trim()) return
+    if (!label.trim() || atLimit || tooLong) return
     onAdd({ label: label.trim(), color })
     setLabel('')
     setOpen(false)
   }
 
   return (
+    <div>
     <div className="flex items-center gap-2 flex-wrap">
       <div className="relative" style={{ flex: '1 1 120px', minWidth: 0 }} onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setOpen(false) }}>
         <input
@@ -67,13 +73,15 @@ function AddTagRow({ onAdd, existingTags = [] }: { onAdd: (t: MonitorTag) => voi
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add() } }}
           placeholder="Tag label…"
           aria-label="Tag label"
+          aria-invalid={tooLong || undefined}
+          aria-describedby={problem ? limitMessageId : undefined}
           className="input-sig text-sm w-full"
         />
         {open && suggestions.length > 0 && (
           <div className="absolute top-full left-0 right-0 mt-1 rounded-lg z-50 overflow-hidden"
             style={{ background: 'var(--m3-surface-container-high)', border: '1px solid var(--m3-outline-variant)', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
             {suggestions.map((t) => (
-              <button key={t.label} type="button"
+              <button key={t.label} type="button" disabled={atLimit}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => selectSuggestion(t)}
                 className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-surface-container"
@@ -102,10 +110,12 @@ function AddTagRow({ onAdd, existingTags = [] }: { onAdd: (t: MonitorTag) => voi
           />
         ))}
       </div>
-      <button type="button" onClick={add}
+      <button type="button" onClick={add} disabled={atLimit || tooLong}
         className="text-xs px-3 py-1.5 rounded-lg font-semibold flex-shrink-0 focus-ring"
         style={{ background: 'var(--m3-primary-fixed)', color: 'var(--m3-primary)', border: '1px solid color-mix(in srgb, var(--m3-primary) 25%, transparent)' }}
       >Add</button>
+    </div>
+    {problem && <p id={limitMessageId} role="alert" className="text-xs mt-2">{problem}</p>}
     </div>
   )
 }
