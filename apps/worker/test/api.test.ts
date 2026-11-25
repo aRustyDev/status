@@ -1141,6 +1141,30 @@ test('custom request settings require an approved destination and round-trip thr
   } finally { delete env.MONITOR_REQUEST_READY; env.ENDPOINTS = '[]' }
 })
 
+test('saved Vault header tests do not require the monitoring API to hold the Vault key', async () => {
+  const endpoint = { id: 'vault-header-api', name: 'Vault header target', url: 'https://example.com/health', requestPolicy: { allowPost: true, plaintextHeaders: [], vaultHeaders: ['x-token'] } }
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  env.MONITOR_REQUEST_READY = 'true'
+  env.MONITOR_AUTH_READY = 'true'
+  env.VAULT_ENCRYPTION_KEY = 'ab'.repeat(32)
+  let forwarded: unknown
+  env.PROBE = { async fetch(request) { forwarded = await request.json(); return Response.json({ overall: 'ok', steps: [], totalMs: 1 }) } }
+  try {
+    const vault = await request('/api/v1/bsp/admin/vaults', adminToken, 'POST', { name: 'Header test vault' })
+    const secret = await request(`/api/v1/bsp/admin/vaults/${vault.body.id}/secrets`, adminToken, 'POST', { name: 'Header test value', type: 'value', value: 'synthetic' })
+    assert.equal(secret.response.status, 201)
+    const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Vault header test' })
+    const check = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: false, intervalMinutes: 1, expectedStatus: 200 })
+    const advancedConfig = { method: 'POST', vaultHeaders: { 'x-token': { vaultId: vault.body.id, secretId: secret.body.id } } }
+    const saved = await request(`/api/v1/bsp/admin/checks/${check.body.id}/advanced`, adminToken, 'PUT', { version: 1, advancedConfig })
+    assert.equal(saved.response.status, 200)
+    delete env.VAULT_ENCRYPTION_KEY
+    const tested = await request('/api/v1/bsp/admin/monitors/test', adminToken, 'POST', { endpointId: endpoint.id, expectedStatus: 200, advancedConfig, checkId: check.body.id, checkVersion: 2 })
+    assert.equal(tested.response.status, 200)
+    assert.deepEqual(forwarded, { checkId: check.body.id, checkVersion: 2 })
+  } finally { delete env.PROBE; delete env.VAULT_ENCRYPTION_KEY; delete env.MONITOR_AUTH_READY; delete env.MONITOR_REQUEST_READY; env.ENDPOINTS = '[]' }
+})
+
 test('effective degraded state survives new reads and legacy-probe fallback uses its latest status', async () => {
   const endpoint = { id: 'advanced-status-api', name: 'Advanced status', url: 'https://status.example.test/health' }
   env.ENDPOINTS = JSON.stringify([endpoint])

@@ -70,7 +70,7 @@ async function validateMonitorAuth(env: Env, value: unknown, endpointId: string)
   const config = value as Record<string, unknown>
   const vaultHeaders = config.vaultHeaders as Record<string, { vaultId: number; secretId: number }> | undefined
   if (vaultHeaders && Object.keys(vaultHeaders).length) {
-    if (env.MONITOR_AUTH_READY !== 'true' || !await vaultKeyReady(env.DB, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Monitor credentials are unavailable')
+    if (env.MONITOR_AUTH_READY !== 'true') throw new HttpError(503, 'Monitor credentials are unavailable')
     for (const ref of Object.values(vaultHeaders)) {
       if (!await stmt(env.DB, "SELECT id FROM vault_secrets WHERE id=? AND vault_id=? AND type='value'", ref.secretId, ref.vaultId).first()) return bad('Select an available Secure Value secret')
     }
