@@ -1389,6 +1389,26 @@ test('monitor Vault Basic auth accepts only saved, authorized HTTPS references a
     assert.equal(passed.response.status,200)
     assert.deepEqual(forwarded,{checkId:check.id,checkVersion:check.config_version})
     assert.doesNotMatch(JSON.stringify(forwarded),/vaultId|secretId|noncredential/)
+
+    // The editor supplies effective defaults even when the saved config is sparse.
+    // These equivalent settings test the stored version without allowing draft edits.
+    const otherSecret = await request(`${base}/${vaultId}/secrets`,adminToken,'POST',{name:'other auth',type:'userpass',userpass:{username:'other',password:'other-fixture'}})
+    assert.equal(otherSecret.response.status,201)
+    const otherSecretId=(otherSecret.body as unknown as {id:number}).id
+    const sparse = { auth: advanced.auth }
+    await db.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').bind(JSON.stringify(sparse),check.id).run()
+    const sparseVersion=(await db.prepare('SELECT config_version FROM http_checks WHERE id=?').bind(check.id).first<{config_version:number}>())!.config_version
+    const normalized = {...test,checkVersion:sparseVersion,advancedConfig:{...sparse,method:'GET',timeoutMs:10_000,attempts:1}}
+    forwarded = undefined
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',normalized)).response.status,200)
+    assert.deepEqual(forwarded,{checkId:check.id,checkVersion:sparseVersion})
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,checkVersion:sparseVersion-1})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,advancedConfig:{...normalized.advancedConfig,keyword:'unsaved'}})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,advancedConfig:{...normalized.advancedConfig,timeoutMs:5000}})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,expectedStatus:201})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,advancedConfig:{...normalized.advancedConfig,method:'HEAD'}})).response.status,409)
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test',adminToken,'POST',{...normalized,advancedConfig:{...normalized.advancedConfig,auth:{type:'basic',basic:{vault:{vaultId,secretId:otherSecretId}}}}})).response.status,409)
+    assert.deepEqual(forwarded,{checkId:check.id,checkVersion:sparseVersion})
     await assert.rejects(db.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').bind(JSON.stringify({auth:{type:'basic',basic:{username:'not-allowed'}}}),check.id).run())
   } finally { delete env.PROBE; delete env.VAULT_ENCRYPTION_KEY; delete env.MONITOR_AUTH_READY; env.ENDPOINTS='[]' }
 })

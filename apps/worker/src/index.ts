@@ -116,6 +116,10 @@ function stableJson(value: unknown): string {
   if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson((value as Json)[key])}`).join(',')}}`
   return JSON.stringify(value)
 }
+/** Compare a saved check with a test draft using the probe's effective defaults. */
+function effectiveTestConfig(value: Json): Json {
+  return { ...value, method: typeof value.method === 'string' ? value.method.toUpperCase() : 'GET', timeoutMs: value.timeoutMs ?? 10_000, attempts: value.attempts ?? 1 }
+}
 async function authenticate(request: Request, env: Env): Promise<User> {
   const token = request.headers.get('Cf-Access-Jwt-Assertion')
   if (!token || !env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) throw new HttpError(401, 'Access authentication required')
@@ -747,7 +751,14 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       if (typeof body.checkId !== 'string' || !Number.isSafeInteger(body.checkVersion)) return bad('Save authentication settings before testing')
       const saved = await stmt(db, 'SELECT endpoint_id,expected_status,advanced_config FROM http_checks WHERE id=? AND config_version=?', body.checkId, body.checkVersion).first<{endpoint_id:string;expected_status:number;advanced_config:string | null}>()
       let same = false
-      try { same = !!saved && saved.endpoint_id === endpointId && saved.expected_status === body.expectedStatus && saved.advanced_config !== null && stableJson(JSON.parse(saved.advanced_config)) === stableJson(config) } catch { /* invalid stored configuration */ }
+      try {
+        if (saved && saved.endpoint_id === endpointId && saved.expected_status === body.expectedStatus && saved.advanced_config !== null) {
+          const stored: unknown = JSON.parse(saved.advanced_config)
+          if (stored && typeof stored === 'object' && !Array.isArray(stored) && parsePersistedHttpConfig(stored, endpointId, 'validation', Number(body.expectedStatus))) {
+            same = stableJson(effectiveTestConfig(stored as Json)) === stableJson(effectiveTestConfig(config))
+          }
+        }
+      } catch { /* invalid stored configuration */ }
       if (!same) throw new HttpError(409, 'Save authentication settings before testing')
       payload = { checkId: body.checkId, checkVersion: body.checkVersion }
     }
