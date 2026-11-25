@@ -113,6 +113,49 @@ test('email failure is not retried and an expired claim is never resent', async 
   assert.deepEqual({ ...expired.local.sqlite.prepare('SELECT state,attempts,error_code FROM notification_outbox').get() }, { state:'failed', attempts:1, error_code:'delivery_failed' })
 })
 
+test('email jobs that expire after selection cannot be claimed', async () => {
+  const x = await fixture(); await x.transition(100, 'down')
+  const db = { prepare(sql: string) {
+    if (sql.includes("WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?"))
+      x.local.sqlite.prepare('UPDATE notification_outbox SET created_at=?').run(Date.now()-3_600_001)
+    return x.db.prepare(sql)
+  }, batch: x.db.batch.bind(x.db) } as D1Database
+  await flushChannelDeliveries({ ...x.env, DB: db })
+  assert.equal(x.calls.length, 0)
+  assert.deepEqual({ ...x.local.sqlite.prepare('SELECT state,attempts FROM notification_outbox').get() }, { state:'failed', attempts:0 })
+})
+
+test('email final preflight defers on a lost lease, an expired job, a slow read, or maintenance starting during the read', async () => {
+  for (const reason of ['lease', 'age', 'slow', 'maintenance'] as const) {
+    const x = await fixture(); await x.transition(100, 'down')
+    const realNow = Date.now; let now = realNow()
+    if (reason === 'maintenance') x.local.sqlite.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now+1_000,now+60_000,now,now)
+    try {
+      Date.now = () => now
+      const db = { prepare(sql: string) {
+        if (!sql.includes('SELECT o.created_at AS createdAt,o.lease_until AS leaseUntil,')) return x.db.prepare(sql)
+        if (reason === 'lease') x.local.sqlite.prepare("UPDATE notification_outbox SET lease_token='another-worker'").run()
+        if (reason === 'age') x.local.sqlite.prepare('UPDATE notification_outbox SET created_at=?').run(now-3_600_001)
+        const statement = x.db.prepare(sql)
+        return { bind(...values: unknown[]) { statement.bind(...values); return this }, async first() {
+          const result = await statement.first()
+          if (reason === 'slow') now += 11_000
+          if (reason === 'maintenance') now += 2_000
+          return result
+        } } as D1PreparedStatement
+      }, batch: x.db.batch.bind(x.db) } as D1Database
+      await flushChannelDeliveries({ ...x.env, DB: db })
+      assert.equal(x.calls.length, 0, reason)
+      const row = x.local.sqlite.prepare('SELECT state,attempts FROM notification_outbox').get()
+      assert.deepEqual({ ...row }, reason === 'lease' ? { state:'sending', attempts:1 } : { state:'pending', attempts:0 }, reason)
+      if (reason === 'age') {
+        await flushChannelDeliveries(x.env)
+        assert.equal((x.local.sqlite.prepare('SELECT state FROM notification_outbox').get() as {state:string}).state, 'failed')
+      }
+    } finally { Date.now = realNow }
+  }
+})
+
 test('overlapping flushes claim an email delivery only once', async () => {
   let started!: () => void, finish!: () => void
   const sent = new Promise<void>(resolve => { started = resolve })

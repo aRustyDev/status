@@ -192,6 +192,76 @@ test('expired pending events fail without transmission',async()=>{
   assert.equal((x.local.db.prepare('SELECT state FROM notification_outbox').get() as {state:string}).state,'failed')
 })
 
+async function queueTimingEvent(x:Awaited<ReturnType<typeof setup>>) {
+  const result=x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,http_status,latency_ms) VALUES (?,1,100,100,'down',500,4)").bind(checkId)
+  await x.db.batch([result,enqueueTransition(x.db,checkId,1,'approved',100,'down')])
+  x.local.db.prepare("UPDATE automation_transition_state SET status='down',generation=1 WHERE check_id=?").run(checkId)
+}
+
+test('a lost or expired notification lease cannot transmit after slow resolution',async()=>{
+  for(const reason of ['lease','age'] as const) {
+    const x=await setup();await queueTimingEvent(x)
+    const db={...x.db,prepare(sql:string){
+      if(sql.includes('SELECT o.created_at AS createdAt,o.lease_until AS leaseUntil,')) {
+        if(reason==='lease') x.local.db.prepare("UPDATE notification_outbox SET lease_token='another-worker'").run()
+        else x.local.db.prepare('UPDATE notification_outbox SET created_at=?').run(Date.now()-3_600_001)
+      }
+      return x.db.prepare(sql)
+    }} as D1Database
+    await flushChannelDeliveries({...x.env,DB:db})
+    assert.equal(x.calls.length,0)
+    assert.equal((x.local.db.prepare('SELECT state FROM notification_outbox').get() as {state:string}).state,reason==='lease'?'sending':'pending')
+    if(reason==='age') {
+      await flushChannelDeliveries(x.env)
+      assert.equal((x.local.db.prepare('SELECT state FROM notification_outbox').get() as {state:string}).state,'failed')
+    }
+  }
+})
+
+test('notification jobs that expire after selection cannot be claimed',async()=>{
+  const x=await setup();await queueTimingEvent(x)
+  const db={...x.db,prepare(sql:string){
+    if(sql.includes("WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?"))
+      x.local.db.prepare('UPDATE notification_outbox SET created_at=?').run(Date.now()-3_600_001)
+    return x.db.prepare(sql)
+  }} as D1Database
+  await flushChannelDeliveries({...x.env,DB:db})
+  assert.equal(x.calls.length,0)
+  assert.equal((x.local.db.prepare('SELECT state FROM notification_outbox').get() as {state:string}).state,'failed')
+})
+
+test('a notification does not send if the final lease query consumes its send window',async()=>{
+  const x=await setup();await queueTimingEvent(x)
+  const realNow=Date.now;let now=realNow()
+  try {
+    Date.now=()=>now
+    const db={...x.db,prepare(sql:string){
+      const statement=x.db.prepare(sql)
+      if(!sql.includes('SELECT o.created_at AS createdAt,o.lease_until AS leaseUntil,')) return statement
+      return {bind(...values:unknown[]){statement.bind(...values);return this},async first(){const value=await statement.first();now+=11_000;return value}} as D1PreparedStatement
+    }} as D1Database
+    await flushChannelDeliveries({...x.env,DB:db})
+    assert.equal(x.calls.length,0)
+  } finally {Date.now=realNow}
+})
+
+test('a notification defers when a scheduled maintenance window starts during its final query',async()=>{
+  const x=await setup();await queueTimingEvent(x)
+  const realNow=Date.now;let now=realNow()
+  x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now+1_000,now+60_000,now,now)
+  try {
+    Date.now=()=>now
+    const db={...x.db,prepare(sql:string){
+      const statement=x.db.prepare(sql)
+      if(!sql.includes('SELECT o.created_at AS createdAt,o.lease_until AS leaseUntil,')) return statement
+      return {bind(...values:unknown[]){statement.bind(...values);return this},async first(){const value=await statement.first();now+=2_000;return value}} as D1PreparedStatement
+    }} as D1Database
+    await flushChannelDeliveries({...x.env,DB:db})
+    assert.equal(x.calls.length,0)
+    assert.deepEqual({...x.local.db.prepare('SELECT state,attempts FROM notification_outbox').get()},{state:'pending',attempts:0})
+  } finally {Date.now=realNow}
+})
+
 test('degraded and down remain distinct and stale effective watermarks fall back to legacy status',async()=>{
   const x=await setup()
   await x.db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,100,100,'down','degraded',200,4)").bind(checkId).run()
@@ -306,7 +376,7 @@ test('a window starting after claim defers a notification before network transmi
  ])
  let inserted=false
  const db={prepare(sql:string) {
-  if(!inserted && sql.includes('SELECT 1 FROM notification_outbox o JOIN http_checks')) {
+  if(!inserted && sql.includes('FROM notification_outbox o JOIN http_checks')) {
    inserted=true;x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now-1000,now+60_000,now,now)
   }
   return x.db.prepare(sql)
@@ -405,7 +475,7 @@ test('webhook preflight refuses credentials rotated or deleted after resolution'
   ])
   let changed=false
   const db={prepare(sql:string) {
-   if(!changed && sql.includes('SELECT 1 FROM notification_outbox o JOIN http_checks') && sql.includes('JOIN vault_secrets v')) {
+   if(!changed && sql.includes('FROM notification_outbox o JOIN http_checks') && sql.includes('JOIN vault_secrets v')) {
     changed=true
     if(change==='delete') x.local.db.prepare('DELETE FROM vault_secrets WHERE id=?').run(x.secret.id)
     else if(change==='rotate') x.local.db.prepare('UPDATE vault_secrets SET version=version+1 WHERE id=?').run(x.secret.id)

@@ -104,6 +104,70 @@ test('crashes, ambiguous responses and stale jobs never cause automatic re-execu
  assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'unavailable')
 })
 
+test('an expired or superseded action claim cannot transmit after slow resolution',async()=>{
+ for(const reason of ['claim','age'] as const) {
+  const x=await setup();await queue(x)
+  const db={...x.db,prepare(sql:string){
+   if(sql.includes('SELECT o.created_at AS createdAt,')) {
+    if(reason==='claim') x.local.db.prepare("UPDATE worker_action_outbox SET state='uncertain'").run()
+    else x.local.db.prepare('UPDATE worker_action_outbox SET created_at=?').run(Date.now()-3_600_001)
+   }
+   return x.db.prepare(sql)
+  }} as D1Database
+  await flushActions({...x.env,DB:db})
+  assert.equal(x.calls.length,0)
+  assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,reason==='claim'?'uncertain':'pending')
+  if(reason==='age') {
+   await flushActions(x.env)
+   assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'unavailable')
+  }
+ }
+})
+
+test('action jobs that expire after selection cannot be claimed',async()=>{
+ const x=await setup();await queue(x)
+ const db={...x.db,prepare(sql:string){
+  if(sql.includes("WHERE o.id=? AND o.state='pending' AND o.created_at<?"))
+   x.local.db.prepare('UPDATE worker_action_outbox SET created_at=?').run(Date.now()-3_600_001)
+  return x.db.prepare(sql)
+ }} as D1Database
+ await flushActions({...x.env,DB:db})
+ assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'unavailable')
+})
+
+test('an action does not send if the final claim query crosses its deadline',async()=>{
+ const x=await setup();await queue(x)
+ const realNow=Date.now;let now=realNow()
+ try {
+  Date.now=()=>now
+  const db={...x.db,prepare(sql:string){
+   const statement=x.db.prepare(sql)
+   if(!sql.includes('SELECT o.created_at AS createdAt,')) return statement
+   return {bind(...values:unknown[]){statement.bind(...values);return this},async first(){const result=await statement.first();now+=31_000;return result}} as D1PreparedStatement
+  }} as D1Database
+  await flushActions({...x.env,DB:db})
+  assert.equal(x.calls.length,0)
+ } finally {Date.now=realNow}
+})
+
+test('an action defers when a scheduled maintenance window starts during its final query',async()=>{
+ const x=await setup();await queue(x)
+ const realNow=Date.now;let now=realNow()
+ x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now+1_000,now+60_000,now,now)
+ try {
+  Date.now=()=>now
+  const db={...x.db,prepare(sql:string){
+   const statement=x.db.prepare(sql)
+   if(!sql.includes('SELECT o.created_at AS createdAt,')) return statement
+   return {bind(...values:unknown[]){statement.bind(...values);return this},async first(){const result=await statement.first();now+=2_000;return result}} as D1PreparedStatement
+  }} as D1Database
+  await flushActions({...x.env,DB:db})
+  assert.equal(x.calls.length,0)
+  assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'pending')
+ } finally {Date.now=realNow}
+})
+
 test('revoked administrators cannot create actions and competing discarded results do not enqueue',async()=>{
  const x=await setup()
  await assert.rejects(actionApi(request('POST',{...x.actionBody,name:'revoked'}),x.env,{...actor,version:0},'/admin/actions'))
@@ -295,7 +359,7 @@ test('a transition after the action claim prevents a stale action before transmi
  const x=await setup();await queue(x)
  let changed=false
  const db={prepare(sql:string) {
-  if(!changed && sql.includes('SELECT 1 FROM worker_action_outbox o JOIN http_checks') && sql.includes('JOIN vault_secrets v')) {
+  if(!changed && sql.includes('FROM worker_action_outbox o JOIN http_checks') && sql.includes('JOIN vault_secrets v')) {
    changed=true;x.local.db.prepare("UPDATE automation_transition_state SET generation=generation+1,status='up' WHERE check_id=?").run(checkId)
   }
   return x.db.prepare(sql)
@@ -340,7 +404,7 @@ test('action preflight refuses credentials rotated or deleted after resolution',
   const x=await setup();await queue(x)
   let changed=false
   const db={prepare(sql:string) {
-   if(!changed && sql.includes('SELECT 1 FROM worker_action_outbox o JOIN http_checks') && sql.includes('JOIN vault_secrets v')) {
+   if(!changed && sql.includes('FROM worker_action_outbox o JOIN http_checks') && sql.includes('JOIN vault_secrets v')) {
     changed=true
     if(change==='delete') x.local.db.prepare('DELETE FROM vault_secrets WHERE id=?').run(x.secret.id)
     else if(change==='rotate') x.local.db.prepare('UPDATE vault_secrets SET version=version+1 WHERE id=?').run(x.secret.id)
