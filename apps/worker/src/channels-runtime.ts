@@ -39,7 +39,12 @@ export async function sendChannel(env: ChannelEnvironment, channelId: string, ve
       if (!channel.recipient_id || !channel.email_fingerprint) return 'unavailable'
       const active = await env.DB.prepare(`SELECT 1 FROM notification_channels WHERE id=? AND version=?${requireEnabled ? ' AND enabled=1' : ''}`).bind(channelId,version).first()
       if (!active) return 'unavailable'
-      if (!event.checkId) return sendApprovedEmail(env,channel.recipient_id,channel.email_fingerprint,null)
+      if (!event.checkId) {
+        // A channel may be changed or deleted while the destination fingerprint
+        // is being computed. Recheck after that work, just before sending.
+        const result = await sendApprovedEmail(env,channel.recipient_id,channel.email_fingerprint,null,async () => !!await env.DB.prepare(`SELECT 1 FROM notification_channels WHERE id=? AND version=?${requireEnabled ? ' AND enabled=1' : ''}`).bind(channelId,version).first())
+        return result === 'deferred' ? 'unavailable' : result
+      }
       if (!event.status || !Number.isSafeInteger(event.scheduledAt) || !event.deliveryId || !event.leaseToken) return 'unavailable'
       const monitor = await env.DB.prepare(`SELECT c.name FROM notification_outbox o JOIN http_checks h ON h.id=o.check_id
         JOIN components c ON c.id=h.component_id JOIN notification_channel_checks cc ON cc.check_id=h.id AND cc.channel_id=o.channel_id

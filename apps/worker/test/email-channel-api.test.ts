@@ -38,6 +38,48 @@ function setup() {
   return {local, env}
 }
 
+test('email channel tests reject a changed or deleted channel before sending', async () => {
+  for (const change of ['retarget', 'delete'] as const) {
+    const {local, env} = setup()
+    const payload = {name:'Test email', type:'email', recipientId:'ops', enabled:true, checkIds:[], expectedChecks:[]}
+    const created = await (await channelApi(request('POST',payload),env,actor,'/admin/notifications/channels')).json() as {id:string;version:number}
+    let sends = 0, changed = false
+    const db = {
+      prepare(sql:string) {
+        const statement = local.prepare(sql)
+        if (sql !== 'SELECT 1 FROM notification_channels WHERE id=? AND version=?') return statement
+        return {
+          bind(...values:unknown[]) { statement.bind(...values); return this },
+          async first<T>() {
+            const result = await statement.first<T>()
+            if (!changed) {
+              changed = true
+              if (change === 'delete') local.db.prepare('DELETE FROM notification_channels WHERE id=?').run(created.id)
+              else local.db.prepare("UPDATE notification_channels SET recipient_id='new',version=version+1 WHERE id=?").run(created.id)
+            }
+            return result
+          },
+        }
+      },
+      batch: local.batch.bind(local),
+    } as unknown as D1Database
+    const testEnv = {...env, DB:db, EMAIL:{send:async () => { sends++; return {messageId:'accepted'} }} as SendEmail}
+    await assert.rejects(channelApi(request('POST',{version:created.version}),testEnv,actor,`/admin/notifications/channels/${created.id}/test`), (error:unknown) => error instanceof ChannelError && error.status === 409)
+    assert.equal(changed,true)
+    assert.equal(sends,0,change)
+  }
+})
+
+test('an unchanged disabled email channel can still send a manual test', async () => {
+  const {env} = setup()
+  let sends = 0
+  const testEnv = {...env, EMAIL:{send:async () => { sends++; return {messageId:'accepted'} }} as SendEmail}
+  const created = await (await channelApi(request('POST',{name:'Disabled',type:'email',recipientId:'ops',enabled:false,checkIds:[],expectedChecks:[]}),testEnv,actor,'/admin/notifications/channels')).json() as {id:string;version:number}
+  const response = await channelApi(request('POST',{version:created.version}),testEnv,actor,`/admin/notifications/channels/${created.id}/test`)
+  assert.equal(response.status,200)
+  assert.equal(sends,1)
+})
+
 test('email channels accept only approved recipients and preserve check links on stale writes', async () => {
   const {local, env} = setup()
   const destinations = await (await channelApi(request('GET'),env,actor,'/admin/notifications/email-destinations')).json()
