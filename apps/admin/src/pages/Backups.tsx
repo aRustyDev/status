@@ -23,7 +23,11 @@ export default function BackupsPage() {
   }
   async function verify(id: string) {
     setBusy(id); setMessage(null)
-    try { await api.get(`/admin/backups/${id}/verify`, { timeoutMs: 120_000 }); setMessage({ tone: 'success', text: 'The stored backup passed its integrity check. Verify recovery in an isolated database before relying on it.' }) }
+    try {
+      const result = await api.get<{ valid: boolean }>(`/admin/backups/${id}/verify`, { timeoutMs: 120_000 })
+      if (result.valid !== true) throw new Error('Backup verification failed.')
+      setMessage({ tone: 'success', text: 'The stored backup passed its integrity check. Verify recovery in an isolated database before relying on it.' })
+    }
     catch (error) { setMessage({ tone: 'error', text: error instanceof Error ? error.message : 'Backup verification failed.' }) }
     finally { setBusy(null) }
   }
@@ -33,7 +37,7 @@ export default function BackupsPage() {
     <section className="rounded-2xl p-6 space-y-4" style={{ background: 'var(--m3-surface-container-lowest)', color: 'var(--m3-on-surface)' }}>
       <button type="button" disabled={busy !== null} onClick={() => void create()} className="btn btn-primary">{busy === 'create' ? 'Starting backup…' : 'Create backup'}</button>
       <p className="text-sm" style={{ color: 'var(--m3-secondary)' }}>D1 exports can temporarily lock the database. Downloads contain application data; protect them as sensitive. Cloudflare configuration, credentials, external services and the Gatus database are not included.</p>
-      <p className="text-sm" style={{ color: 'var(--m3-secondary)' }}>Restore is an offline operation. Test recovery with an isolated target first; restoring a live database overwrites its data.</p>
+      <p className="text-sm" style={{ color: 'var(--m3-secondary)' }}>Restore is unavailable in this console. Follow the <a className="underline" href="https://github.com/aRustyDev/status/blob/main/docs/cloudflare-backups.md" target="_blank" rel="noreferrer">Cloudflare D1 backups and recovery guide</a> to verify and download an export, then test it in an isolated database. For live recovery, stop writers and confirm the target before restoring; a restore can overwrite data.</p>
     </section>
     <section className="rounded-2xl p-6 space-y-2" style={{ background: 'var(--m3-surface-container-lowest)', color: 'var(--m3-on-surface)' }}>
       <h2 className="font-headline text-xl font-semibold">Automatic backups</h2>

@@ -33,6 +33,30 @@ describe('Cloudflare backups', () => {
     await user.click(screen.getByRole('button', { name: /try again/i }))
     expect(await screen.findByText('No backups yet')).toBeInTheDocument()
   })
+  it('reports failed creation and verification without claiming success', async () => {
+    vi.mocked(api.get).mockImplementation(async path => {
+      if (path.endsWith('/verify')) throw new Error('Backup integrity check failed')
+      return { backups: [backup], nextCursor: null } as never
+    })
+    vi.mocked(api.post).mockRejectedValue(new Error('Export unavailable'))
+    const user = userEvent.setup()
+    show()
+    await screen.findByText(backup.id)
+    await user.click(screen.getByRole('button', { name: 'Create backup' }))
+    expect(await screen.findByText('Export unavailable')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Verify' }))
+    expect(await screen.findByText('Backup integrity check failed')).toBeInTheDocument()
+    expect(screen.queryByText(/passed its integrity check/)).not.toBeInTheDocument()
+  })
+  it('does not treat an invalid verification response as success', async () => {
+    vi.mocked(api.get).mockImplementation(async path => path.endsWith('/verify') ? { valid: false } as never : { backups: [backup], nextCursor: null } as never)
+    const user = userEvent.setup()
+    show()
+    await screen.findByText(backup.id)
+    await user.click(screen.getByRole('button', { name: 'Verify' }))
+    expect(await screen.findByText('Backup verification failed.')).toBeInTheDocument()
+    expect(screen.queryByText(/passed its integrity check/)).not.toBeInTheDocument()
+  })
   it('loads subsequent pages and can return to the first page', async () => {
     vi.mocked(api.get).mockImplementation(async path => path.includes('cursor=')
       ? { backups: [{ ...backup, id: 'b'.repeat(64) }], nextCursor: null } as never

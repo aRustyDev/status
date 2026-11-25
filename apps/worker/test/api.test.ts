@@ -160,6 +160,12 @@ test('backup service stays capability-gated, administrator-only and idempotent',
     assert.ok(capabilities.supportedRoutes.includes('/admin/backups'))
     assert.equal((await request(path, viewerToken)).response.status, 403)
     assert.equal((await request(path, operatorToken)).response.status, 403)
+    for (const action of ['verify', 'download']) {
+      const itemPath = `${path}/${'a'.repeat(64)}/${action}`
+      assert.equal((await request(itemPath, viewerToken)).response.status, 403)
+      assert.equal((await request(itemPath, operatorToken)).response.status, 403)
+      assert.equal((await request(itemPath, adminToken)).response.status, 200)
+    }
     assert.equal((await request(path, adminToken)).response.status, 200)
     assert.equal((await request(`${path}?cursor=next-page`, adminToken)).response.status, 200)
     assert.equal(queries.at(-1), '?cursor=next-page')
