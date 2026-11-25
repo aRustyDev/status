@@ -48,8 +48,8 @@ describe('Cloudflare backups', () => {
     expect(await screen.findByText('Backup integrity check failed')).toBeInTheDocument()
     expect(screen.queryByText(/passed its integrity check/)).not.toBeInTheDocument()
   })
-  it('does not treat an invalid verification response as success', async () => {
-    vi.mocked(api.get).mockImplementation(async path => path.endsWith('/verify') ? { valid: false } as never : { backups: [backup], nextCursor: null } as never)
+  it.each([null, undefined, { valid: false }, { valid: 'true' }])('does not treat invalid verification response %s as success', async result => {
+    vi.mocked(api.get).mockImplementation(async path => path.endsWith('/verify') ? result as never : { backups: [backup], nextCursor: null } as never)
     const user = userEvent.setup()
     show()
     await screen.findByText(backup.id)

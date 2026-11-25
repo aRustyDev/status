@@ -24,8 +24,8 @@ export default function BackupsPage() {
   async function verify(id: string) {
     setBusy(id); setMessage(null)
     try {
-      const result = await api.get<{ valid: boolean }>(`/admin/backups/${id}/verify`, { timeoutMs: 120_000 })
-      if (result.valid !== true) throw new Error('Backup verification failed.')
+      const result = await api.get<{ valid?: unknown } | null | undefined>(`/admin/backups/${id}/verify`, { timeoutMs: 120_000 })
+      if (result?.valid !== true) throw new Error('Backup verification failed.')
       setMessage({ tone: 'success', text: 'The stored backup passed its integrity check. Verify recovery in an isolated database before relying on it.' })
     }
     catch (error) { setMessage({ tone: 'error', text: error instanceof Error ? error.message : 'Backup verification failed.' }) }
