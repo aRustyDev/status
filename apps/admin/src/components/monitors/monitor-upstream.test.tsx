@@ -543,3 +543,27 @@ it('identifies unavailable channels and allows removing existing selections', as
   await user.click(screen.getByRole('button', { name: 'Save Changes' }))
   await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ channelIds: [], expectedChannelIds: ['old'], version: 4 })))
 })
+
+it('tests a sparse saved Vault check using effective defaults without changing its saved version', async () => {
+  const user=userEvent.setup()
+  const auth={type:'basic',basic:{vault:{vaultId:12,secretId:20}}}
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path==='/admin/checks') return [{...check,advancedConfig:{auth}}]
+    if (path==='/admin/endpoints') return [{id:'api',name:'Approved API'}]
+    if (path==='/admin/monitors/7/history') return {results:[],retentionDays:14}
+    if (path==='/admin/vaults') return [{id:12,name:'Operations'}]
+    if (path==='/admin/vaults/12/secrets') return [{id:20,name:'service-login',type:'userpass'}]
+    throw new Error(`Unexpected request ${path}`)
+  })
+  vi.mocked(api.post).mockResolvedValue({overall:'ok',steps:[],totalMs:1})
+  renderModal(monitor,[],true)
+  await user.click(await screen.findByRole('button',{name:'Test'}))
+  await waitFor(() => expect(api.post).toHaveBeenCalledWith('/admin/monitors/test',{
+    endpointId:'api',expectedStatus:200,checkId:'check-uuid',checkVersion:3,
+    advancedConfig:{method:'GET',auth,timeoutMs:10_000,attempts:1},
+  },expect.anything()))
+  await user.click(screen.getByRole('button',{name:'Save Changes'}))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7',{
+    name:'API',manualStatus:'operational',position:1,tags:[],version:4,
+  }))
+})
