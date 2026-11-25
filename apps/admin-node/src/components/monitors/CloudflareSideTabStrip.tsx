@@ -4,7 +4,7 @@ import type { SidePanelKey } from './MonitorSidePanel'
 
 // Adapted from @better-forge/ui's SideTabStrip; see THIRD_PARTY_LICENSE_BetterStatusPage.
 // The shared strip does not yet support disabled tabs.
-export function CloudflareSideTabStrip({ meta, active, onToggle, canEditChecks, canEditAuth = false, canEditRequest = false, canEditAlerts = false, canEditDependencies = false, checkCount, tagCount, alertCount = 0, dependencyCount = 0, className }: {
+export function CloudflareSideTabStrip({ meta, active, onToggle, canEditChecks, canEditAuth = false, canEditRequest = false, canEditAlerts = false, canEditActions = false, canEditDependencies = false, checkCount, tagCount, alertCount = 0, dependencyCount = 0, className }: {
   meta: Record<SidePanelKey, SidePanelMeta>
   active: SidePanelKey | null
   onToggle: (key: SidePanelKey | null) => void
@@ -12,6 +12,7 @@ export function CloudflareSideTabStrip({ meta, active, onToggle, canEditChecks, 
   canEditAuth?: boolean
   canEditRequest?: boolean
   canEditAlerts?: boolean
+  canEditActions?: boolean
   canEditDependencies?: boolean
   checkCount: number
   tagCount: number
@@ -23,7 +24,7 @@ export function CloudflareSideTabStrip({ meta, active, onToggle, canEditChecks, 
 
   return <div role="toolbar" className={clsx('flex items-stretch border-outline-variant flex-row w-full border-t overflow-x-auto rounded-b-2xl lg:w-11 lg:flex-none lg:flex-col lg:border-t-0 lg:border-l lg:rounded-b-none lg:rounded-r-2xl', className)}>
     {tabs.map(key => {
-      const disabled = key === 'tags' ? false : key === 'checks' ? !canEditChecks : key === 'auth' ? !canEditAuth : key === 'request' ? !canEditRequest : key === 'channels' ? !canEditAlerts : key === 'dependencies' ? !canEditDependencies : true
+      const disabled = key === 'tags' ? false : key === 'checks' ? !canEditChecks : key === 'auth' ? !canEditAuth : key === 'request' ? !canEditRequest : key === 'channels' ? !canEditAlerts : key === 'actions' ? !canEditActions : key === 'dependencies' ? !canEditDependencies : true
       const isActive = active === key
       const current = meta[key]
       return <button key={key} type="button" disabled={disabled} aria-pressed={isActive}

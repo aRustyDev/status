@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { isDatabaseType } from '@bsp/shared'
-import type { Action, MonitorAction, MonitorType } from '@bsp/shared'
+import type { MonitorAction, MonitorType } from '@bsp/shared'
 import type { VaultRef } from '@better-forge/contracts'
 import type { SidePanelMeta } from '@better-forge/ui'
 import { ConnectionStringSection, CredentialSection } from '@better-forge/ui'
@@ -213,12 +213,14 @@ export function ChannelsSection<T extends string | number>({ channels, selected,
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
-export function ActionsSection({ actions, links, onChange }: {
-  actions: Action[]
-  links: MonitorAction[]
-  onChange: (links: MonitorAction[]) => void
+export type ActionLink<Id extends string | number> = Omit<MonitorAction, 'actionId'> & { actionId: Id }
+
+export function ActionsSection<Id extends string | number>({ actions, links, onChange }: {
+  actions: { id: Id; name: string; enabled: boolean | number }[]
+  links: ActionLink<Id>[]
+  onChange: (links: ActionLink<Id>[]) => void
 }) {
-  const update = (index: number, patch: Partial<MonitorAction>) =>
+  const update = (index: number, patch: Partial<ActionLink<Id>>) =>
     onChange(links.map((link, i) => (i === index ? { ...link, ...patch } : link)))
 
   return (
@@ -233,8 +235,9 @@ export function ActionsSection({ actions, links, onChange }: {
       {links.map((link, i) => (
         <div key={i} className="rounded-lg px-3 py-3 space-y-3" style={{ border: '1px solid var(--m3-outline-variant)' }}>
           <div className="flex items-center gap-2">
-            <select value={link.actionId} onChange={(e) => update(i, { actionId: Number(e.target.value) })}
+            <select value={link.actionId} onChange={(e) => { const action = actions.find(item => String(item.id) === e.target.value); if (action) update(i, { actionId: action.id }) }}
               aria-label={`Action ${i + 1}`} className="input-sig flex-1 min-w-0">
+              {!actions.some(a => a.id === link.actionId) && <option value={link.actionId}>Unavailable action</option>}
               {actions.map((a) => <option key={a.id} value={a.id}>{a.name}{a.enabled ? '' : ' (disabled)'}</option>)}
             </select>
             <button type="button" onClick={() => onChange(links.filter((_, idx) => idx !== i))}
