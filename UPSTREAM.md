@@ -5,3 +5,5 @@ This repository incorporates source from [Better Status Page](https://github.com
 The upstream source is licensed under the MIT License. Its copyright notice and license are preserved in `THIRD_PARTY_LICENSE_BetterStatusPage`.
 
 The scheduled HTTP-check design was informed by [cf-workers-status-page](https://github.com/eidam/cf-workers-status-page), including its use of Workers Cron Triggers and HTTP response checks. This fork implements its own probe and D1 persistence; it does not incorporate that project's source code.
+
+The Cloudflare Vault screen adapts the layout and shared modal components of the upstream `@better-forge/ui` Vault page. The upstream page is coupled to the Node API client and offers reveal and HashiCorp operations that the Workers API does not implement, so it cannot be used unchanged. The adapted screen uses the Cloudflare API client, local encrypted vaults, and write-only secret creation and rotation. External providers, secret reveal, monitor authentication, and notification channels remain unavailable until their complete Workers implementations are supported.
