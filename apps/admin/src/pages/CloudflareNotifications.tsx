@@ -1,11 +1,12 @@
 // Adapts the upstream Notifications page and Vault picker to the supported Workers webhook provider.
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Modal, ModalFooter } from '@better-forge/ui'
 import { api } from '../api/client'
 
 type Channel = { id:string; name:string; endpointId:string; vaultId:number; secretId:number; enabled:number; version:number; checkIds:string[] }
 type Choice = {id:string;name:string}
+type CheckChoice = Choice & {componentId:string;version:number}
 type Vault = {id:number;name:string}
 type Secret = {id:number;name:string;type:string}
 type Delivery = {channelId:string;checkId:string;status:string;state:string;attempts:number;errorCode:string|null;updatedAt:number}
@@ -52,13 +53,25 @@ function ChannelForm({channel,onClose,onSaved}:{channel:Channel|null;onClose:()=
   const [name,setName]=useState(channel?.name??''), [endpointId,setEndpointId]=useState(channel?.endpointId??''), [vaultId,setVaultId]=useState(channel?.vaultId??0), [secretId,setSecretId]=useState(channel?.secretId??0)
   const [enabled,setEnabled]=useState(channel?.enabled!==0), [checkIds,setCheckIds]=useState<string[]>(channel?.checkIds??[]), [busy,setBusy]=useState(false), [error,setError]=useState('')
   const destinations=useQuery<Choice[]>({queryKey:['worker-channel-destinations'],queryFn:()=>api.get('/admin/notifications/destinations')})
-  const checks=useQuery<Choice[]>({queryKey:['worker-channel-checks'],queryFn:()=>api.get('/admin/notifications/checks')})
+  const checks=useQuery<CheckChoice[]>({queryKey:['worker-channel-checks'],queryFn:()=>api.get('/admin/notifications/checks'),refetchOnMount:'always'})
+  const [checkSnapshots,setCheckSnapshots]=useState<Record<string,CheckChoice>>({})
+  useEffect(()=>{
+    if (!checks.isFetchedAfterMount || !checks.data) return
+    setCheckSnapshots(current=>{
+      const next={...current}
+      for (const check of checks.data) if (checkIds.includes(check.id) && !next[check.id]) next[check.id]=check
+      return next
+    })
+  },[checks.isFetchedAfterMount,checks.data,checkIds])
+  const missingCheckSnapshots=checkIds.filter(id=>!checkSnapshots[id] || !checks.data?.some(check=>check.id===id))
   const vaults=useQuery<Vault[]>({queryKey:['vaults'],queryFn:()=>api.get('/admin/vaults')})
   const secrets=useQuery<Secret[]>({queryKey:['vault-secrets',vaultId],queryFn:()=>api.get(`/admin/vaults/${vaultId}/secrets`),enabled:vaultId>0})
   async function submit(event:FormEvent) {
     event.preventDefault(); setError(''); setBusy(true)
     try {
-      const payload={name,endpointId,vaultId,secretId,enabled,checkIds,...(channel?{version:channel.version}:{})}
+      if (!checks.isFetchedAfterMount || checks.isError || missingCheckSnapshots.length) throw new Error('Selected monitors are unavailable')
+      const expectedChecks=checkIds.map(id=>({id,componentId:checkSnapshots[id]!.componentId,version:checkSnapshots[id]!.version}))
+      const payload={name,endpointId,vaultId,secretId,enabled,checkIds,expectedChecks,...(channel?{version:channel.version}:{})}
       if (channel) await api.patch(`/admin/notifications/channels/${channel.id}`,payload)
       else await api.post('/admin/notifications/channels',payload)
       await onSaved()
@@ -72,7 +85,9 @@ function ChannelForm({channel,onClose,onSaved}:{channel:Channel|null;onClose:()=
     <label className="block">Vault<select className="input-sig w-full" required value={vaultId||''} onChange={event=>{setVaultId(Number(event.target.value));setSecretId(0)}}><option value="">— select vault —</option>{vaults.data?.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}</select></label>
     <label className="block">Secure Value secret<select className="input-sig w-full" required disabled={!vaultId} value={secretId||''} onChange={event=>setSecretId(Number(event.target.value))}><option value="">— select secret —</option>{secrets.data?.filter(s=>s.type==='value').map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
     <label className="flex gap-2"><input type="checkbox" checked={enabled} onChange={event=>setEnabled(event.target.checked)} />Enabled</label>
-    <fieldset><legend>Monitors</legend><p className="text-sm">Select local monitors with checks. Gatus-managed monitors remain read-only.</p>{checks.data?.map(check=><label className="flex gap-2" key={check.id}><input type="checkbox" checked={checkIds.includes(check.id)} onChange={event=>setCheckIds(current=>event.target.checked?[...current,check.id]:current.filter(id=>id!==check.id))} />{check.name}</label>)}</fieldset>
+    <fieldset><legend>Monitors</legend><p className="text-sm">Select local monitors with checks. Gatus-managed monitors remain read-only.</p>{!checks.isFetchedAfterMount && <p role="status">Loading monitors…</p>}{checks.isFetchedAfterMount && !checks.isError && checks.data?.map(check=><label className="flex gap-2" key={check.id}><input type="checkbox" checked={checkIds.includes(check.id)} onChange={event=>{const selected=event.target.checked;setCheckIds(current=>selected?[...current,check.id]:current.filter(id=>id!==check.id));setCheckSnapshots(current=>{const next={...current};if(selected)next[check.id]=check;else delete next[check.id];return next})}} />{check.name}</label>)}
+      {checkIds.filter(id=>checks.isFetchedAfterMount && !checks.isError && !checks.data?.some(check=>check.id===id)).map(id=><p key={id} role="alert">A selected monitor is unavailable. <button type="button" className="underline" onClick={()=>{setCheckIds(current=>current.filter(value=>value!==id));setCheckSnapshots(current=>{const next={...current};delete next[id];return next})}}>Remove unavailable monitor</button></p>)}
+    </fieldset>
     {(destinations.isError||checks.isError||vaults.isError||secrets.isError) && <p role="alert">Could not load channel choices. Close and try again.</p>}{error && <p role="alert">{error}</p>}
-  </div><ModalFooter><button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="btn btn-primary" disabled={busy||!endpointId||!vaultId||!secretId}>{channel?'Save Channel':'Create Channel'}</button></ModalFooter></form></Modal>
+  </div><ModalFooter><button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="btn btn-primary" disabled={busy||!checks.isFetchedAfterMount||checks.isError||missingCheckSnapshots.length>0||!endpointId||!vaultId||!secretId}>{channel?'Save Channel':'Create Channel'}</button></ModalFooter></form></Modal>
 }

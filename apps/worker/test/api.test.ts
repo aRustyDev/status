@@ -577,6 +577,49 @@ test('check configuration requires an approved endpoint and rejects stale change
   assert.equal(Number((await db.prepare('SELECT expected_status FROM http_checks WHERE id=?').bind(created.body.id).first())?.expected_status), 204)
 })
 
+test('moving a check with actions or channels is rejected atomically until they are unlinked', async () => {
+  const previousEndpoints=env.ENDPOINTS
+  const endpoint = { id:'action-move-endpoint', name:'Action move endpoint', url:'https://api.example/action-move' }
+  env.ENDPOINTS=JSON.stringify([endpoint])
+  await db.prepare('INSERT INTO endpoint_registry(endpoint_id,fingerprint) VALUES (?,?)').bind(endpoint.id,await endpointFingerprint(endpoint)).run()
+  const first = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Action move original' })
+  const second = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Action move target' })
+  const config = { componentId:first.body.id, endpointId:endpoint.id, enabled:true, intervalMinutes:1, expectedStatus:200 }
+  const check = await request('/api/v1/admin/checks', adminToken, 'POST', config)
+  assert.equal(check.response.status, 201)
+  const checkId = check.body.id
+  await db.batch([
+    db.prepare("INSERT INTO worker_actions (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,trigger_status,created_at,updated_at) VALUES ('move-action','Move guard action','api','fingerprint',1,1,'all',0,0)"),
+    db.prepare('INSERT INTO worker_action_checks (action_id,check_id) VALUES (?,?)').bind('move-action',checkId),
+    db.prepare("INSERT INTO worker_action_outbox (id,action_id,action_version,check_id,check_version,scheduled_at,status,state,created_at,updated_at) VALUES ('move-job','move-action',1,?,1,100,'down','pending',0,0)").bind(checkId),
+    db.prepare("INSERT INTO notification_channels (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,created_at,updated_at) VALUES ('move-channel','Move guard channel','api','fingerprint',1,1,0,0)"),
+    db.prepare('INSERT INTO notification_channel_checks (channel_id,check_id) VALUES (?,?)').bind('move-channel',checkId),
+    db.prepare("INSERT INTO notification_outbox (id,channel_id,channel_version,check_id,check_version,scheduled_at,status,state,created_at,updated_at) VALUES ('move-notification','move-channel',1,?,1,100,'down','pending',0,0)").bind(checkId),
+  ])
+  const auditsBefore=Number((await db.prepare("SELECT count(*) AS count FROM audit_events WHERE entity_type='check' AND entity_id=?").bind(checkId).first())?.count)
+  const moved=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:1})
+  assert.equal(moved.response.status,409)
+  const keyedMove=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:1},'https://status.example',`${Date.now()}.${crypto.randomUUID()}`)
+  assert.equal(keyedMove.response.status,409)
+  const after=await db.prepare('SELECT component_id,config_version FROM http_checks WHERE id=?').bind(checkId).first<{component_id:string;config_version:number}>()
+  assert.equal(after?.component_id,first.body.id);assert.equal(after?.config_version,1)
+  assert.equal(Number((await db.prepare("SELECT count(*) AS count FROM audit_events WHERE entity_type='check' AND entity_id=?").bind(checkId).first())?.count),auditsBefore)
+  assert.equal((await db.prepare("SELECT state FROM worker_action_outbox WHERE id='move-job'").first())?.state,'pending')
+  assert.equal((await db.prepare("SELECT state FROM notification_outbox WHERE id='move-notification'").first())?.state,'pending')
+  const edited=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,expectedStatus:204,version:1})
+  assert.equal(edited.response.status,200)
+  await db.prepare('DELETE FROM worker_action_checks WHERE action_id=? AND check_id=?').bind('move-action',checkId).run()
+  const channelStillLinked=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:2})
+  assert.equal(channelStillLinked.response.status,409)
+  await db.prepare('DELETE FROM notification_channel_checks WHERE channel_id=? AND check_id=?').bind('move-channel',checkId).run()
+  const unlinkedMove=await request(`/api/v1/admin/checks/${checkId}`,adminToken,'PATCH',{...config,componentId:second.body.id,version:2})
+  assert.equal(unlinkedMove.response.status,200)
+  await db.prepare('DELETE FROM worker_actions WHERE id=?').bind('move-action').run()
+  await db.prepare('DELETE FROM notification_channels WHERE id=?').bind('move-channel').run()
+  await db.prepare('DELETE FROM http_checks WHERE id=?').bind(checkId).run()
+  env.ENDPOINTS=previousEndpoints
+})
+
 test('component status retains the worst manual, check and published incident impact', async () => {
   const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Aggregation', manualStatus: 'degraded' })
   const componentId = component.body.id

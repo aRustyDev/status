@@ -7,13 +7,13 @@ import CloudflareActions from './CloudflareActions'
 vi.mock('../api/client',()=>({api:{get:vi.fn(),post:vi.fn(),patch:vi.fn(),delete:vi.fn()}}))
 const checkId='00000000-0000-4000-8000-000000000001'
 const action={id:'00000000-0000-4000-8000-000000000002',name:'Recover',endpointId:'approved',vaultId:1,secretId:2,enabled:1,version:3,checkIds:[checkId],triggerStatus:'down'}
-function setup(){const client=new QueryClient({defaultOptions:{queries:{retry:false}}});render(<QueryClientProvider client={client}><CloudflareActions /></QueryClientProvider>);return userEvent.setup()}
+function setup(client=new QueryClient({defaultOptions:{queries:{retry:false}}})){render(<QueryClientProvider client={client}><CloudflareActions /></QueryClientProvider>);return userEvent.setup()}
 beforeEach(()=>{
  vi.resetAllMocks()
  vi.mocked(api.get).mockImplementation(async path=>{
   if(path==='/admin/actions') return [action]
   if(path==='/admin/actions/destinations') return [{id:'approved',name:'Approved action'}]
-  if(path==='/admin/actions/checks') return [{id:checkId,name:'Service'}]
+  if(path==='/admin/actions/checks') return [{id:checkId,name:'Service',componentId:'component',configVersion:7}]
   if(path==='/admin/vaults') return [{id:1,name:'Operations'}]
   if(path==='/admin/vaults/1/secrets') return [{id:2,name:'Token',type:'value'},{id:3,name:'Login',type:'userpass'}]
   return []
@@ -32,7 +32,7 @@ describe('Cloudflare actions',()=>{
   await user.click(await within(form).findByRole('checkbox',{name:'Service'}))
   vi.mocked(api.post).mockResolvedValueOnce({})
   await user.click(within(form).getByRole('button',{name:'Create Action'}))
-  await waitFor(()=>expect(api.post).toHaveBeenCalledWith('/admin/actions',{name:'Recover service',endpointId:'approved',vaultId:1,secretId:2,enabled:true,checkIds:[checkId],triggerStatus:'degraded'}))
+  await waitFor(()=>expect(api.post).toHaveBeenCalledWith('/admin/actions',{name:'Recover service',endpointId:'approved',vaultId:1,secretId:2,enabled:true,checkIds:[checkId],checkSnapshots:[{id:checkId,componentId:'component',configVersion:7}],triggerStatus:'degraded'}))
  })
  it('deletes only the displayed version and offers no manual execution',async()=>{
   const user=setup();await screen.findByText('Recover')
@@ -40,5 +40,17 @@ describe('Cloudflare actions',()=>{
   await user.click(screen.getByRole('button',{name:'Delete action Recover'}));vi.mocked(api.delete).mockResolvedValueOnce(undefined)
   await user.click(within(screen.getByRole('dialog')).getByRole('button',{name:'Delete'}))
   await waitFor(()=>expect(api.delete).toHaveBeenCalledWith(`/admin/actions/${action.id}`,{version:3}))
+ })
+ it('keeps the selected monitor snapshot if choices refresh while editing',async()=>{
+  const client=new QueryClient({defaultOptions:{queries:{retry:false}}}),user=setup(client)
+  await user.click(await screen.findByRole('button',{name:'Edit'}));const form=screen.getByRole('dialog')
+  await waitFor(()=>expect(within(form).getByRole('checkbox',{name:'Service'})).toBeChecked())
+  await waitFor(()=>expect(within(form).getByRole('button',{name:'Save Action'})).toBeEnabled())
+  client.setQueryData(['worker-action-checks'],[{id:checkId,name:'Moved service',componentId:'other',configVersion:8}])
+  await within(form).findByRole('checkbox',{name:'Moved service'})
+  vi.mocked(api.patch).mockRejectedValueOnce(new Error('Conflict'))
+  await user.click(within(form).getByRole('button',{name:'Save Action'}))
+  await waitFor(()=>expect(api.patch).toHaveBeenCalledWith(`/admin/actions/${action.id}`,expect.objectContaining({version:3,checkIds:[checkId],checkSnapshots:[{id:checkId,componentId:'component',configVersion:7}]})))
+  expect(await within(form).findByRole('alert')).toHaveTextContent('Could not save action')
  })
 })

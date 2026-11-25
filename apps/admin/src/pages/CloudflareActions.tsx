@@ -1,11 +1,13 @@
 // Adapts the upstream Actions page and Vault picker to the supported Workers webhook provider.
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Modal, ModalFooter } from '@better-forge/ui'
 import { api } from '../api/client'
 
 type Action = { id:string; name:string; endpointId:string; triggerStatus:string; vaultId:number; secretId:number; enabled:number; version:number; checkIds:string[] }
 type Choice = {id:string;name:string}
+type Check = Choice & {componentId:string;configVersion:number}
+type CheckSnapshot = Pick<Check,'id'|'componentId'|'configVersion'>
 type Vault = {id:number;name:string}
 type Secret = {id:number;name:string;type:string}
 type Delivery = {actionId:string;checkId:string;status:string;state:string;updatedAt:number}
@@ -46,14 +48,22 @@ function ActionForm({action,onClose,onSaved}:{action:Action|null;onClose:()=>voi
   const [name,setName]=useState(action?.name??''), [endpointId,setEndpointId]=useState(action?.endpointId??''), [vaultId,setVaultId]=useState(action?.vaultId??0), [secretId,setSecretId]=useState(action?.secretId??0)
   const [triggerStatus,setTriggerStatus]=useState(action?.triggerStatus??'down')
   const [enabled,setEnabled]=useState(action?.enabled!==0), [checkIds,setCheckIds]=useState<string[]>(action?.checkIds??[]), [busy,setBusy]=useState(false), [error,setError]=useState('')
+  const [checkSnapshots,setCheckSnapshots]=useState<CheckSnapshot[]>([]), initialChecksLoaded=useRef(false)
   const destinations=useQuery<Choice[]>({queryKey:['worker-action-destinations'],queryFn:()=>api.get('/admin/actions/destinations')})
-  const checks=useQuery<Choice[]>({queryKey:['worker-action-checks'],queryFn:()=>api.get('/admin/actions/checks')})
+  const checks=useQuery<Check[]>({queryKey:['worker-action-checks'],queryFn:()=>api.get('/admin/actions/checks'),refetchOnMount:'always'})
   const vaults=useQuery<Vault[]>({queryKey:['vaults'],queryFn:()=>api.get('/admin/vaults')})
   const secrets=useQuery<Secret[]>({queryKey:['vault-secrets',vaultId],queryFn:()=>api.get(`/admin/vaults/${vaultId}/secrets`),enabled:vaultId>0})
+  useEffect(()=>{
+    if (!checks.isFetchedAfterMount || !checks.data || initialChecksLoaded.current) return
+    initialChecksLoaded.current=true
+    setCheckSnapshots(checks.data.filter(check=>checkIds.includes(check.id)).map(({id,componentId,configVersion})=>({id,componentId,configVersion})))
+  },[checks.isFetchedAfterMount,checks.data,checkIds])
+  const missingCheckSnapshots=checkIds.filter(id=>!checkSnapshots.some(snapshot=>snapshot.id===id) || !checks.data?.some(check=>check.id===id))
   async function submit(event:FormEvent) {
     event.preventDefault(); setError(''); setBusy(true)
     try {
-      const payload={name,endpointId,vaultId,secretId,enabled,checkIds,triggerStatus,...(action?{version:action.version}:{})}
+      if (!checks.isFetchedAfterMount || checks.isError || missingCheckSnapshots.length) throw new Error('Selected monitors are unavailable')
+      const payload={name,endpointId,vaultId,secretId,enabled,checkIds,checkSnapshots,triggerStatus,...(action?{version:action.version}:{})}
       if (action) await api.patch(`/admin/actions/${action.id}`,payload)
       else await api.post('/admin/actions',payload)
       await onSaved()
@@ -68,7 +78,9 @@ function ActionForm({action,onClose,onSaved}:{action:Action|null;onClose:()=>voi
     <label className="block">Secure Value secret<select className="input-sig w-full" required disabled={!vaultId} value={secretId||''} onChange={event=>setSecretId(Number(event.target.value))}><option value="">— select secret —</option>{secrets.data?.filter(s=>s.type==='value').map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
     <label className="block">Trigger on<select className="input-sig w-full" value={triggerStatus} onChange={event=>setTriggerStatus(event.target.value)}><option value="down">Down</option><option value="degraded">Degraded</option><option value="up">Up</option><option value="all">Any status change</option></select></label>
     <label className="flex gap-2"><input type="checkbox" checked={enabled} onChange={event=>setEnabled(event.target.checked)} />Enabled</label>
-    <fieldset><legend>Monitors</legend><p className="text-sm">Select local monitors with checks. Gatus-managed monitors remain read-only.</p>{checks.data?.map(check=><label className="flex gap-2" key={check.id}><input type="checkbox" checked={checkIds.includes(check.id)} onChange={event=>setCheckIds(current=>event.target.checked?[...current,check.id]:current.filter(id=>id!==check.id))} />{check.name}</label>)}</fieldset>
+    <fieldset><legend>Monitors</legend><p className="text-sm">Select local monitors with checks. Gatus-managed monitors remain read-only.</p>{!checks.isFetchedAfterMount && <p role="status">Loading monitors…</p>}{checks.isFetchedAfterMount && !checks.isError && checks.data?.map(check=><label className="flex gap-2" key={check.id}><input type="checkbox" checked={checkIds.includes(check.id)} onChange={event=>{const selected=event.target.checked;setCheckIds(current=>selected?[...current,check.id]:current.filter(id=>id!==check.id));setCheckSnapshots(current=>selected?[...current,{id:check.id,componentId:check.componentId,configVersion:check.configVersion}]:current.filter(item=>item.id!==check.id))}} />{check.name}</label>)}
+      {checkIds.filter(id=>checks.isFetchedAfterMount && !checks.isError && !checks.data?.some(check=>check.id===id)).map(id=><p key={id} role="alert">A selected monitor is unavailable. <button type="button" className="underline" onClick={()=>{setCheckIds(current=>current.filter(value=>value!==id));setCheckSnapshots(current=>current.filter(snapshot=>snapshot.id!==id))}}>Remove unavailable monitor</button></p>)}
+    </fieldset>
     {(destinations.isError||checks.isError||vaults.isError||secrets.isError) && <p role="alert">Could not load action choices. Close and try again.</p>}{error && <p role="alert">{error}</p>}
-  </div><ModalFooter><button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="btn btn-primary" disabled={busy||!endpointId||!vaultId||!secretId}>{action?'Save Action':'Create Action'}</button></ModalFooter></form></Modal>
+  </div><ModalFooter><button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="btn btn-primary" disabled={busy||!checks.isFetchedAfterMount||checks.isError||missingCheckSnapshots.length>0||!endpointId||!vaultId||!secretId}>{action?'Save Action':'Create Action'}</button></ModalFooter></form></Modal>
 }

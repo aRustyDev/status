@@ -638,8 +638,9 @@ test('scheduler sends degraded transitions to configured channels and actions', 
   const bodies: unknown[]=[]
   const runtime={...env,VAULT_ENCRYPTION_KEY:key,MONITOR_AUTH_READY:'true',CHANNELS_READY:'true',CHANNEL_ENDPOINTS:destinations,ACTIONS_READY:'true',ACTION_ENDPOINTS:destinations,SINK:{fetch:async (_url:string,init:RequestInit)=>{bodies.push(JSON.parse(String(init.body))); return new Response(null,{status:200})}}}
   const common={endpointId:'sink',vaultId:vault.id,secretId:secret.id,enabled:true,checkIds:[checkId]}
-  assert.equal((await channelApi(req({...common,name:'Channel'}),runtime as never,actor,'/admin/notifications/channels')).status,201)
-  assert.equal((await actionApi(req({...common,name:'Action',triggerStatus:'degraded'}),runtime as never,actor,'/admin/actions')).status,201)
+  const selectedCheck=sqlite.prepare('SELECT component_id AS componentId,config_version AS configVersion FROM http_checks WHERE id=?').get(checkId) as {componentId:string;configVersion:number}
+  assert.equal((await channelApi(req({...common,name:'Channel',expectedChecks:[{id:checkId,componentId:selectedCheck.componentId,version:selectedCheck.configVersion}]}),runtime as never,actor,'/admin/notifications/channels')).status,201)
+  assert.equal((await actionApi(req({...common,name:'Action',triggerStatus:'degraded',checkSnapshots:[{id:checkId,...selectedCheck}]}),runtime as never,actor,'/admin/actions')).status,201)
   globalThis.fetch = async () => new Response('ready',{status:200})
   await runChecks(now,runtime as never)
   globalThis.fetch = async () => new Response('absent',{status:200})
@@ -817,7 +818,8 @@ test('first trustworthy observation after an initial credential fault or mainten
     const destinations = JSON.stringify([{ id: 'sink', name: 'Fixture', url: 'https://sink.internal/', binding: 'SINK', serviceId: 'sink-worker' }])
     const bodies: unknown[] = []
     const runtime = { ...env, VAULT_ENCRYPTION_KEY: key, MONITOR_AUTH_READY: 'true', CHANNELS_READY: 'true', CHANNEL_ENDPOINTS: destinations, SINK: { fetch: async (_url: string, init: RequestInit) => { bodies.push(JSON.parse(String(init.body))); return new Response(null, { status: 200 }) } } }
-    assert.equal((await channelApi(req({ name: 'Channel', endpointId: 'sink', vaultId: vault.id, secretId: token.id, enabled: true, checkIds: [checkId] }), runtime as never, actor, '/admin/notifications/channels')).status, 201)
+    const selectedCheck=sqlite.prepare('SELECT component_id AS componentId,config_version AS version FROM http_checks WHERE id=?').get(checkId) as {componentId:string;version:number}
+    assert.equal((await channelApi(req({ name: 'Channel', endpointId: 'sink', vaultId: vault.id, secretId: token.id, enabled: true, checkIds: [checkId], expectedChecks:[{id:checkId,...selectedCheck}] }), runtime as never, actor, '/admin/notifications/channels')).status, 201)
     if (reason === 'credential') sqlite.prepare('UPDATE http_checks SET advanced_config=? WHERE id=?').run(JSON.stringify({ auth: { type: 'basic', basic: { vault: { vaultId: vault.id, secretId: login.id } } } }), checkId)
     else sqlite.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(Date.now() - 1000, Date.now() + 60_000, Date.now(), Date.now())
     globalThis.fetch = async () => new Response(null, { status })
@@ -848,7 +850,8 @@ test('first observation after a configuration version change still establishes a
   const destinations = JSON.stringify([{ id: 'sink', name: 'Fixture', url: 'https://sink.internal/', binding: 'SINK', serviceId: 'sink-worker' }])
   let deliveries = 0
   const runtime = { ...env, VAULT_ENCRYPTION_KEY: key, CHANNELS_READY: 'true', CHANNEL_ENDPOINTS: destinations, SINK: { fetch: async () => { deliveries++; return new Response(null, { status: 200 }) } } }
-  await channelApi(req({ name: 'Channel', endpointId: 'sink', vaultId: vault.id, secretId: token.id, enabled: true, checkIds: [checkId] }), runtime as never, actor, '/admin/notifications/channels')
+  const selectedCheck=sqlite.prepare('SELECT component_id AS componentId,config_version AS version FROM http_checks WHERE id=?').get(checkId) as {componentId:string;version:number}
+  await channelApi(req({ name: 'Channel', endpointId: 'sink', vaultId: vault.id, secretId: token.id, enabled: true, checkIds: [checkId], expectedChecks:[{id:checkId,...selectedCheck}] }), runtime as never, actor, '/admin/notifications/channels')
   globalThis.fetch = async () => new Response(null, { status: 503 })
   await runChecks(now, runtime as never)
   assert.equal(deliveries, 0)

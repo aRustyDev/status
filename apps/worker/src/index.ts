@@ -561,7 +561,9 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
       return json({id:checkId,version:1},201)
     }
     const token = id()
-    const replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=?',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,version(body)),[audit(db,user,'update','check',recordId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus},{table:'http_checks',token})],receipt,recordId,Number(body.version)+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
+    // Links identify checks, not their owners. Do not let a move silently
+    // retarget an action or channel; guard inside the same transaction as the edit.
+    const replay = await mutate(db,stmt(db,'UPDATE http_checks SET component_id=?,endpoint_id=?,enabled=?,interval_minutes=?,expected_status=?,config_version=config_version+1,last_scheduled_at=NULL,last_result_at=NULL,last_status=NULL,mutation_key=? WHERE id=? AND config_version=? AND (component_id=? OR (NOT EXISTS (SELECT 1 FROM worker_action_checks WHERE check_id=http_checks.id) AND NOT EXISTS (SELECT 1 FROM notification_channel_checks WHERE check_id=http_checks.id)))',componentId,endpointId,body.enabled ? 1 : 0,body.intervalMinutes,body.expectedStatus,token,recordId,version(body),componentId),[audit(db,user,'update','check',recordId,{componentId,enabled:body.enabled,intervalMinutes:body.intervalMinutes,expectedStatus:body.expectedStatus},{table:'http_checks',token})],receipt,recordId,Number(body.version)+1,'SELECT 1 FROM http_checks WHERE id=? AND mutation_key=?',[recordId,token])
     if (replay) return replayReceipt(db, receipt!, replay)
     return json({id:recordId,version:Number(body.version)+1})
   }

@@ -35,7 +35,7 @@ async function setup(){
  const env={DB:db,ACTIONS_READY:'true',ACTION_ENDPOINTS:destinations,VAULT_ENCRYPTION_KEY:key,ACTION:{fetch:async(url:string,init:RequestInit)=>{calls.push({url,init});return status===204?new Response(null,{status}):new Response('private response',{status})}}} satisfies ActionEnvironment
  const vault=await (await vaultApi(request('POST',{name:'fixture'}),db,key,actor,'/admin/vaults')).json() as {id:number}
  const secret=await (await vaultApi(request('POST',{name:'token',type:'value',value:'fixture-token-one'}),db,key,actor,`/admin/vaults/${vault.id}/secrets`)).json() as {id:number}
- const actionBody={name:'Action',endpointId:'approved',vaultId:vault.id,secretId:secret.id,enabled:true,checkIds:[checkId],triggerStatus:'all'}
+ const actionBody={name:'Action',endpointId:'approved',vaultId:vault.id,secretId:secret.id,enabled:true,checkIds:[checkId],checkSnapshots:[{id:checkId,componentId:'component',configVersion:1}],triggerStatus:'all'}
  const action=await (await actionApi(request('POST',actionBody),env,actor,'/admin/actions')).json() as {id:string;version:number}
  return {local,db,env,calls,vault,secret,action,actionBody,setStatus:(v:number)=>{status=v}}
 }
@@ -67,6 +67,32 @@ test('actions use saved scoped credentials at an approved HTTPS target',async()=
  assert.equal(job.state,'completed')
  const audit=x.local.db.prepare("SELECT details FROM audit_events WHERE entity_type='action'").all()
  assert.doesNotMatch(JSON.stringify(audit),/fixture-token|private response/)
+})
+
+test('action saves atomically fence the selected monitor identity and check version',async()=>{
+ for(const method of ['POST','PATCH'] as const) for(const change of ['move','version'] as const) {
+  const x=await setup()
+  const choices=await (await actionApi(request('GET'),x.env,actor,'/admin/actions/checks')).json() as {id:string;componentId:string;configVersion:number}[]
+  assert.deepEqual(choices.map(({id,componentId,configVersion})=>({id,componentId,configVersion})),x.actionBody.checkSnapshots)
+  x.local.db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('other','Other',0)").run()
+  const auditBefore=x.local.db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_type='action'").get() as {n:number}
+  let changed=false
+  const racingDb={prepare:x.db.prepare.bind(x.db), async batch(statements:D1PreparedStatement[]) {
+   if(!changed) {
+    changed=true
+    if(change==='move') x.local.db.prepare("UPDATE http_checks SET component_id='other' WHERE id=?").run(checkId)
+    else x.local.db.prepare('UPDATE http_checks SET config_version=config_version+1 WHERE id=?').run(checkId)
+   }
+   return x.db.batch(statements)
+  }} as D1Database
+  const input={...x.actionBody,name:'Changed',...(method==='PATCH'?{version:x.action.version}:{})}
+  await assert.rejects(actionApi(request(method,input),{...x.env,DB:racingDb},actor,method==='PATCH'?`/admin/actions/${x.action.id}`:'/admin/actions'),(e:unknown)=>e instanceof ActionError&&e.status===409)
+  assert.equal(changed,true)
+  assert.deepEqual({...x.local.db.prepare('SELECT name,version FROM worker_actions WHERE id=?').get(x.action.id)},{name:'Action',version:1})
+  assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM worker_actions').get() as {n:number}).n,1)
+  assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM worker_action_checks WHERE action_id=? AND check_id=?').get(x.action.id,checkId) as {n:number}).n,1)
+  assert.equal((x.local.db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_type='action'").get() as {n:number}).n,auditBefore.n)
+ }
 })
 
 test('actions fail closed after configuration drift, key loss, rotation or deletion without leaking secrets',async()=>{
@@ -217,7 +243,7 @@ test('Workerd D1 concurrently dispatches a transition at most once', {skip:!proc
   const env={DB:db,ACTIONS_READY:'true',ACTION_ENDPOINTS:destinations,VAULT_ENCRYPTION_KEY:key,ACTION:{fetch:async()=>{calls++;return new Response(null,{status:204})}}} satisfies ActionEnvironment
   const vault=await (await vaultApi(request('POST',{name:'fixture'}),db,key,actor,'/admin/vaults')).json() as {id:number}
   const secret=await (await vaultApi(request('POST',{name:'token',type:'value',value:'fixture-token'}),db,key,actor,`/admin/vaults/${vault.id}/secrets`)).json() as {id:number}
-  await actionApi(request('POST',{name:'Action',endpointId:'approved',vaultId:vault.id,secretId:secret.id,enabled:true,checkIds:[checkId],triggerStatus:'down'}),env,actor,'/admin/actions')
+  await actionApi(request('POST',{name:'Action',endpointId:'approved',vaultId:vault.id,secretId:secret.id,enabled:true,checkIds:[checkId],checkSnapshots:[{id:checkId,componentId:'component',configVersion:1}],triggerStatus:'down'}),env,actor,'/admin/actions')
   async function save(){return db.batch([
    db.prepare("INSERT OR IGNORE INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,100,100,'down','down',500,4)").bind(checkId),
    enqueueActionTransition(db,checkId,1,'approved',100,'down'),
@@ -440,4 +466,66 @@ test('credential fault beginning during action preflight defers before invalidat
  }} as D1Database
  await flushActions({...x.env,DB:db});assert.equal(x.calls.length,0)
  assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'pending')
+})
+
+test('action no-op and rename retain the pending transition',async()=>{
+ const x=await setup();await queue(x)
+ const path=`/admin/actions/${x.action.id}`
+ const noop=await actionApi(request('PATCH',{...x.actionBody,version:1}),x.env,actor,path)
+ assert.equal((await noop.json() as {version:number}).version,1)
+ const renamed=await actionApi(request('PATCH',{...x.actionBody,name:'Renamed',version:1}),x.env,actor,path)
+ assert.equal((await renamed.json() as {version:number}).version,2)
+ assert.deepEqual({...x.local.db.prepare('SELECT state,action_version FROM worker_action_outbox').get()},{state:'pending',action_version:2})
+ await flushActions(x.env);assert.equal(x.calls.length,1)
+ assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox').get()?.state,'completed')
+})
+
+test('functional action edits do not carry pending transitions',async()=>{
+ const x=await setup();await queue(x)
+ await actionApi(request('PATCH',{...x.actionBody,triggerStatus:'up',version:1}),x.env,actor,`/admin/actions/${x.action.id}`)
+ assert.equal(x.local.db.prepare('SELECT action_version FROM worker_action_outbox').get()?.action_version,1)
+ await flushActions(x.env);assert.equal(x.calls.length,0)
+})
+
+test('concurrent action rename and functional edits have one version winner',async()=>{
+ const x=await setup();await queue(x);const path=`/admin/actions/${x.action.id}`
+ const results=await Promise.allSettled([
+  actionApi(request('PATCH',{...x.actionBody,name:'Renamed',version:1}),x.env,actor,path),
+  actionApi(request('PATCH',{...x.actionBody,triggerStatus:'up',version:1}),x.env,actor,path),
+ ])
+ assert.equal(results.filter(result=>result.status==='fulfilled').length,1)
+ const failure=results.find(result=>result.status==='rejected') as PromiseRejectedResult
+ assert.ok(failure.reason instanceof ActionError && failure.reason.status===409)
+ const row=x.local.db.prepare('SELECT name,version FROM worker_actions').get() as {name:string;version:number}
+ assert.equal(row.version,2)
+ assert.equal(x.local.db.prepare('SELECT action_version FROM worker_action_outbox').get()?.action_version,row.name==='Renamed'?2:1)
+})
+
+test('action rename during an in-flight send preserves its claim and never retries',async()=>{
+ const x=await setup();await queue(x)
+ let start!:()=>void,release!:()=>void,calls=0
+ const started=new Promise<void>(resolve=>{start=resolve}),blocked=new Promise<void>(resolve=>{release=resolve})
+ const env={...x.env,ACTION:{fetch:async()=>{calls++;start();await blocked;return new Response(null,{status:204})}}}
+ const flushing=flushActions(env);await started
+ await actionApi(request('PATCH',{...x.actionBody,name:'Renamed',version:1}),env,actor,`/admin/actions/${x.action.id}`)
+ assert.deepEqual({...x.local.db.prepare('SELECT state,action_version FROM worker_action_outbox').get()},{state:'executing',action_version:2})
+ release();await flushing;await flushActions(env)
+ assert.equal(calls,1);assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox').get()?.state,'completed')
+})
+
+test('action rename during claimed pre-send validation defers rather than discarding',async()=>{
+ const x=await setup();await queue(x);let renamed=false
+ const db={...x.db,prepare(sql:string){
+  const statement=x.db.prepare(sql)
+  if(renamed || !sql.includes('SELECT id,endpoint_id,endpoint_fingerprint,enabled,version FROM worker_actions')) return statement
+  return {bind(...values:unknown[]){statement.bind(...values);return this},async first(){
+   renamed=true
+   await actionApi(request('PATCH',{...x.actionBody,name:'Renamed',version:1}),x.env,actor,`/admin/actions/${x.action.id}`)
+   return statement.first()
+  }} as D1PreparedStatement
+ }} as D1Database
+ await flushActions({...x.env,DB:db})
+ assert.deepEqual({...x.local.db.prepare('SELECT state,action_version FROM worker_action_outbox').get()},{state:'pending',action_version:2})
+ assert.equal(x.calls.length,0)
+ await flushActions(x.env);assert.equal(x.calls.length,1)
 })

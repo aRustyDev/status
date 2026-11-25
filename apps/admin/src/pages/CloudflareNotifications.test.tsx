@@ -8,13 +8,13 @@ import CloudflareNotifications from './CloudflareNotifications'
 vi.mock('../api/client',()=>({api:{get:vi.fn(),post:vi.fn(),patch:vi.fn(),delete:vi.fn()}}))
 const checkId='00000000-0000-4000-8000-000000000001'
 const channel={id:'00000000-0000-4000-8000-000000000002',name:'Alerts',endpointId:'approved',vaultId:1,secretId:2,enabled:1,version:3,checkIds:[checkId]}
-function setup(){const client=new QueryClient({defaultOptions:{queries:{retry:false}}});render(<QueryClientProvider client={client}><CloudflareNotifications /></QueryClientProvider>);return userEvent.setup()}
+function setup(client=new QueryClient({defaultOptions:{queries:{retry:false}}})){render(<QueryClientProvider client={client}><CloudflareNotifications /></QueryClientProvider>);return userEvent.setup()}
 beforeEach(()=>{
   vi.resetAllMocks()
   vi.mocked(api.get).mockImplementation(async path=>{
     if(path==='/admin/notifications/channels') return [channel]
     if(path==='/admin/notifications/destinations') return [{id:'approved',name:'Approved webhook'}]
-    if(path==='/admin/notifications/checks') return [{id:checkId,name:'Service'}]
+    if(path==='/admin/notifications/checks') return [{id:checkId,name:'Service',componentId:'component',version:7}]
     if(path==='/admin/vaults') return [{id:1,name:'Operations'}]
     if(path==='/admin/vaults/1/secrets') return [{id:2,name:'Token',type:'value'},{id:3,name:'Login',type:'userpass'}]
     return []
@@ -38,7 +38,7 @@ describe('Cloudflare notification channels',()=>{
     await user.click(await within(form).findByRole('checkbox',{name:'Service'}))
     vi.mocked(api.post).mockResolvedValueOnce({})
     await user.click(within(form).getByRole('button',{name:'Create Channel'}))
-    await waitFor(()=>expect(api.post).toHaveBeenCalledWith('/admin/notifications/channels',{name:'New alerts',endpointId:'approved',vaultId:1,secretId:2,enabled:true,checkIds:[checkId]}))
+    await waitFor(()=>expect(api.post).toHaveBeenCalledWith('/admin/notifications/channels',{name:'New alerts',endpointId:'approved',vaultId:1,secretId:2,enabled:true,checkIds:[checkId],expectedChecks:[{id:checkId,componentId:'component',version:7}]}))
     expect(JSON.stringify(vi.mocked(api.post).mock.calls)).not.toMatch(/password|fixture-token/)
   })
   it('tests the saved version and reports only a generic error',async()=>{
@@ -54,5 +54,17 @@ describe('Cloudflare notification channels',()=>{
     vi.mocked(api.delete).mockResolvedValueOnce(undefined)
     await user.click(within(screen.getByRole('dialog')).getByRole('button',{name:'Delete'}))
     await waitFor(()=>expect(api.delete).toHaveBeenCalledWith(`/admin/notifications/channels/${channel.id}`,{version:3}))
+  })
+  it('keeps the selected monitor snapshot if choices refresh while editing',async()=>{
+    const client=new QueryClient({defaultOptions:{queries:{retry:false}}}),user=setup(client)
+    await user.click(await screen.findByRole('button',{name:'Edit'}));const form=screen.getByRole('dialog')
+    await waitFor(()=>expect(within(form).getByRole('checkbox',{name:'Service'})).toBeChecked())
+    await waitFor(()=>expect(within(form).getByRole('button',{name:'Save Channel'})).toBeEnabled())
+    client.setQueryData(['worker-channel-checks'],[{id:checkId,name:'Moved service',componentId:'other',version:8}])
+    await within(form).findByRole('checkbox',{name:'Moved service'})
+    vi.mocked(api.patch).mockRejectedValueOnce(new Error('Conflict'))
+    await user.click(within(form).getByRole('button',{name:'Save Channel'}))
+    await waitFor(()=>expect(api.patch).toHaveBeenCalledWith(`/admin/notifications/channels/${channel.id}`,expect.objectContaining({version:3,checkIds:[checkId],expectedChecks:[{id:checkId,componentId:'component',version:7}]})))
+    expect(await within(form).findByRole('alert')).toHaveTextContent('Could not save channel')
   })
 })
