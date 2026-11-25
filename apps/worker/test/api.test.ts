@@ -68,7 +68,7 @@ let db: TestDatabase = sqlite
 let miniflare: Miniflare | undefined
 const issuer = 'https://test.cloudflareaccess.com'
 const audience = 'status-test'
-const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> } } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
+const env: { DB: TestDatabase; ASSETS: { fetch: () => Promise<Response> }; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string; ENDPOINTS: string; GATUS?: { fetch: (request: Request) => Promise<Response> }; GATUS_REQUIRED?: string; PROBE?: { fetch: (request: Request) => Promise<Response> }; BACKUPS?: { fetch: (request: Request) => Promise<Response> }; BACKUPS_READY?: string } = { DB: db, ASSETS: { fetch: async () => new Response('asset') }, ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: audience, ENDPOINTS: '[]' }
 const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
@@ -141,6 +141,36 @@ test('Access identity, roles and same-origin mutations are enforced', async () =
   assert.equal((await request('/api/v1/admin/users', operatorToken)).response.status, 403)
   assert.equal((await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'API' }, 'https://evil.example')).response.status, 403)
   assert.equal((await request('/api/v1/admin/users', adminToken)).response.status, 200)
+})
+
+test('backup service stays capability-gated, administrator-only and idempotent', async () => {
+  const path = '/api/v1/bsp/admin/backups'
+  assert.equal((await request(path, adminToken)).response.status, 503)
+  const ids: string[] = []
+  const queries: string[] = []
+  env.BACKUPS_READY = 'true'
+  env.BACKUPS = { fetch: async incoming => {
+    if (incoming.method === 'POST') { ids.push(incoming.headers.get('x-backup-id') ?? ''); return Response.json({ id: ids.at(-1) }, { status: 202 }) }
+    queries.push(new URL(incoming.url).search)
+    return Response.json({ backups: [], nextCursor: null })
+  } }
+  try {
+    const capabilities = (await request('/api/v1/bsp/capabilities', adminToken)).body as unknown as {supportedRoutes:string[]}
+    assert.ok(capabilities.supportedRoutes.includes('/admin/backups'))
+    assert.equal((await request(path, viewerToken)).response.status, 403)
+    assert.equal((await request(path, operatorToken)).response.status, 403)
+    assert.equal((await request(path, adminToken)).response.status, 200)
+    assert.equal((await request(`${path}?cursor=next-page`, adminToken)).response.status, 200)
+    assert.equal(queries.at(-1), '?cursor=next-page')
+    assert.equal((await request(path, adminToken, 'POST', {})).response.status, 400)
+    const key = `${Date.now()}.${crypto.randomUUID()}`
+    assert.equal((await request(path, adminToken, 'POST', {}, 'https://evil.example', key)).response.status, 403)
+    assert.equal((await request(path, adminToken, 'POST', {}, 'https://status.example', key)).response.status, 202)
+    assert.equal((await request(path, adminToken, 'POST', {}, 'https://status.example', key)).response.status, 202)
+    assert.match(ids[0], /^[a-f0-9]{64}$/); assert.equal(ids[0], ids[1])
+    const events = await db.prepare("SELECT action FROM audit_events WHERE entity_type='backup' AND entity_id=?").bind(ids[0]).all<{action:string}>()
+    assert.deepEqual(events.results.map(row => row.action), ['create'])
+  } finally { delete env.BACKUPS; delete env.BACKUPS_READY }
 })
 
 test('audit log is admin-only, paginated, filtered and redacts legacy sensitive details', async () => {

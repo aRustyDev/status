@@ -24,7 +24,8 @@
         "ACCESS_TEAM_DOMAIN": "REPLACE_ACCESS_TEAM_DOMAIN",
         "ACCESS_AUD": "REPLACE_ACCESS_AUDIENCE",
         "ENDPOINTS": "[]",
-        "API_SCOPE": "operations"
+        "API_SCOPE": "operations",
+        "BACKUPS_READY": "false"
       },
       "d1_databases": [
         {

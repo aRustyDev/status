@@ -13,6 +13,7 @@ const Incidents = lazy(() => import('./pages/Incidents'))
 const Maintenance = lazy(() => import('./pages/Maintenance'))
 const Users = lazy(() => import('./pages/Users'))
 const Audit = lazy(() => import('./pages/AuditLog'))
+const Backups = lazy(() => import('./pages/Backups'))
 
 type Identity = { id: string; email: string; role: 'viewer' | 'operator' | 'admin'; serverTime?: number }
 
@@ -134,6 +135,7 @@ export default function App() {
             <Route path="maintenance" element={capabilities.supportedRoutes.includes("/admin/maintenance") ? <Maintenance /> : <Unavailable />} />
             <Route path="users" element={identity.role === 'admin' ? <Users /> : <Unavailable />} />
             <Route path="audit-log" element={identity.role === 'admin' ? <Audit /> : <Unavailable />} />
+            <Route path="backups" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/backups') ? <Backups /> : <Unavailable />} />
             <Route path="*" element={<Unavailable />} />
           </Route>
           <Route path="*" element={<Navigate to="/admin/" replace />} />
