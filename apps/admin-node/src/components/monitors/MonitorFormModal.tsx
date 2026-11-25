@@ -26,6 +26,9 @@ export interface CloudflareProfile {
   isAdmin: boolean
   monitorAuth?: boolean
   monitorAlerts?: boolean
+  monitorDependencies?: boolean
+  dependencyMonitors?: { id: number; name: string }[]
+  dependsOnIds?: number[]
   alertChannels?: ChannelOption<string>[]
   alertChannelIds?: string[]
   listVaults?: () => Promise<VaultSummary[]>
@@ -39,7 +42,7 @@ export interface CloudflareProfile {
   manualStatus: string
   position: number
   history?: React.ReactNode
-  save: (draft: { name: string; manualStatus: string; position: number; tags: MonitorTag[]; channelIds?: string[]; expectedChannelIds?: string[]; check?: Record<string, unknown> }) => Promise<void>
+  save: (draft: { name: string; manualStatus: string; position: number; tags: MonitorTag[]; channelIds?: string[]; expectedChannelIds?: string[]; dependsOnIds?: number[]; check?: Record<string, unknown> }) => Promise<void>
   test: (draft: { endpointId: string; expectedStatus: number; advancedConfig: Record<string, unknown>; checkId?: string; checkVersion?: number }) => Promise<TestResult>
 }
 
@@ -141,7 +144,8 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   const [availableActions, setAvailableActions] = useState<Action[] | null>(null)
   const [actionLinks, setActionLinks]           = useState<MonitorAction[] | null>(monitor ? null : [])
   const [allMonitors, setAllMonitors]       = useState<{ id: number; name: string }[]>([])
-  const [selectedDependsOnIds, setSelectedDependsOnIds] = useState<Set<number>>(new Set())
+  const [initialDependsOnIds] = useState(() => cloudflare?.dependsOnIds ?? [])
+  const [selectedDependsOnIds, setSelectedDependsOnIds] = useState<Set<number>>(() => new Set(initialDependsOnIds))
 
   useEffect(() => {
     if (cloudflare) return
@@ -321,7 +325,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         const check = cloudflare.isAdmin && endpointId && !(basicUnchanged && advancedUnchanged) ? { ...(previous ? { id: previous.id, version: previous.version } : {}), endpointId, enabled, intervalMinutes: intervalSecs / 60, expectedStatus: Number(config['expectedStatus'] ?? 200), advancedConfig: previous && advancedUnchanged ? previous.advancedConfig ?? null : advanced } : undefined
         const channelIds = [...selectedAlertChannelIds]
         const alertsChanged = cloudflare.monitorAlerts && comparable([...channelIds].sort()) !== comparable([...initialAlertChannelIds].sort())
-        await cloudflare.save({ name, manualStatus, position, tags, ...(alertsChanged ? { channelIds, ...(isEdit ? { expectedChannelIds: initialAlertChannelIds } : {}) } : {}), ...(check ? { check } : {}) })
+        const dependsOnIds = [...selectedDependsOnIds]
+        const dependenciesChanged = cloudflare.monitorDependencies && comparable([...dependsOnIds].sort((a, b) => a - b)) !== comparable([...initialDependsOnIds].sort((a, b) => a - b))
+        await cloudflare.save({ name, manualStatus, position, tags, ...(dependenciesChanged ? { dependsOnIds } : {}), ...(alertsChanged ? { channelIds, ...(isEdit ? { expectedChannelIds: initialAlertChannelIds } : {}) } : {}), ...(check ? { check } : {}) })
         onSaved()
       } catch (err) { setError(err instanceof Error ? err.message : 'Save failed') } finally { setLoading(false) }
       return
@@ -524,13 +530,15 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
           {sidePanel === 'actions' && availableActions !== null && actionLinks !== null && (
             <ActionsSection actions={availableActions} links={actionLinks} onChange={setActionLinks} />
           )}
-          {sidePanel === 'dependencies' && (
+          {sidePanel === 'dependencies' && <>
             <DependenciesSection
-              monitors={allMonitors.filter((m) => m.id !== monitor?.id)}
+              monitors={(cloudflare ? cloudflare.dependencyMonitors ?? [] : allMonitors).filter((m) => m.id !== monitor?.id)}
               selected={selectedDependsOnIds}
               onChange={setSelectedDependsOnIds}
+              cloudflare={!!cloudflare}
             />
-          )}
+            {cloudflare && [...selectedDependsOnIds].filter(id => !(cloudflare.dependencyMonitors ?? []).some(item => item.id === id)).map(id => <p key={id} role="alert">A selected dependency is unavailable. <button type="button" className="underline" onClick={() => setSelectedDependsOnIds(prev => { const next = new Set(prev); next.delete(id); return next })}>Remove unavailable dependency</button></p>)}
+          </>}
           {sidePanel === 'incident' && (
             <AutoIncidentSection values={autoIncident} onChange={(p) => setAutoIncident((prev) => ({ ...prev, ...p }))} />
           )}
@@ -541,7 +549,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
 
       {/* ── Vertical tab strip ──────────────────────────────────────────── */}
       {cloudflare
-        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} canEditAuth={cloudflare.isAdmin && !!cloudflare.monitorAuth} canEditAlerts={cloudflare.isAdmin && !!cloudflare.monitorAlerts} checkCount={checkCount} tagCount={tags.length} alertCount={selectedAlertChannelIds.size} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
+        ? <CloudflareSideTabStrip meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} canEditChecks={cloudflare.isAdmin} canEditAuth={cloudflare.isAdmin && !!cloudflare.monitorAuth} canEditAlerts={cloudflare.isAdmin && !!cloudflare.monitorAlerts} canEditDependencies={cloudflare.isAdmin && !!cloudflare.monitorDependencies} dependencyCount={selectedDependsOnIds.size} checkCount={checkCount} tagCount={tags.length} alertCount={selectedAlertChannelIds.size} className={cloudflare.statusUnavailable ? 'hidden' : undefined} />
         : <SideTabStrip tabs={sideTabs} meta={PANEL_META} active={sidePanel} onToggle={setSidePanel} layout="responsive" />}
 
       </div>{/* outer flex row */}

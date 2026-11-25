@@ -8,6 +8,7 @@ import { enqueueActionTransition, flushActions } from '../../worker/src/actions-
 type Check = {
   id: string
   endpoint_id: string
+  component_id: string
   interval_minutes: number
   expected_status: number
   config_version: number
@@ -127,7 +128,7 @@ async function advancedProbe(check: Check, env: Environment, approved: ReadonlyM
   return { status: result.status === 'up' ? 'up' : 'down', effectiveStatus: result.status, httpStatus: result.httpStatus, latencyMs: result.responseMs ?? 0, completedAt: Date.now(), ...(result.reasons.includes('credential_unavailable') ? { credentialUnavailable: true } : {}) }
 }
 
-async function saveResult(db: D1Database, check: Check, fingerprint: string, scheduledAt: number, result: Result, env: Environment): Promise<boolean> {
+async function saveResult(db: D1Database, check: Check, fingerprint: string, scheduledAt: number, result: Result, env: Environment, validEndpoints: string): Promise<boolean> {
   const results = await db.batch([
     db.prepare(`INSERT OR IGNORE INTO http_check_results
       (check_id, config_version, scheduled_at, completed_at, status, effective_status, http_status, latency_ms)
@@ -135,6 +136,25 @@ async function saveResult(db: D1Database, check: Check, fingerprint: string, sch
       WHERE id = ? AND enabled = 1 AND config_version = ?
       AND EXISTS (SELECT 1 FROM endpoint_registry WHERE endpoint_id = http_checks.endpoint_id AND fingerprint = ?)`)
       .bind(scheduledAt, result.completedAt, result.status, result.effectiveStatus, result.httpStatus, result.latencyMs, check.id, check.config_version, fingerprint),
+    db.prepare(`UPDATE http_check_results SET dependency_causes = COALESCE((
+      SELECT json_group_array(d.depends_on_id) FROM monitor_dependencies d
+      JOIN http_checks prerequisite ON prerequisite.component_id=d.depends_on_id
+      JOIN endpoint_registry registry ON registry.endpoint_id=prerequisite.endpoint_id
+      JOIN json_each(?) approved ON json_extract(approved.value, '$.id')=prerequisite.endpoint_id
+        AND json_extract(approved.value, '$.fingerprint')=registry.fingerprint
+      WHERE d.dependent_id=(SELECT component_id FROM http_checks WHERE id=?)
+        AND prerequisite.enabled=1 AND prerequisite.transition_suppressed=0
+        AND prerequisite.last_result_at IS NOT NULL AND prerequisite.last_result_at>=? - prerequisite.interval_minutes*180000
+        AND (CASE WHEN prerequisite.dependency_scheduled_at=prerequisite.last_scheduled_at AND prerequisite.dependency_affected=1 THEN 'affected'
+          WHEN prerequisite.last_effective_scheduled_at=prerequisite.last_scheduled_at THEN COALESCE(prerequisite.last_effective_status,prerequisite.last_status)
+          ELSE prerequisite.last_status END) IN ('down','degraded','affected')
+    ), '[]') WHERE check_id=? AND config_version=? AND scheduled_at=? AND ?=0
+      AND EXISTS (SELECT 1 FROM http_checks WHERE id=? AND (last_scheduled_at IS NULL OR last_scheduled_at<?))`)
+      .bind(validEndpoints, check.id, result.completedAt, check.id, check.config_version, scheduledAt, result.credentialUnavailable ? 1 : 0, check.id, scheduledAt),
+    db.prepare(`UPDATE http_check_results SET dependency_affected=CASE WHEN json_array_length(dependency_causes)>0 THEN 1 ELSE 0 END
+      WHERE check_id=? AND config_version=? AND scheduled_at=? AND EXISTS
+        (SELECT 1 FROM http_checks WHERE id=? AND (last_scheduled_at IS NULL OR last_scheduled_at<?))`)
+      .bind(check.id, check.config_version, scheduledAt, check.id, scheduledAt),
     ...(!result.credentialUnavailable && channelsReady(env) ? [enqueueTransition(db, check.id, check.config_version, fingerprint, scheduledAt, result.effectiveStatus, result.completedAt)] : []),
     ...(!result.credentialUnavailable && env.ACTIONS_READY === 'true' && typeof env.ACTION_ENDPOINTS === 'string' && env.ACTION_ENDPOINTS ? [enqueueActionTransition(db, check.id, check.config_version, fingerprint, scheduledAt, result.effectiveStatus, result.completedAt)] : []),
     db.prepare(`UPDATE http_checks SET transition_suppressed = ?, last_scheduled_at = ?,
@@ -142,15 +162,33 @@ async function saveResult(db: D1Database, check: Check, fingerprint: string, sch
       last_status = (SELECT status FROM http_check_results WHERE check_id = ? AND config_version = ? AND scheduled_at = ?),
       last_effective_status = (SELECT effective_status FROM http_check_results WHERE check_id = ? AND config_version = ? AND scheduled_at = ?),
       last_effective_scheduled_at = ?,
+      dependency_affected = (SELECT dependency_affected FROM http_check_results WHERE check_id = ? AND config_version = ? AND scheduled_at = ?),
+      dependency_causes = (SELECT dependency_causes FROM http_check_results WHERE check_id = ? AND config_version = ? AND scheduled_at = ?),
+      dependency_scheduled_at = ?,
       last_http_status = (SELECT http_status FROM http_check_results WHERE check_id = ? AND config_version = ? AND scheduled_at = ?),
       last_latency_ms = (SELECT latency_ms FROM http_check_results WHERE check_id = ? AND config_version = ? AND scheduled_at = ?)
       WHERE id = ? AND enabled = 1 AND config_version = ? AND (last_scheduled_at IS NULL OR last_scheduled_at < ?)
       AND EXISTS (SELECT 1 FROM http_check_results WHERE check_id = ? AND config_version = ? AND scheduled_at = ?)
       AND EXISTS (SELECT 1 FROM endpoint_registry WHERE endpoint_id = http_checks.endpoint_id AND fingerprint = ?)`)
-      .bind(result.credentialUnavailable ? 1 : 0, scheduledAt, check.id, check.config_version, scheduledAt, check.id, check.config_version, scheduledAt,
-        check.id, check.config_version, scheduledAt, scheduledAt, check.id, check.config_version, scheduledAt,
+      .bind(result.credentialUnavailable ? 1 : 0, scheduledAt,
         check.id, check.config_version, scheduledAt,
-        check.id, check.config_version, scheduledAt, check.id, check.config_version, scheduledAt, fingerprint),
+        check.id, check.config_version, scheduledAt,
+        check.id, check.config_version, scheduledAt, scheduledAt,
+        check.id, check.config_version, scheduledAt,
+        check.id, check.config_version, scheduledAt, scheduledAt,
+        check.id, check.config_version, scheduledAt,
+        check.id, check.config_version, scheduledAt,
+        check.id, check.config_version, scheduledAt,
+        check.id, check.config_version, scheduledAt, fingerprint),
+    ...(!result.credentialUnavailable ? [db.prepare(`INSERT INTO notification_transition_state (check_id,check_version,status)
+      SELECT h.id,h.config_version,CASE WHEN h.dependency_affected=1 THEN 'affected' ELSE ? END
+      FROM http_checks h WHERE h.id=? AND h.config_version=? AND h.last_scheduled_at=?
+      AND EXISTS (SELECT 1 FROM http_check_results r WHERE r.check_id=h.id AND r.config_version=h.config_version AND r.scheduled_at=? AND COALESCE(r.effective_status,r.status)=?)
+      AND NOT EXISTS (SELECT 1 FROM maintenance m WHERE m.cancelled=0 AND m.starts_at<=? AND m.ends_at>?
+        AND (NOT EXISTS (SELECT 1 FROM maintenance_components mc WHERE mc.maintenance_id=m.id)
+          OR EXISTS (SELECT 1 FROM maintenance_components mc WHERE mc.maintenance_id=m.id AND mc.component_id=h.component_id)))
+      ON CONFLICT(check_id) DO UPDATE SET generation=notification_transition_state.generation + CASE WHEN notification_transition_state.check_version<>excluded.check_version OR notification_transition_state.status<>excluded.status THEN 1 ELSE 0 END,check_version=excluded.check_version,status=excluded.status`)
+      .bind(result.effectiveStatus,check.id,check.config_version,scheduledAt,scheduledAt,result.effectiveStatus,result.completedAt,result.completedAt)] : []),
     ...(!result.credentialUnavailable ? [db.prepare(`INSERT INTO automation_transition_state (check_id,check_version,status)
       SELECT h.id,h.config_version,? FROM http_checks h WHERE h.id=? AND h.config_version=? AND h.last_scheduled_at=?
       AND EXISTS (SELECT 1 FROM http_check_results r WHERE r.check_id=h.id AND r.config_version=h.config_version AND r.scheduled_at=? AND COALESCE(r.effective_status,r.status)=?)
@@ -168,11 +206,18 @@ export async function runChecks(scheduledTime: number, env: Environment): Promis
   const registry = await env.DB.prepare('SELECT endpoint_id, fingerprint FROM endpoint_registry').all<{endpoint_id:string;fingerprint:string}>()
   const current = new Map(registry.results.map(row => [row.endpoint_id, row.fingerprint]))
   const scheduledAt = Math.floor(scheduledTime / 60_000) * 60_000
-  const rows = await env.DB.prepare('SELECT id, endpoint_id, interval_minutes, expected_status, config_version, last_scheduled_at, advanced_config FROM http_checks WHERE enabled = 1 ORDER BY id').all<Check>()
+  const rows = await env.DB.prepare('SELECT id, component_id, endpoint_id, interval_minutes, expected_status, config_version, last_scheduled_at, advanced_config FROM http_checks WHERE enabled = 1 ORDER BY id').all<Check>()
   const due = rows.results.filter(check =>
     (check.last_scheduled_at === null || scheduledAt - check.last_scheduled_at >= check.interval_minutes * 60_000))
-  for (let i = 0; i < due.length; i += 4) {
-    await Promise.all(due.slice(i, i + 4).map(async check => {
+  const validEndpoints = JSON.stringify(await Promise.all([...approved.values()].map(async endpoint => ({ id: endpoint.id, fingerprint: await endpointFingerprint(endpoint) }))))
+  const edges = await env.DB.prepare('SELECT dependent_id, depends_on_id FROM monitor_dependencies').all<{dependent_id:string;depends_on_id:string}>()
+  const remaining = new Map(due.map(check => [check.component_id, check]))
+  while (remaining.size) {
+    const ready = [...remaining.values()].filter(check => !edges.results.some(edge => edge.dependent_id === check.component_id && remaining.has(edge.depends_on_id)))
+    if (!ready.length) throw new Error('Monitor dependency cycle detected')
+    for (const check of ready) remaining.delete(check.component_id)
+    for (let i = 0; i < ready.length; i += 4) {
+    await Promise.all(ready.slice(i, i + 4).map(async check => {
       const endpoint = approved.get(check.endpoint_id)
       if (!endpoint) {
         console.error(JSON.stringify({ event: 'probe_endpoint_missing', endpointId: check.endpoint_id }))
@@ -190,10 +235,11 @@ export async function runChecks(scheduledTime: number, env: Environment): Promis
         console.error(JSON.stringify({ event: 'probe_config_invalid', endpointId: check.endpoint_id }))
         return
       }
-      const saved = await saveResult(env.DB, check, fingerprint, scheduledAt, result, env)
+      const saved = await saveResult(env.DB, check, fingerprint, scheduledAt, result, env, validEndpoints)
       if (saved && result.credentialUnavailable) console.warn(JSON.stringify({ event: 'probe_credential_unavailable', checkId: check.id }))
       console.log(JSON.stringify({ event: saved ? 'probe_completed' : 'probe_discarded', endpointId: endpoint.id, status: result.status }))
     }))
+    }
   }
   if (channelsReady(env)) await flushChannelDeliveries(env as Parameters<typeof flushChannelDeliveries>[0])
   if (env.ACTIONS_READY === 'true' && typeof env.ACTION_ENDPOINTS === 'string' && env.ACTION_ENDPOINTS) await flushActions(env as Parameters<typeof flushActions>[0])
