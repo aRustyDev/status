@@ -115,19 +115,22 @@ test('email failure is not retried and an expired claim is never resent', async 
 
 test('email jobs that expire after selection cannot be claimed', async () => {
   const x = await fixture(); await x.transition(100, 'down')
-  const db = { prepare(sql: string) {
-    const statement = x.db.prepare(sql)
-    if (!sql.includes("WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?")) return statement
-    return { bind(...values: unknown[]) {
-      // Age the selected job past the runtime's exact claim cutoff, without
-      // relying on how long elapsed since the cutoff was sampled.
-      x.local.sqlite.prepare('UPDATE notification_outbox SET created_at=?').run(Number(values[3])-1)
-      return statement.bind(...values)
-    } } as D1PreparedStatement
-  }, batch: x.db.batch.bind(x.db) } as D1Database
-  await flushChannelDeliveries({ ...x.env, DB: db })
-  assert.equal(x.calls.length, 0)
-  assert.deepEqual({ ...x.local.sqlite.prepare('SELECT state,attempts FROM notification_outbox').get() }, { state:'failed', attempts:0 })
+  const realNow = Date.now; let now = realNow(), selected = 0
+  x.local.sqlite.prepare('UPDATE notification_outbox SET created_at=?').run(now-3_599_000)
+  try {
+    Date.now = () => now
+    const db = { prepare(sql: string) {
+      const statement = x.db.prepare(sql)
+      if (!sql.includes('SELECT o.id,o.channel_id,o.channel_version,o.check_id')) return statement
+      return { bind(...values: unknown[]) { statement.bind(...values); return this }, async all() {
+        const result = await statement.all(); selected = result.results.length; now += 2_000; return result
+      } } as D1PreparedStatement
+    }, batch: x.db.batch.bind(x.db) } as D1Database
+    await flushChannelDeliveries({ ...x.env, DB: db })
+    assert.equal(selected, 1)
+    assert.equal(x.calls.length, 0)
+    assert.deepEqual({ ...x.local.sqlite.prepare('SELECT state,attempts FROM notification_outbox').get() }, { state:'failed', attempts:0 })
+  } finally { Date.now = realNow }
 })
 
 test('email final preflight defers on a lost lease, an expired job, a slow read, or maintenance starting during the read', async () => {
