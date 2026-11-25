@@ -86,6 +86,9 @@ async function evaluateConfigured(check: Check, config: HttpMonitorConfig, env: 
     const current = await env.DB.prepare('SELECT endpoint_id, advanced_config FROM http_checks WHERE id=? AND config_version=?').bind(check.id, check.config_version).first<{endpoint_id:string;advanced_config:string | null}>()
     if (!current || current.endpoint_id !== check.endpoint_id || current.advanced_config !== check.advanced_config) return unavailable()
     const bytes = new TextEncoder().encode(`${credentials.username}:${credentials.password}`)
+    // Match the configured-header limit before encoding: oversized credentials
+    // are a local configuration fault, not a remote outage or automation event.
+    if (6 + 4 * Math.ceil(bytes.length / 3) > 8192) return unavailable()
     authorization = `Basic ${btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''))}`
     credential = credentials
     } catch { return unavailable() }

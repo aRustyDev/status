@@ -529,10 +529,18 @@ test('saved Basic Vault credentials are resolved only for the configured check a
   await putCredential({ username:'rotated', password:'synthetic-password-2' })
   await worker.fetch(req({checkId:'check-0',checkVersion}),runtime as never)
   assert.notEqual(seen[2],seen[1])
+  await putCredential({username:'u',password:'x'.repeat(6136)})
+  const boundary = await worker.fetch(req({checkId:'check-0',checkVersion}),runtime as never)
+  assert.match(await boundary.text(),/HTTP check passed/)
+  assert.equal(seen[3]?.length,8190)
+  await putCredential({username:'u',password:'x'.repeat(6137)})
+  const oversized = await worker.fetch(req({checkId:'check-0',checkVersion}),runtime as never)
+  assert.match(await oversized.text(),/credential_unavailable/)
+  assert.equal(seen.length,4)
   sqlite.prepare('DELETE FROM vault_secrets WHERE id=2').run()
   const missing = await worker.fetch(req({checkId:'check-0',checkVersion}),runtime as never)
   assert.match(await missing.text(),/credential_unavailable/)
-  assert.equal(seen.length,3)
+  assert.equal(seen.length,4)
   const warnings: string[] = []
   const originalWarn = console.warn
   try {
@@ -542,7 +550,7 @@ test('saved Basic Vault credentials are resolved only for the configured check a
   assert.deepEqual(warnings.map(value => JSON.parse(value)), [{event:'probe_credential_unavailable',checkId:'check-0'}])
   assert.doesNotMatch(warnings.join(' '),/synthetic-password|user-λ|example\.com/)
   assert.equal(sqlite.prepare('SELECT last_status FROM http_checks WHERE id=?').get('check-0')?.last_status,'down')
-  assert.equal(seen.length,3)
+  assert.equal(seen.length,4)
   sqlite.close()
 })
 
@@ -679,6 +687,32 @@ test('scheduler sends degraded transitions to configured channels and actions', 
   await runChecks(now+360_000,runtime as never)
   assert.equal(bodies.length,5)
   assert.equal((bodies[4] as {status:string}).status,'up')
+  assert.equal(sqlite.prepare('SELECT transition_suppressed FROM http_checks WHERE id=?').get(checkId)?.transition_suppressed,0)
+
+  // Vault accepts this string, but UTF-8 and Base64 produce a header over the
+  // transport limit. Neither Test nor the scheduler may transmit or automate it.
+  const rotate=(version:number,password:string)=>new Request('https://status.example/',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({version,userpass:{username:'fixture',password}})})
+  assert.equal((await vaultApi(rotate(1,'界'.repeat(3000)),env.DB as never,key,actor,`/admin/vaults/${vault.id}/secrets/${login.id}`)).status,200)
+  const checkVersion=Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get(checkId)?.config_version)
+  const beforeOversized=monitoredCalls, oversizedWarnings:string[]=[]
+  const counts=()=>({channels:sqlite.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get()?.n,actions:sqlite.prepare('SELECT COUNT(*) AS n FROM worker_action_outbox').get()?.n})
+  const beforeJobs=counts()
+  const testResponse=await worker.fetch(new Request('https://probe.internal/test',{method:'POST',body:JSON.stringify({checkId,checkVersion})}),runtime as never)
+  assert.match(await testResponse.text(),/credential_unavailable/)
+  const warn=console.warn
+  try {
+    console.warn=(...args:unknown[])=>{oversizedWarnings.push(args.map(String).join(' '))}
+    await runChecks(now+420_000,runtime as never)
+  } finally { console.warn=warn }
+  assert.equal(monitoredCalls,beforeOversized)
+  assert.equal(bodies.length,5)
+  assert.deepEqual(counts(),beforeJobs)
+  assert.deepEqual({...sqlite.prepare('SELECT last_status,transition_suppressed FROM http_checks WHERE id=?').get(checkId)},{last_status:'down',transition_suppressed:1})
+  assert.deepEqual(oversizedWarnings.map(value=>JSON.parse(value)),[{event:'probe_credential_unavailable',checkId}])
+  assert.doesNotMatch(oversizedWarnings.join(' '),/界|fixture|synthetic/)
+  assert.equal((await vaultApi(rotate(2,'synthetic-password'),env.DB as never,key,actor,`/admin/vaults/${vault.id}/secrets/${login.id}`)).status,200)
+  await runChecks(now+480_000,runtime as never)
+  assert.equal(bodies.length,5)
   assert.equal(sqlite.prepare('SELECT transition_suppressed FROM http_checks WHERE id=?').get(checkId)?.transition_suppressed,0)
   sqlite.close()
 })
