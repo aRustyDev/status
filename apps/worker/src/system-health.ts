@@ -1,4 +1,5 @@
 import { endpointFingerprint, parseEndpoints } from './endpoint-config'
+import { getFallback } from './static-fallback'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
 
 type Status = 'ok' | 'attention' | 'error' | 'disabled'
@@ -8,6 +9,8 @@ type HealthEnvironment = {
   ENDPOINTS: string
   BACKUPS?: Fetcher
   BACKUPS_READY?: string
+  FALLBACK_BUCKET?: R2Bucket
+  FALLBACK_READY?: string
   GATUS?: GatusBinding
   GATUS_REQUIRED?: string
 }
@@ -66,11 +69,22 @@ export async function getSystemHealthReport(env: HealthEnvironment, now = Date.n
     finally { if (timer) clearTimeout(timer) }
   }
   const backups = { status: backupStatus }
+  let staticMirror: { status: Status; lastSuccessAt: number | null } = { status: 'disabled', lastSuccessAt: null }
+  if (env.FALLBACK_READY === 'true') {
+    staticMirror = { status: 'error', lastSuccessAt: null }
+    if (env.FALLBACK_BUCKET) {
+      try {
+        const fallback = await getFallback(env.FALLBACK_BUCKET)
+        const status: Status = fallback.health === 'disabled' ? 'disabled' : fallback.health === 'ok' ? 'ok' : fallback.health === 'error' ? 'error' : 'attention'
+        staticMirror = { status, lastSuccessAt: fallback.status.lastSuccessAt }
+      } catch { /* Report availability without exposing storage errors. */ }
+    }
+  }
   return {
-    status: database.status === 'error' || monitoring.status === 'error' || monitoring.status === 'attention' || gatus.status === 'error' || gatus.status === 'attention' || backups.status === 'error' ? 'degraded' as const : 'healthy' as const,
+    status: database.status === 'error' || monitoring.status === 'error' || monitoring.status === 'attention' || gatus.status === 'error' || gatus.status === 'attention' || backups.status === 'error' || staticMirror.status === 'error' || staticMirror.status === 'attention' ? 'degraded' as const : 'healthy' as const,
     generatedAt: now,
     application: { status: 'ok' as const }, database, monitoring, gatus,
     notifications: { status: 'disabled' as const }, backups,
-    staticMirror: { status: 'disabled' as const },
+    staticMirror,
   }
 }

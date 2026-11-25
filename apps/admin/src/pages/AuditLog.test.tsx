@@ -53,4 +53,18 @@ describe('Cloudflare audit log', () => {
     await user.click(screen.getByRole('button', { name: /try again/i }))
     expect(await screen.findByText('No audit entries found.')).toBeInTheDocument()
   })
+  it('labels and filters static fallback update attempts', async () => {
+    vi.mocked(api.get).mockResolvedValue({ entries: [{ id: 'event-2', userEmail: 'admin@example.com', action: 'update_attempt', entityType: 'static_mirror', entityName: 'fallback', timestamp: 1730000000000, diff: null }], total: 1, page: 1, limit: 50, pages: 1 } as never)
+    const user = userEvent.setup()
+    showPage()
+    expect(await screen.findByText('fallback')).toBeInTheDocument()
+    expect(screen.getByText('Update attempt', { selector: 'span' })).toBeInTheDocument()
+    await user.selectOptions(screen.getByLabelText('Entity'), 'static_mirror')
+    await user.selectOptions(screen.getByLabelText('Action'), 'update_attempt')
+    await waitFor(() => {
+      const path = vi.mocked(api.get).mock.calls.at(-1)?.[0]
+      expect(path).toContain('entityType=static_mirror')
+      expect(path).toContain('action=update_attempt')
+    })
+  })
 })

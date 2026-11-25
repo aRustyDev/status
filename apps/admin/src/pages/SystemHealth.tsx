@@ -15,7 +15,7 @@ interface SystemHealthReport {
   gatus: { status: ComponentStatus; configuredMonitors: number | null }
   notifications: { status: 'disabled' }
   backups: { status: 'ok' | 'error' | 'disabled' }
-  staticMirror: { status: 'disabled' }
+  staticMirror: { status: ComponentStatus; lastSuccessAt?: number | null }
 }
 
 function formatDate(value: number | null) {
@@ -115,7 +115,8 @@ export default function SystemHealthPage() {
           <Metric label="Backup integrity" value="Not checked" />
         </HealthCard>
         <HealthCard icon="cloud_upload" title="Static fallback" status={report.staticMirror.status}>
-          <Metric label="Push" value="Not available" />
+          <Metric label="Push" value={report.staticMirror.status === 'ok' ? 'Up to date' : report.staticMirror.status === 'attention' ? 'Stale or pending' : report.staticMirror.status === 'error' ? 'Unavailable' : 'Not enabled'} />
+          {report.staticMirror.lastSuccessAt != null && <Metric label="Last success" value={formatDate(report.staticMirror.lastSuccessAt)} />}
         </HealthCard>
       </div>
     </>}

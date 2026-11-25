@@ -82,6 +82,22 @@ describe('answerFromSnapshot', () => {
     await expect(answer('/api/v1/public/layout')).rejects.toMatchObject({ status: 0 })
   })
 
+  it('signals Access expiry when a snapshot request is denied or redirected', async () => {
+    const listener = vi.fn()
+    window.addEventListener('access-session-expired', listener)
+    try {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 401 })))
+      await expect(answer('/api/v1/public/status')).rejects.toMatchObject({ status: 401 })
+      expect(listener).toHaveBeenCalledTimes(1)
+      vi.resetModules()
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 302 })))
+      await expect(answer('/api/v1/public/status')).rejects.toMatchObject({ status: 302 })
+      expect(listener).toHaveBeenCalledTimes(2)
+    } finally {
+      window.removeEventListener('access-session-expired', listener)
+    }
+  })
+
   it('calls a copy stale after three of its intervals', async () => {
     const { snapshotStaleMs } = await import('./dataSource')
     expect(snapshotStaleMs({ intervalSeconds: 60 })).toBe(180_000)

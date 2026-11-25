@@ -8,6 +8,7 @@ export default tseslint.config(
   {
     ignores: [
       '**/dist/**',
+      '**/dist-fallback/**',
       '**/node_modules/**',
       '**/data/**',
       'demo-output/**',

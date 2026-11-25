@@ -17,3 +17,5 @@ The Cloudflare monitor Alerts panel reuses the incorporated upstream `ChannelsSe
 The Cloudflare monitor Depends on panel reuses the incorporated upstream dependency selector. Relationships, scheduled status evaluation and notification suppression are adapted to Workers and D1. Administrators can select Cloudflare-managed monitors as dependencies.
 
 The Cloudflare Actions screen adapts the upstream action list and Vault-selection pattern. Its Node action editor supports arbitrary HTTP templates and direct credentials that the Workers runtime does not expose; the adapted page offers only deployment-approved HTTPS POST actions with write-only Vault tokens and explicit monitor-state triggers.
+
+The Cloudflare Static Fallback screen adapts the upstream settings and status presentation. The Node implementation accepts S3 credentials and publishes a public copy. This profile uses a private, deployment-bound R2 bucket and a separate Access-protected Worker. The status reader reuses the upstream snapshot data source and banner.
