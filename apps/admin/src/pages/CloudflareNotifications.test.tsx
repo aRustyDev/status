@@ -50,7 +50,13 @@ describe('Cloudflare notification channels',()=>{
     const user=setup(); await user.click(await screen.findByRole('button',{name:'Add Channel'}))
     const form=screen.getByRole('dialog')
     await user.type(within(form).getByLabelText('Channel name'),'Email alerts')
-    await user.selectOptions(within(form).getByLabelText('Channel type'),'email')
+    expect(within(form).getByText('Approved HTTPS destination')).toBeInTheDocument()
+    await user.click(within(form).getByRole('button',{name:/Type/}))
+    const emailOption = await within(form).findByRole('option',{name:/^Email/})
+    expect(emailOption).toHaveTextContent('Approved email recipient')
+    await user.click(emailOption)
+    expect(within(form).getByRole('button',{name:/Type.*Email/})).toHaveTextContent('Approved email recipient')
+    expect(within(form).queryByText('Uses the SMTP settings')).not.toBeInTheDocument()
     await user.selectOptions(await within(form).findByLabelText('Approved email recipient'),'ops-mail')
     expect(within(form).queryByLabelText('Vault')).not.toBeInTheDocument()
     await user.click(await within(form).findByRole('checkbox',{name:'Service'}))
@@ -58,7 +64,7 @@ describe('Cloudflare notification channels',()=>{
     await user.click(within(form).getByRole('button',{name:'Create Channel'}))
     await waitFor(()=>expect(api.post).toHaveBeenCalledWith('/admin/notifications/channels',{name:'Email alerts',type:'email',recipientId:'ops-mail',enabled:true,checkIds:[checkId],expectedChecks:[checkSnapshot]}))
   })
-  it('shows unavailable email recipients without silently allowing a save',async()=>{
+  it('marks unavailable providers as disabled',async()=>{
     vi.mocked(api.get).mockImplementation(async path=>{
       if(path==='/admin/notifications/channels') return [channel]
       if(path==='/admin/notifications/checks') return []
@@ -67,10 +73,9 @@ describe('Cloudflare notification channels',()=>{
     })
     const user=setup(); await user.click(await screen.findByRole('button',{name:'Add Channel'}))
     const form=screen.getByRole('dialog')
-    await user.type(within(form).getByLabelText('Channel name'),'Email alerts')
-    await user.selectOptions(within(form).getByLabelText('Channel type'),'email')
-    expect(await within(form).findByRole('alert')).toHaveTextContent('Could not load approved email recipients')
-    expect(within(form).getByRole('button',{name:'Create Channel'})).toBeDisabled()
+    await user.click(within(form).getByRole('button',{name:/Type/}))
+    expect(await within(form).findByRole('option',{name:/^Email.*Unavailable/})).toBeDisabled()
+    expect(within(form).getByRole('option',{name:/^Slack.*Unavailable/})).toBeDisabled()
   })
   it('edits an email channel using its original version',async()=>{
     vi.mocked(api.get).mockImplementation(async path=>{
@@ -80,7 +85,7 @@ describe('Cloudflare notification channels',()=>{
     })
     const user=setup(); await user.click(await screen.findByRole('button',{name:'Edit'}))
     const form=screen.getByRole('dialog')
-    expect(within(form).getByLabelText('Channel type')).toHaveValue('email')
+    expect(within(form).getByRole('button',{name:/Type.*Email/})).toBeDisabled()
     expect(await within(form).findByRole('option',{name:'Operations inbox'})).toBeInTheDocument()
     await user.clear(within(form).getByLabelText('Channel name')); await user.type(within(form).getByLabelText('Channel name'),'Renamed mail')
     vi.mocked(api.patch).mockResolvedValueOnce({})
@@ -90,10 +95,21 @@ describe('Cloudflare notification channels',()=>{
   it('tests the saved version and reports only a generic error',async()=>{
     const user=setup(); await screen.findByText('Alerts')
     vi.mocked(api.post).mockRejectedValueOnce(new Error('secret response body'))
-    await user.click(screen.getByRole('button',{name:'Send test'}))
-    expect(await screen.findByRole('status')).toHaveTextContent('Test failed')
-    expect(screen.getByRole('status')).not.toHaveTextContent('secret response body')
+    await user.click(screen.getByRole('button',{name:'Edit'})); await user.click(screen.getByRole('button',{name:'Send test (saved settings)'}))
+    expect(await screen.findByText(/Test failed/)).toBeInTheDocument()
+    expect(screen.queryByText(/secret response body/)).not.toBeInTheDocument()
     expect(api.post).toHaveBeenCalledWith(`/admin/notifications/channels/${channel.id}/test`,{version:3})
+  })
+
+  it('requires saved settings before testing',async()=>{
+    const user=setup()
+    await user.click(await screen.findByRole('button',{name:'Edit'}))
+    const form=screen.getByRole('dialog')
+    const test=within(form).getByRole('button',{name:'Send test (saved settings)'})
+    expect(test).toBeEnabled()
+    await user.type(within(form).getByLabelText('Channel name'),' changed')
+    expect(test).toBeDisabled()
+    expect(api.post).not.toHaveBeenCalled()
   })
 
   it('keeps the channel draft and original association snapshot after a conflict',async()=>{
