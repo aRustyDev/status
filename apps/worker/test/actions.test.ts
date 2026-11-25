@@ -263,6 +263,28 @@ test('Workerd D1 concurrently dispatches a transition at most once', {skip:!proc
   assert.equal(calls,1)
   assert.equal((await db.prepare('SELECT state FROM worker_action_outbox').first<{state:string}>())?.state,'completed')
   assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM monitor_action_cooldowns').first<{n:number}>())?.n,1)
+  // A newer transition must wait while another job still owns the cooldown.
+  const claimAt=Date.now()
+  await db.batch([
+   db.prepare('DELETE FROM worker_action_outbox'),
+   db.prepare('DELETE FROM monitor_action_cooldowns'),
+   db.prepare(`INSERT INTO worker_action_outbox (id,action_id,action_version,check_id,check_version,scheduled_at,status,state,claimed_at,created_at,updated_at,transition_generation,link_id,cooldown_minutes) VALUES ('old',?,1,?,1,100,'down','executing',?,?,?,1,'link',30)`).bind(action.id,checkId,claimAt,claimAt,claimAt),
+   db.prepare("INSERT INTO monitor_action_cooldowns (component_id,action_id,on_status,claimed_at,reservation_id) VALUES ('component',?,'down',?,'old')").bind(action.id,claimAt),
+   db.prepare("UPDATE automation_transition_state SET status='up',generation=generation+1 WHERE check_id=?").bind(checkId),
+   db.prepare("UPDATE http_checks SET last_status='up' WHERE id=?").bind(checkId),
+  ])
+  await db.batch([
+   db.prepare("INSERT INTO http_check_results (check_id,config_version,scheduled_at,completed_at,status,effective_status,http_status,latency_ms) VALUES (?,1,101,101,'down','down',500,4)").bind(checkId),
+   enqueueActionTransition(db,checkId,1,'approved',101,'down'),
+   db.prepare("UPDATE http_checks SET last_status='down',last_scheduled_at=101,last_result_at=101 WHERE id=?").bind(checkId),
+   db.prepare("UPDATE automation_transition_state SET status='down',generation=generation+1 WHERE check_id=?").bind(checkId),
+  ])
+  await Promise.all([flushActions(env),flushActions(env)])
+  assert.equal((await db.prepare('SELECT state FROM worker_action_outbox WHERE scheduled_at=101').first<{state:string}>())?.state,'pending')
+  await db.batch([db.prepare("UPDATE worker_action_outbox SET state='unavailable' WHERE id='old'"),db.prepare("DELETE FROM monitor_action_cooldowns WHERE reservation_id='old'")])
+  await Promise.all([flushActions(env),flushActions(env)])
+  assert.equal(calls,2)
+  assert.equal((await db.prepare('SELECT state FROM worker_action_outbox WHERE scheduled_at=101').first<{state:string}>())?.state,'completed')
  } finally {await runtime.dispose()}
 })
 
@@ -759,4 +781,64 @@ test('unrelated monitor edits cannot revive legacy jobs invalidated by destinati
   assert.equal(x.calls.length,0,`${change} change must invalidate the old action job`)
   assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox').get()?.state,'unavailable')
  }
+})
+
+test('a superseded pre-send claim releases its reservation before the newer outage runs',async()=>{
+ const x=await monitorFixture(), before=await x.get()
+ await x.put([{actionId:x.action.id,onStatus:'down',delayMinutes:0,cooldownMinutes:30}],before.version)
+ await queue(x,'down',100)
+ let raced=false
+ const db={batch:x.db.batch.bind(x.db),prepare(sql:string){
+  const statement=x.db.prepare(sql)
+  if(!sql.trimStart().startsWith('SELECT 1 FROM worker_action_outbox o JOIN http_checks')) return statement
+  return {bind(...values:unknown[]){statement.bind(...values);return this},async first(){
+   const result=await statement.first()
+   if(!raced){raced=true;await queue(x,'down',101);await flushActions(x.env)}
+   return result
+  }} as D1PreparedStatement
+ }} as D1Database
+ await flushActions({...x.env,DB:db})
+ assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox WHERE scheduled_at=101').get()?.state,'pending')
+ await flushActions(x.env)
+ assert.equal(x.calls.length,1)
+ assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox WHERE scheduled_at=101').get()?.state,'completed')
+})
+
+test('a newer outage waits for an in-flight delivery and honors its completed or uncertain outcome',async()=>{
+ for (const status of [204,500]) {
+  const x=await monitorFixture(), before=await x.get()
+  await x.put([{actionId:x.action.id,onStatus:'down',delayMinutes:0,cooldownMinutes:30}],before.version)
+  await queue(x,'down',100)
+  let finish!: (response:Response)=>void, notifyStart!:()=>void
+  const started=new Promise<void>(resolve=>{notifyStart=resolve})
+  const result=new Promise<Response>(resolve=>{finish=resolve})
+  let calls=0
+  x.env.ACTION={fetch:async()=>{calls++;notifyStart();return result}}
+  const first=flushActions(x.env)
+  await started
+  await queue(x,'down',101)
+  await flushActions(x.env)
+  assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox WHERE scheduled_at=101').get()?.state,'pending')
+  finish(status===204?new Response(null,{status}):new Response('error',{status}))
+  await first
+  await flushActions(x.env)
+  assert.equal(calls,1)
+  assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox WHERE scheduled_at=100').get()?.state,status===204?'completed':'uncertain')
+  assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox WHERE scheduled_at=101').get()?.state,'unavailable')
+ }
+})
+
+test('a stale claimed action becomes uncertain and retains its cooldown for newer outages',async()=>{
+ const x=await monitorFixture(), before=await x.get()
+ await x.put([{actionId:x.action.id,onStatus:'down',delayMinutes:0,cooldownMinutes:30}],before.version)
+ await queue(x,'down',100)
+ const job=x.local.db.prepare('SELECT id FROM worker_action_outbox WHERE scheduled_at=100').get() as {id:string}
+ const claimed=Date.now()-31_000
+ x.local.db.prepare("UPDATE worker_action_outbox SET state='executing',claimed_at=? WHERE id=?").run(claimed,job.id)
+ x.local.db.prepare("INSERT INTO monitor_action_cooldowns (component_id,action_id,on_status,claimed_at,reservation_id) VALUES (?,?,'down',?,?)").run(monitorId,x.action.id,claimed,job.id)
+ await queue(x,'down',101)
+ await Promise.all([flushActions(x.env),flushActions(x.env)])
+ assert.equal(x.calls.length,0)
+ assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox WHERE scheduled_at=100').get()?.state,'uncertain')
+ assert.equal(x.local.db.prepare('SELECT state FROM worker_action_outbox WHERE scheduled_at=101').get()?.state,'unavailable')
 })

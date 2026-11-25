@@ -104,7 +104,9 @@ export async function flushActions(env:ActionEnvironment):Promise<void> {
         ON CONFLICT(component_id,action_id,on_status) DO UPDATE SET claimed_at=excluded.claimed_at,reservation_id=excluded.reservation_id`).bind(claimedAt,job.id,claimedAt),
     ])
     if(!claim?.meta.changes) {
-      await env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='unavailable',updated_at=? WHERE o.id=? AND o.state='pending' AND EXISTS (SELECT 1 FROM monitor_action_cooldowns c JOIN http_checks h ON h.component_id=c.component_id WHERE h.id=o.check_id AND c.action_id=o.action_id AND c.on_status=o.status AND c.claimed_at+o.cooldown_minutes*60000>?)`).bind(claimedAt,job.id,claimedAt).run()
+      // An executing claim may still be rejected before transmission. Keep a
+      // newer job pending until that reservation resolves rather than discarding it.
+      await env.DB.prepare(`UPDATE worker_action_outbox AS o SET state='unavailable',updated_at=? WHERE o.id=? AND o.state='pending' AND EXISTS (SELECT 1 FROM monitor_action_cooldowns c JOIN http_checks h ON h.component_id=c.component_id WHERE h.id=o.check_id AND c.action_id=o.action_id AND c.on_status=o.status AND c.claimed_at+o.cooldown_minutes*60000>? AND NOT EXISTS (SELECT 1 FROM worker_action_outbox previous WHERE previous.id=c.reservation_id AND previous.state='executing'))`).bind(claimedAt,job.id,claimedAt).run()
       continue
     }
     let result=await executeAction(env,job,claimedAt)
