@@ -340,7 +340,7 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
 
   const siteName = branding?.siteName || t('page.defaultTitle')
   const imageLogoUrl = resolveBrandingLogoUrl(branding, isDark, brandingEnabled)
-  const defaultLogoUrl = `${SNAPSHOT_URL ? '/__fallback' : ''}/logo_${isDark ? 'dark' : 'light'}.png`
+  const defaultLogoUrl = `${SNAPSHOT_URL ? '/__fallback' : ''}${isDark ? '/logo_dark.png' : '/logo_light.png'}`
   const customCss = resolveBrandingCustomCss(branding)
   document.title = siteName
 
