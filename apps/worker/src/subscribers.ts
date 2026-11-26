@@ -136,7 +136,9 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
       scope
         ? query(env, 'INSERT INTO preview_subscription_settings (scope,enabled,allow_email,allow_component_scope,allowed_events,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET enabled=excluded.enabled,allow_email=excluded.allow_email,allow_component_scope=excluded.allow_component_scope,allowed_events=excluded.allowed_events,updated_at=excluded.updated_at', scope, Number(input.enabled), Number(input.allowEmail), Number(input.allowComponentScope), JSON.stringify([...new Set(input.allowedEvents)]), Date.now())
         : query(env, 'UPDATE subscription_settings SET enabled=?,allow_email=?,allow_component_scope=?,allowed_events=?,updated_at=? WHERE id=1', Number(input.enabled), Number(input.allowEmail), Number(input.allowComponentScope), JSON.stringify([...new Set(input.allowedEvents)]), Date.now()),
-      query(env, 'INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES (?,?,?,?,?,?,?)', crypto.randomUUID(), user.email, 'update', 'subscription_settings', '1', Date.now(), '{}'),
+      scope
+        ? query(env, 'INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details,preview_scope) VALUES (?,?,?,?,?,?,?,?)', crypto.randomUUID(), user.email, 'update', 'subscription_settings', '1', Date.now(), '{}', scope)
+        : query(env, 'INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES (?,?,?,?,?,?,?)', crypto.randomUUID(), user.email, 'update', 'subscription_settings', '1', Date.now(), '{}'),
     ])
     return json(settingsView(env, await settings(env)))
   }
@@ -216,7 +218,9 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
     if (!record) return fail(404, 'Subscriber not found')
     await env.DB.batch([
       query(env, `DELETE FROM ${table} WHERE ${inScope}id=?`, ...scoped(record.id)),
-      query(env, 'INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES (?,?,?,?,?,?,?)', crypto.randomUUID(), user.email, 'delete', 'subscriber', String(record.id), Date.now(), '{}'),
+      scope
+        ? query(env, 'INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details,preview_scope) VALUES (?,?,?,?,?,?,?,?)', crypto.randomUUID(), user.email, 'delete', 'subscriber', String(record.id), Date.now(), '{}', scope)
+        : query(env, 'INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES (?,?,?,?,?,?,?)', crypto.randomUUID(), user.email, 'delete', 'subscriber', String(record.id), Date.now(), '{}'),
     ])
     return new Response(null, { status: 204, headers: { 'Cache-Control': 'no-store' } })
   }

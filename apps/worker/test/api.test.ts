@@ -97,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql', '0018_subscribers.sql', '0019_subscriber_deliveries.sql', '0020_preview_subscribers.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql', '0018_subscribers.sql', '0019_subscriber_deliveries.sql', '0020_preview_subscribers.sql', '0021_preview_audit_scope.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -132,6 +132,7 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0018_subscribers.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0019_subscriber_deliveries.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0020_preview_subscribers.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0021_preview_audit_scope.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -2103,6 +2104,7 @@ test('preview publication atomically queues only its lease-scoped subscribers', 
     const fixture = await db.prepare("SELECT id FROM maintenance WHERE name='Scoped publication test'").first<{id:string}>()
     assert.ok(fixture)
     maintenanceId = fixture.id
+    assert.equal((await db.prepare("SELECT preview_scope FROM audit_events WHERE entity_type='maintenance' AND entity_id=? AND action='create'").bind(maintenanceId).first<{preview_scope:string}>())?.preview_scope,a)
     const jobs = await db.prepare('SELECT scope,event_id FROM preview_subscriber_deliveries').all<{scope:string;event_id:string}>()
     assert.deepEqual(jobs.results.map(row => ({...row})),[{scope:a,event_id:maintenanceId}])
     assert.equal((await db.prepare('SELECT count(*) AS n FROM subscriber_deliveries').first<{n:number}>())?.n,0)
@@ -2120,6 +2122,10 @@ test('preview publication atomically queues only its lease-scoped subscribers', 
     const secondJob = await db.prepare('SELECT event_id FROM preview_subscriber_deliveries WHERE scope=?').bind(b).first<{event_id:string}>()
     assert.ok(secondJob)
     secondMaintenanceId = secondJob.event_id
+    assert.equal((await db.prepare("SELECT preview_scope FROM audit_events WHERE entity_type='maintenance' AND entity_id=? AND action='create'").bind(secondMaintenanceId).first<{preview_scope:string}>())?.preview_scope,b)
+    const auditLog = (await request('/api/v1/bsp/admin/audit-log?entityType=maintenance',adminToken)).body as unknown as {entries:Array<{entityId:string;diff:{previewScope?:string}}>}
+    assert.equal(auditLog.entries.find(entry => entry.entityId === maintenanceId)?.diff.previewScope,a)
+    assert.equal(auditLog.entries.find(entry => entry.entityId === secondMaintenanceId)?.diff.previewScope,b)
     assert.notEqual(secondMaintenanceId,maintenanceId)
   } finally {
     await db.prepare('DELETE FROM preview_subscriber_deliveries').run()

@@ -1,13 +1,14 @@
 import { subscriberAddressApproved, subscriberEmailReady, subscriberScope, type SubscriberEnv } from './subscribers'
 
 // Trusted preview deployment tooling enables a cron only for this contract.
-export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT = 1
+export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT = 2
 
 /** Dispatch only this live slot lease; never invoke the shared fallback scheduler. */
-export async function flushPreviewSubscriberDeliveries(env: SubscriberEnv & { SUBSCRIBERS_READY?: string }): Promise<void> {
+export async function flushPreviewSubscriberDeliveries(env: SubscriberEnv & { SUBSCRIBERS_READY?: string }, authorize?: () => Promise<boolean>): Promise<void> {
   const scope = subscriberScope(env)
   const slot = env.PREVIEW_SLOT, target = env.PREVIEW_TARGET, release = env.PREVIEW_RELEASE
   if (!scope || !slot || !/^[1-6]$/.test(slot) || !target || !/^[ab]$/.test(target) || !release || !/^[0-9a-f]{40}$/.test(release)) throw new Error('Invalid preview scheduler configuration')
+  if (typeof authorize !== 'function') throw new Error('Missing preview send authorization')
   if (env.SUBSCRIBERS_READY !== 'true' || !subscriberEmailReady(env)) return
   const fence = 'EXISTS (SELECT 1 FROM preview_subscriber_leases l WHERE l.scope=? AND l.slot=? AND l.target=? AND l.release=? AND l.expires_at>?)'
   const fenceArgs = () => [scope, Number(slot), target, release, Date.now()]
@@ -35,6 +36,14 @@ export async function flushPreviewSubscriberDeliveries(env: SubscriberEnv & { SU
     // cannot be atomically rolled back by a later lease switch.
     const live = await env.DB.prepare('SELECT expires_at FROM preview_subscriber_leases WHERE scope=? AND slot=? AND target=? AND release=? AND expires_at>?').bind(...fenceArgs()).first<{expires_at:number}>()
     if (!live || live.expires_at <= Date.now()) continue
+    let authorized = false
+    try { authorized = await authorize() && live.expires_at > Date.now() }
+    catch { /* An unavailable authorization service is not permission to send. */ }
+    if (!authorized) {
+      // No provider call was made; return the claim to pending if we still own it.
+      await env.DB.prepare(`UPDATE preview_subscriber_deliveries SET state='pending',attempts=attempts-1,lease_token=NULL,lease_until=NULL,updated_at=? WHERE scope=? AND id=? AND state='sending' AND lease_token=? AND ${fence}`).bind(Date.now(),scope,job.id,lease,...fenceArgs()).run()
+      return
+    }
     let sent = false
     try {
       const text = `A status update has been published. Visit ${env.SUBSCRIBER_PUBLIC_URL!} to view it or manage your subscription.`

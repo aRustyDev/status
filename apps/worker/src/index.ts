@@ -229,12 +229,18 @@ async function auditPage(db: D1Database, request: Request): Promise<Response> {
   }
   const where = clauses.join(' AND ')
   const count = await stmt(db, `SELECT COUNT(*) AS count FROM audit_events WHERE ${where}`, ...values).first<{count:number}>()
-  const rows = await stmt(db, `SELECT id, actor_email AS userEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS timestamp, details FROM audit_events WHERE ${where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`, ...values, limit, (page - 1) * limit).all<{id:string; userEmail:string; action:string; entityType:string; entityId:string; timestamp:number; details:string}>()
+  const columns = await db.prepare('PRAGMA table_info(audit_events)').all<{name:string}>()
+  const scopeColumn = columns.results.some(column => column.name === 'preview_scope') ? 'preview_scope' : 'NULL'
+  const rows = await stmt(db, `SELECT id, actor_email AS userEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS timestamp, details, ${scopeColumn} AS previewScope FROM audit_events WHERE ${where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`, ...values, limit, (page - 1) * limit).all<{id:string; userEmail:string; action:string; entityType:string; entityId:string; timestamp:number; details:string; previewScope:string | null}>()
   const total = count?.count ?? 0
-  return json({ entries: rows.results.map(({ details, ...row }) => ({ ...row, entityName: row.entityId, diff: parsedAuditDetails(details) })), total, page, limit, pages: Math.max(1, Math.ceil(total / limit)) })
+  return json({ entries: rows.results.map(({ details, previewScope, ...row }) => ({ ...row, entityName: row.entityId, diff: { ...parsedAuditDetails(details), ...(previewScope && /^[0-9a-f]{64}$/.test(previewScope) ? { previewScope } : {}) } })), total, page, limit, pages: Math.max(1, Math.ceil(total / limit)) })
 }
-function audit(db: D1Database, user: User, action: string, entityType: string, entityId: string, details: Json, guard?: { table: string; token: string; id?: string }): D1PreparedStatement {
+function audit(db: D1Database, user: User, action: string, entityType: string, entityId: string, details: Json, guard?: { table: string; token: string; id?: string }, previewScope: string | null = null): D1PreparedStatement {
   const values = [id(), user.email, action, entityType, entityId, Date.now(), JSON.stringify(safeAuditDetails(details))]
+  if (previewScope) {
+    if (!guard) return stmt(db, 'INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details, preview_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', ...values, previewScope)
+    return stmt(db, `INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details, preview_scope) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ${guard.table} WHERE id=? AND mutation_key=?)`, ...values, previewScope, guard.id ?? entityId, guard.token)
+  }
   if (!guard) return stmt(db, 'INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) VALUES (?, ?, ?, ?, ?, ?, ?)', ...values)
   return stmt(db, `INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ${guard.table} WHERE id=? AND mutation_key=?)`, ...values, guard.id ?? entityId, guard.token)
 }
@@ -471,7 +477,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
       const replay = await commitMutation(db, [
         stmt(db,'INSERT INTO incidents (id,title,status,impact,draft,created_at,updated_at) VALUES (?,?,?,?,1,?,?)',incidentId,title,'investigating',impact,now,now),
         stmt(db,'INSERT INTO incident_updates (id,incident_id,body,status,posted_at) VALUES (?,?,?,?,?)',id(),incidentId,message,'investigating',now),
-        ...links(db,'incident_components','incident_id',incidentId,ids),audit(db,user,'create','incident',incidentId,{title,impact})
+        ...links(db,'incident_components','incident_id',incidentId,ids),audit(db,user,'create','incident',incidentId,{title,impact},undefined,subscriberScope(env))
       ], receipt, incidentId, 1, 201, 'SELECT 1 FROM incidents WHERE id=?', [incidentId])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({ id:incidentId,title,impact,status:'investigating',draft:true,componentIds:ids,version:1 },201)
@@ -517,7 +523,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
         const eventType = event === 'publish' ? (status === 'resolved' ? 'incident.resolved' : 'incident.created') : (status === 'resolved' ? 'incident.resolved' : 'incident.updated')
         extra.push(enqueueSubscriberDeliveries(db,token,eventType,linked.results.map(row => row.component_id),now,{table:'incidents',id:recordId,mutationKey:token},env))
       }
-      extra.push(audit(db,user,event,'incident',recordId,{title,status,impact},{table:'incidents',token}))
+      extra.push(audit(db,user,event,'incident',recordId,{title,status,impact},{table:'incidents',token},subscriberScope(env)))
       const replay = await mutate(db,stmt(db,'UPDATE incidents SET title=?,impact=?,status=?,draft=?,resolved_at=?,updated_at=?,version=version+1,mutation_key=? WHERE id=? AND version=?',title,impact,status,draft,resolved,now,token,recordId,version(body)),extra,receipt,recordId,Number(body.version)+1,'SELECT 1 FROM incidents WHERE id=? AND mutation_key=?',[recordId,token])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:recordId,version:Number(body.version)+1})
@@ -533,7 +539,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
       if (ends <= starts) bad('End must be after start')
       const ids = componentIds(body.componentIds ?? [])
       await validateComponents(db,ids)
-      const replay = await commitMutation(db,[stmt(db,'INSERT INTO maintenance (id,name,description,starts_at,ends_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',maintenanceId,name,description,starts,ends,now,now),...links(db,'maintenance_components','maintenance_id',maintenanceId,ids),audit(db,user,'create','maintenance',maintenanceId,{name,startsAt:starts,endsAt:ends}),...(env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,maintenanceId,'maintenance.scheduled',ids,now,undefined,env)] : [])],receipt,maintenanceId,1,201,'SELECT 1 FROM maintenance WHERE id=?',[maintenanceId])
+      const replay = await commitMutation(db,[stmt(db,'INSERT INTO maintenance (id,name,description,starts_at,ends_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',maintenanceId,name,description,starts,ends,now,now),...links(db,'maintenance_components','maintenance_id',maintenanceId,ids),audit(db,user,'create','maintenance',maintenanceId,{name,startsAt:starts,endsAt:ends},undefined,subscriberScope(env)),...(env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,maintenanceId,'maintenance.scheduled',ids,now,undefined,env)] : [])],receipt,maintenanceId,1,201,'SELECT 1 FROM maintenance WHERE id=?',[maintenanceId])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:maintenanceId,name,description,startsAt:starts,endsAt:ends,componentIds:ids,version:1},201)
     }
@@ -564,7 +570,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
         extra.push(stmt(db,`DELETE FROM maintenance_components WHERE maintenance_id=? AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE value=maintenance_components.component_id) AND EXISTS (SELECT 1 FROM maintenance WHERE id=? AND mutation_key=?)`,recordId,JSON.stringify(ids),recordId,token))
         extra.push(...links(db,'maintenance_components','maintenance_id',recordId,ids,'maintenance',token))
       }
-      extra.push(audit(db,user,event,'maintenance',recordId,{name,startsAt:starts,endsAt:ends},{table:'maintenance',token}))
+      extra.push(audit(db,user,event,'maintenance',recordId,{name,startsAt:starts,endsAt:ends},{table:'maintenance',token},subscriberScope(env)))
       const replay = await mutate(db,stmt(db,'UPDATE maintenance SET name=?,description=?,starts_at=?,ends_at=?,cancelled=?,updated_at=?,version=version+1,mutation_key=? WHERE id=? AND version=?',name,description,starts,ends,cancelled,now,token,recordId,version(body)),extra,receipt,recordId,Number(body.version)+1,'SELECT 1 FROM maintenance WHERE id=? AND mutation_key=?',[recordId,token])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:recordId,version:Number(body.version)+1})
@@ -1102,8 +1108,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       stmt(db, 'INSERT INTO incidents (id,title,status,impact,draft,created_at,updated_at) VALUES (?,?,?,?,?,?,?)', incidentId,title,status,impact,body.draft ? 1 : 0,now,now),
       stmt(db, 'INSERT INTO incident_updates (id,incident_id,body,status,posted_at) VALUES (?,?,?,?,?)', id(),incidentId,message,status,now),
       ...links(db,'incident_components','incident_id',incidentId,ids),
-      audit(db,user,'create','incident',incidentId,{title,impact}),
-      ...(!body.draft ? [audit(db,user,'publish','incident',incidentId,{title,status,impact})] : []),
+      audit(db,user,'create','incident',incidentId,{title,impact},undefined,subscriberScope(env)),
+      ...(!body.draft ? [audit(db,user,'publish','incident',incidentId,{title,status,impact},undefined,subscriberScope(env))] : []),
       ...(!body.draft && env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,incidentId,'incident.created',ids,now,undefined,env)] : []),
     ], receipt, incidentId, 1, 201, "SELECT 1 FROM incidents i JOIN entity_aliases a ON a.entity_id=i.id AND a.entity_type='incident' WHERE i.id=?", [incidentId], 'incident')
     if (replay) return replayReceipt(db, receipt!, replay)

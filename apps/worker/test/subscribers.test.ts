@@ -28,7 +28,7 @@ const operator = { id:'o', email:'o@example.test', role:'operator' }
 const request = (method: string, data?: unknown) => new Request('https://status.example.test', { method, headers: { 'Content-Type':'application/json' }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) })
 function fixture() {
   const local = new DB()
-  for (const file of ['0001_board.sql', '0004_aliases.sql', '0018_subscribers.sql', '0020_preview_subscribers.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
+  for (const file of ['0001_board.sql', '0004_aliases.sql', '0018_subscribers.sql', '0020_preview_subscribers.sql', '0021_preview_audit_scope.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
   local.db.exec("INSERT INTO users (id,issuer,subject,email,role) VALUES ('a','issuer','a','a@example.test','viewer'),('b','issuer','b','b@example.test','viewer'),('o','issuer','o','o@example.test','operator')")
   local.db.exec("UPDATE subscription_settings SET enabled=1,allow_email=1 WHERE id=1")
   const messages: Array<{text:string}> = []
@@ -109,6 +109,7 @@ test('preview leases isolate settings, enrollments, confirmations and admin oper
   const second = {...env, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:'b'.repeat(64)}
   const update = { enabled:true, allowEmail:true, allowComponentScope:true, allowedEvents:['incident.created'] }
   await subscriberApi(request('PUT',update),first,operator,'/admin/subscribers/settings')
+  assert.equal((local.db.prepare("SELECT preview_scope FROM audit_events WHERE entity_type='subscription_settings' ORDER BY rowid DESC").get() as {preview_scope:string}).preview_scope,first.PREVIEW_SUBSCRIBER_SCOPE)
   assert.equal(((await (await subscriberApi(request('GET'),second,operator,'/admin/subscribers/settings')).json()) as {enabled:boolean}).enabled,false)
   await subscriberApi(request('PUT',update),second,operator,'/admin/subscribers/settings')
   await subscriberApi(request('POST',enrollment),first,owner,'/public/subscriptions')
@@ -126,6 +127,8 @@ test('preview leases isolate settings, enrollments, confirmations and admin oper
   await subscriberApi(request('POST',{}),first,owner,'/public/subscriptions/unsubscribe')
   const secondRecord = local.db.prepare('SELECT status FROM preview_subscribers WHERE scope=?').get(second.PREVIEW_SUBSCRIBER_SCOPE) as {status:string}
   assert.equal(secondRecord.status,'active')
+  await subscriberApi(request('DELETE'),first,operator,`/admin/subscribers/${firstSearch.subscribers[0]!.id}`)
+  assert.equal((local.db.prepare("SELECT preview_scope FROM audit_events WHERE entity_type='subscriber' ORDER BY rowid DESC").get() as {preview_scope:string}).preview_scope,first.PREVIEW_SUBSCRIBER_SCOPE)
   assert.equal((local.db.prepare('SELECT count(*) AS n FROM subscribers').get() as {n:number}).n,0)
   await assert.rejects(() => subscriberApi(request('GET'),{...env,PREVIEW_SUBSCRIBER_REQUIRED:'true'},operator,'/admin/subscribers/settings'), /Missing preview subscriber scope/)
   await assert.rejects(() => subscriberApi(request('GET'),{...first,PREVIEW_SUBSCRIBER_SCOPE:'bad'},operator,'/admin/subscribers/settings'), /Invalid preview subscriber scope/)
