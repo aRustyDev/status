@@ -3,6 +3,8 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Alert, ConfirmModal, DataTable, DataTh, ErrorState, LoadingState, PageContainer, PageHeader, QuickStartPanel, useTableSort, type QuickStartOption } from '@better-forge/ui'
 import { api } from '../api/client'
+import { useCapabilities } from '../capabilities'
+import { deliveryHistoryUrl } from '../deliveryHistoryUrl'
 import CloudflareChannelForm, { type Channel } from '../components/notifications/CloudflareChannelForm'
 import { CHANNEL_TYPES } from '../components/notifications/channelTypes'
 
@@ -12,6 +14,7 @@ type Delivery = { channelId: string; checkId: string; status: string; state: str
 
 export default function CloudflareNotifications() {
   const qc = useQueryClient()
+  const capabilities = useCapabilities()
   const [editing, setEditing] = useState<Channel | 'new' | null>(null)
   const [initialType, setInitialType] = useState<ChannelType>('webhook')
   const [removing, setRemoving] = useState<Channel | null>(null)
@@ -58,6 +61,7 @@ export default function CloudflareNotifications() {
       <button type="button" className="btn btn-primary" onClick={() => openCreate(options[0]?.key ?? 'webhook')}>
         <span className="material-symbols-outlined" aria-hidden="true">add</span> Add Channel
       </button>
+      {capabilities.supportedRoutes.includes('/admin/delivery-history') && <a href={deliveryHistoryUrl('notifications')} className="btn btn-secondary">Delivery history</a>}
       <button type="button" className="btn btn-secondary" disabled title="SMTP settings are unavailable">SMTP Settings</button>
     </>} />
     <Alert tone="info">Create notification channels here, then assign them to individual monitors via the monitor editor. Email recipients and webhook destinations are configured by the deployment administrator. Other providers and alert policies are unavailable.</Alert>

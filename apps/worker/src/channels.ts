@@ -72,6 +72,8 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
     await statement(db, `INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details)
       VALUES (?,?,?,?,?,?,CASE WHEN EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?) THEN '{}' ELSE NULL END)`,crypto.randomUUID(),actor.email,'test','notification_channel',channelId,Date.now(),actor.id,actor.version).run()
     const result=await sendChannel(env,channelId,version,{},false)
+    await statement(db, `INSERT INTO notification_test_deliveries (id,channel_id,channel_version,result,created_at)
+      SELECT ?,id,?,?,? FROM notification_channels WHERE id=?`, crypto.randomUUID(),version,result==='deferred' ? 'unavailable' : result,Date.now(),channelId).run()
     if (result==='unavailable') return fail(409,'Channel credential or destination is unavailable')
     if (result!=='sent') return fail(502,'Channel test failed')
     return json({ok:true})

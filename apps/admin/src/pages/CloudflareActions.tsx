@@ -3,6 +3,8 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, Modal, ModalFooter } from '@better-forge/ui'
 import { api } from '../api/client'
+import { useCapabilities } from '../capabilities'
+import { deliveryHistoryUrl } from '../deliveryHistoryUrl'
 
 type Action = { id:string; name:string; endpointId:string; triggerStatus:string; vaultId:number; secretId:number; enabled:number; version:number; checkIds:string[] }
 type Choice = {id:string;name:string}
@@ -13,6 +15,7 @@ type Secret = {id:number;name:string;type:string}
 type Delivery = {actionId:string;checkId:string;status:string;state:string;updatedAt:number}
 
 export default function CloudflareActions() {
+  const capabilities = useCapabilities()
   const qc=useQueryClient(), [editing,setEditing]=useState<Action|'new'|null>(null), [removing,setRemoving]=useState<Action|null>(null)
   const [busy,setBusy]=useState(false), [message,setMessage]=useState('')
   const actions=useQuery<Action[]>({queryKey:['worker-actions'],queryFn:()=>api.get('/admin/actions')})
@@ -25,7 +28,7 @@ export default function CloudflareActions() {
     finally { setBusy(false) }
   }
   return <div className="p-4 md:p-6 space-y-5">
-    <div className="flex flex-wrap justify-between gap-3"><div><h1 className="font-headline font-bold text-xl">Actions</h1><p className="text-sm">Run approved HTTP actions when selected monitors change status.</p></div><button className="btn btn-primary" onClick={()=>setEditing('new')}>Add Action</button></div>
+    <div className="flex flex-wrap justify-between gap-3"><div><h1 className="font-headline font-bold text-xl">Actions</h1><p className="text-sm">Run approved HTTP actions when selected monitors change status.</p></div><div className="flex gap-2">{capabilities.supportedRoutes.includes('/admin/delivery-history') && <a href={deliveryHistoryUrl('actions')} className="btn btn-secondary">Run history</a>}<button className="btn btn-primary" onClick={()=>setEditing('new')}>Add Action</button></div></div>
     <p className="text-sm">Action names are visible metadata. Actions use a Vault Secure Value as a Bearer token. Other action providers, templates and manual test runs are unavailable. Actions can change external systems; each event is attempted at most once.</p>
     {message && <p role="status">{message}</p>}
     {actions.isLoading && <p>Loading actions…</p>}{actions.isError && <p role="alert">Could not load actions. <button onClick={()=>void actions.refetch()}>Retry</button></p>}

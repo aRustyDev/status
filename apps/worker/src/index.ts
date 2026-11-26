@@ -6,6 +6,7 @@ import { ProbeTestTimeout, requestProbeTest } from './probe-test'
 import { getSystemHealthReport } from './system-health'
 import { vaultApi, vaultKeyReady, VaultError } from './vault'
 import { channelApi, ChannelError } from './channels'
+import { deliveryHistoryApi, deliveryHistoryAvailable } from './delivery-history'
 import { channelEndpoints, type ChannelEnvironment } from './channels-runtime'
 import { emailChannelFingerprint, emailDestinations, emailReady, type EmailChannelEnv } from './email-channel'
 import { resolveChannelCredential } from './vault-resolver'
@@ -671,6 +672,11 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     requireRole(user, 'admin')
     return json(await getSystemHealthReport(env))
   }
+  if (route.startsWith('/admin/delivery-history/')) {
+    requireRole(user, 'admin')
+    if (!await deliveryHistoryAvailable(db)) throw new HttpError(503, 'Delivery history is unavailable')
+    return deliveryHistoryApi(request, env, user, route)
+  }
   if (route === '/admin/actions' || route.startsWith('/admin/actions/')) {
     requireRole(user, 'admin')
     if (env.ACTIONS_READY !== 'true' || !actionEndpoints(env.ACTION_ENDPOINTS).size || !await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Actions are unavailable')
@@ -982,8 +988,9 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   if (route === '/capabilities' && method === 'GET') {
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
     const notificationsAvailable = await notificationsReady(env)
+    const historyAvailable = await deliveryHistoryAvailable(db)
     const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
-    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(historyAvailable ? ['/admin/delivery-history'] : []), ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
