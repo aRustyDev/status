@@ -24,6 +24,25 @@ function text(value, name) {
   return value
 }
 
+const workerComponents = ['gateway', 'api', 'statusApi', 'monitoring', 'status', 'admin', 'probe']
+
+export function selectWorkerSecrets(secrets, environment) {
+  if (!['dev', 'stage', 'schema'].includes(environment)) throw new Error('Invalid Worker secret environment')
+  const environments = object(secrets?.environments, 'Worker secret environments')
+  const workersByEnvironment = {}
+  for (const name of ['dev', 'stage', 'schema']) {
+    const selected = object(environments[name], `${name} Worker secret environment`)
+    const workers = object(selected.workers, `${name} Worker secrets`)
+    if (Object.keys(workers).some(component => !workerComponents.includes(component))) throw new Error(`Invalid ${name} Worker component`)
+    for (const component of workerComponents) {
+      const values = object(workers[component], `${name} ${component} Worker secrets`)
+      if (Object.entries(values).some(([key, value]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== 'string' || !value)) throw new Error(`Invalid ${name} ${component} Worker secrets`)
+    }
+    workersByEnvironment[name] = workers
+  }
+  return workersByEnvironment[environment]
+}
+
 // The probe enters through the shared staging gateway, regardless of which
 // database the preview selects, so authenticate it against staging Access.
 export function activationIdentity(config, access) {
@@ -46,11 +65,7 @@ export async function main(env = process.env) {
   if (!policy || !/^[a-f0-9]{40}$/.test(sha)) throw new Error('Invalid branch or commit')
   const config = parse(env.PREVIEW_BRANCH_CONFIG, 'PREVIEW_BRANCH_CONFIG')
   const secrets = parse(env.PREVIEW_WORKER_SECRETS, 'PREVIEW_WORKER_SECRETS')
-  const workerSecrets = object(secrets.workers, 'Worker secrets')
-  for (const component of ['gateway', 'api', 'statusApi', 'monitoring', 'status', 'admin', 'probe']) {
-    const values = object(workerSecrets[component], `${component} Worker secrets`)
-    if (Object.entries(values).some(([key, value]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== 'string' || !value)) throw new Error(`Invalid ${component} Worker secrets`)
-  }
+  const workerSecrets = selectWorkerSecrets(secrets, policy.environment)
   const verifySecret = text(secrets.verificationSecret, 'candidate verification secret')
   if (verifySecret.length < 32) throw new Error('Candidate verification secret is too short')
   const access = object(secrets.accessHeaders, 'Access headers')
