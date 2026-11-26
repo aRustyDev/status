@@ -31,6 +31,7 @@ function fixture(send?: () => Promise<unknown>) {
   local.sqlite.exec(readFileSync(new URL('../migrations/0019_subscriber_deliveries.sql',import.meta.url),'utf8'))
   local.sqlite.exec(readFileSync(new URL('../migrations/0020_preview_subscribers.sql',import.meta.url),'utf8'))
   local.sqlite.exec(readFileSync(new URL('../migrations/0021_preview_audit_scope.sql',import.meta.url),'utf8'))
+  local.sqlite.exec(readFileSync(new URL('../migrations/0022_preview_audit_events.sql',import.meta.url),'utf8'))
   let calls = 0
   const env = { DB: local as unknown as D1Database, SUBSCRIBER_EMAIL_READY: 'true', SUBSCRIBER_EMAIL_FROM: 'status@example.test', SUBSCRIBER_EMAIL_DESTINATIONS: JSON.stringify([{id:'test',name:'Test',address:'test@example.test'}]), SUBSCRIBER_PUBLIC_URL: 'https://status.example.test', SUBSCRIBER_EMAIL: {send: async () => { calls++; return send ? send() : {messageId:'accepted'} }} as unknown as SendEmail }
   return {local,env,get calls() { return calls }}
@@ -174,6 +175,34 @@ test('the preview switch is checked for every send and failures leave unsent job
   await flushPreviewSubscriberDeliveries(config,async () => { throw new Error('Flagship unavailable') })
   assert.equal(x.calls,1)
   assert.deepEqual({...x.local.sqlite.prepare("SELECT state,attempts FROM preview_subscriber_deliveries WHERE event_id='second'").get()},{state:'pending',attempts:0})
+})
+
+test('an expired claim during authorization fails without sending or retrying', async () => {
+  const x = fixture(), scope = 'a'.repeat(64), release = 'b'.repeat(40), now = Date.now()
+  x.local.sqlite.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email,allowed_events,updated_at) VALUES (?,1,1,'[\"incident.created\"]',0)").run(scope)
+  x.local.sqlite.prepare("INSERT INTO preview_subscribers(scope,user_id,email,status,events,monitor_ids,created_at,updated_at) VALUES (?,'owner','test@example.test','active','[\"incident.created\"]','[]',0,0)").run(scope)
+  x.local.sqlite.prepare('INSERT INTO preview_subscriber_leases(scope,slot,target,release,expires_at) VALUES (?,1,\'a\',?,?)').run(scope,release,now+120_000)
+  const config = {...x.env,PREVIEW_SUBSCRIBER_REQUIRED:'true',PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_SLOT:'1',PREVIEW_TARGET:'a',PREVIEW_RELEASE:release,SUBSCRIBERS_READY:'true'}
+  await enqueueSubscriberDeliveries(x.env.DB,'expired-during-auth','incident.created',[],now,undefined,config).run()
+  await flushPreviewSubscriberDeliveries(config,async () => { x.local.sqlite.prepare('UPDATE preview_subscriber_deliveries SET lease_until=?').run(Date.now()-1); return true })
+  assert.equal(x.calls,0)
+  await flushPreviewSubscriberDeliveries(config,async () => true)
+  assert.equal(x.calls,0)
+  assert.equal((x.local.sqlite.prepare('SELECT state FROM preview_subscriber_deliveries').get() as {state:string}).state,'failed')
+})
+
+test('unsubscribe, preference, settings, and identity changes during authorization cancel before send', async () => {
+  for (const mutation of ["UPDATE preview_subscribers SET status='unsubscribed'", "UPDATE preview_subscribers SET events='[]'", "UPDATE preview_subscribers SET monitor_ids='[\"other\"]'", "UPDATE preview_subscription_settings SET enabled=0", "UPDATE preview_subscription_settings SET allowed_events='[]'", "UPDATE users SET email='changed@example.test'"]) {
+    const x = fixture(), scope = 'a'.repeat(64), release = 'b'.repeat(40), now = Date.now()
+    x.local.sqlite.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email,allowed_events,updated_at) VALUES (?,1,1,'[\"incident.created\"]',0)").run(scope)
+    x.local.sqlite.prepare("INSERT INTO preview_subscribers(scope,user_id,email,status,events,monitor_ids,created_at,updated_at) VALUES (?,'owner','test@example.test','active','[\"incident.created\"]','[]',0,0)").run(scope)
+    x.local.sqlite.prepare('INSERT INTO preview_subscriber_leases(scope,slot,target,release,expires_at) VALUES (?,1,\'a\',?,?)').run(scope,release,now+120_000)
+    const config = {...x.env,PREVIEW_SUBSCRIBER_REQUIRED:'true',PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_SLOT:'1',PREVIEW_TARGET:'a',PREVIEW_RELEASE:release,SUBSCRIBERS_READY:'true'}
+    await enqueueSubscriberDeliveries(x.env.DB,'changed','incident.created',['component-a'],now,undefined,config).run()
+    await flushPreviewSubscriberDeliveries(config,async () => { x.local.sqlite.exec(mutation); return true })
+    assert.equal(x.calls,0)
+    assert.equal((x.local.sqlite.prepare('SELECT state FROM preview_subscriber_deliveries').get() as {state:string}).state,'cancelled')
+  }
 })
 
 test('deleting a shared identity cascades only its preview subscriptions and deliveries', async () => {

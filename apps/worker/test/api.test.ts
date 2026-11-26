@@ -97,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql', '0018_subscribers.sql', '0019_subscriber_deliveries.sql', '0020_preview_subscribers.sql', '0021_preview_audit_scope.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql', '0018_subscribers.sql', '0019_subscriber_deliveries.sql', '0020_preview_subscribers.sql', '0021_preview_audit_scope.sql', '0022_preview_audit_events.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -133,6 +133,7 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0019_subscriber_deliveries.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0020_preview_subscribers.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0021_preview_audit_scope.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0022_preview_audit_events.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -2096,7 +2097,15 @@ test('preview publication atomically queues only its lease-scoped subscribers', 
   try {
     const viewer = await db.prepare("SELECT id FROM users WHERE subject='viewer-id'").first<{id:string}>()
     assert.ok(viewer)
+    await db.prepare("INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES ('baseline-audit-fixture','tester@example.com','create','maintenance','baseline-audit-fixture',?,'{}')").bind(Date.now()).run()
+    await assert.rejects(() => db.batch([
+      db.prepare("INSERT INTO preview_audit_events (id,preview_scope,actor_email,action,entity_type,entity_id,created_at,details) VALUES ('rollback-preview-audit',?,'tester@example.com','create','maintenance','rollback-preview-audit',?,'{}')").bind(a,Date.now()),
+      db.prepare("INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES ('baseline-audit-fixture','tester@example.com','create','maintenance','duplicate',?,'{}')").bind(Date.now()),
+    ]))
+    assert.equal(await db.prepare("SELECT id FROM preview_audit_events WHERE id='rollback-preview-audit'").first(),null)
+    assert.equal(await db.prepare("SELECT id FROM audit_events WHERE id='rollback-preview-audit'").first(),null)
     await db.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email) VALUES (?,1,1)").bind(a).run()
+    for (const [scope,slot] of [[a,1],[b,2]] as const) await db.prepare("INSERT INTO preview_subscriber_leases(scope,slot,target,release,expires_at) VALUES (?,?,'a',?,?)").bind(scope,slot,'c'.repeat(40),Date.now()+60000).run()
     for (const scope of [a,b]) await db.prepare("INSERT INTO preview_subscribers(scope,user_id,email,status,events,monitor_ids,created_at,updated_at) VALUES (?,?,'viewer@example.com','active','[\"maintenance.scheduled\"]','[]',0,0)").bind(scope,viewer.id).run()
     const publication = {name:'Scoped publication test',description:'',startsAt:Date.now()+60_000,endsAt:Date.now()+120_000,monitorIds:[],notifySubscribers:true}
     const result = await request('/api/v1/bsp/admin/maintenance',operatorToken,'POST',publication,undefined,key)
@@ -2104,7 +2113,7 @@ test('preview publication atomically queues only its lease-scoped subscribers', 
     const fixture = await db.prepare("SELECT id FROM maintenance WHERE name='Scoped publication test'").first<{id:string}>()
     assert.ok(fixture)
     maintenanceId = fixture.id
-    assert.equal((await db.prepare("SELECT preview_scope FROM audit_events WHERE entity_type='maintenance' AND entity_id=? AND action='create'").bind(maintenanceId).first<{preview_scope:string}>())?.preview_scope,a)
+    assert.equal((await db.prepare("SELECT preview_scope FROM preview_audit_events WHERE entity_type='maintenance' AND entity_id=? AND action='create'").bind(maintenanceId).first<{preview_scope:string}>())?.preview_scope,a)
     const jobs = await db.prepare('SELECT scope,event_id FROM preview_subscriber_deliveries').all<{scope:string;event_id:string}>()
     assert.deepEqual(jobs.results.map(row => ({...row})),[{scope:a,event_id:maintenanceId}])
     assert.equal((await db.prepare('SELECT count(*) AS n FROM subscriber_deliveries').first<{n:number}>())?.n,0)
@@ -2122,15 +2131,38 @@ test('preview publication atomically queues only its lease-scoped subscribers', 
     const secondJob = await db.prepare('SELECT event_id FROM preview_subscriber_deliveries WHERE scope=?').bind(b).first<{event_id:string}>()
     assert.ok(secondJob)
     secondMaintenanceId = secondJob.event_id
-    assert.equal((await db.prepare("SELECT preview_scope FROM audit_events WHERE entity_type='maintenance' AND entity_id=? AND action='create'").bind(secondMaintenanceId).first<{preview_scope:string}>())?.preview_scope,b)
-    const auditLog = (await request('/api/v1/bsp/admin/audit-log?entityType=maintenance',adminToken)).body as unknown as {entries:Array<{entityId:string;diff:{previewScope?:string}}>}
-    assert.equal(auditLog.entries.find(entry => entry.entityId === maintenanceId)?.diff.previewScope,a)
+    assert.equal((await db.prepare("SELECT preview_scope FROM preview_audit_events WHERE entity_type='maintenance' AND entity_id=? AND action='create'").bind(secondMaintenanceId).first<{preview_scope:string}>())?.preview_scope,b)
+    const auditLog = (await request('/api/v1/bsp/admin/audit-log?limit=100',adminToken)).body as unknown as {entries:Array<{entityId:string;entityType:string;diff:{previewScope?:string}}>}
+    assert.ok(auditLog.entries.some(entry => entry.entityId === 'baseline-audit-fixture'))
+    assert.equal(auditLog.entries.find(entry => entry.entityId === maintenanceId)?.entityType,'preview_slot_1_maintenance')
+    assert.equal(auditLog.entries.find(entry => entry.entityId === maintenanceId)?.diff.previewScope,undefined)
     assert.equal(auditLog.entries.find(entry => entry.entityId === secondMaintenanceId)?.diff.previewScope,b)
+    mutable.PREVIEW_SUBSCRIBER_SCOPE = a
+    const firstLog = (await request('/api/v1/bsp/admin/audit-log?limit=100',adminToken)).body as unknown as typeof auditLog
+    assert.ok(firstLog.entries.some(entry => entry.entityId === 'baseline-audit-fixture'))
+    assert.equal(firstLog.entries.find(entry => entry.entityId === maintenanceId)?.diff.previewScope,a)
+    assert.equal(firstLog.entries.filter(entry => entry.entityId === maintenanceId).length,1)
+    assert.equal(firstLog.entries.find(entry => entry.entityId === secondMaintenanceId)?.entityType,'preview_slot_2_maintenance')
+    assert.equal(firstLog.entries.find(entry => entry.entityId === secondMaintenanceId)?.diff.previewScope,undefined)
+    delete mutable.PREVIEW_SUBSCRIBER_SCOPE
+    delete mutable.PREVIEW_SUBSCRIBER_REQUIRED
+    const baselineLog = (await request('/api/v1/bsp/admin/audit-log?limit=100',adminToken)).body as unknown as typeof auditLog
+    assert.ok(baselineLog.entries.some(entry => entry.entityId === 'baseline-audit-fixture'))
+    for (const [eventId,expectedType] of [[maintenanceId,'preview_slot_1_maintenance'],[secondMaintenanceId,'preview_slot_2_maintenance']] as const) {
+      const event = baselineLog.entries.find(entry => entry.entityId === eventId)
+      assert.equal(event?.entityType,expectedType)
+      assert.equal(event?.diff.previewScope,undefined)
+    }
     assert.notEqual(secondMaintenanceId,maintenanceId)
   } finally {
     await db.prepare('DELETE FROM preview_subscriber_deliveries').run()
     await db.prepare('DELETE FROM preview_subscribers').run()
     await db.prepare('DELETE FROM preview_subscription_settings').run()
+    await db.prepare('DELETE FROM preview_subscriber_leases').run()
+    await db.prepare("DELETE FROM audit_events WHERE id='baseline-audit-fixture'").run()
+    await db.prepare("DELETE FROM audit_events WHERE id='rollback-preview-audit'").run()
+    await db.prepare('DELETE FROM preview_audit_events WHERE preview_scope IN (?,?)').bind(a,b).run()
+    await db.prepare("DELETE FROM audit_events WHERE entity_id IN (?,?) AND entity_type IN ('preview_slot_1_maintenance','preview_slot_2_maintenance')").bind(maintenanceId,secondMaintenanceId).run()
     if (maintenanceId) await db.prepare('DELETE FROM maintenance WHERE id=?').bind(maintenanceId).run()
     if (secondMaintenanceId) await db.prepare('DELETE FROM maintenance WHERE id=?').bind(secondMaintenanceId).run()
     await db.prepare('DELETE FROM mutation_receipts WHERE request_key IN (?,?)').bind(`preview:${a}:${key}`,`preview:${b}:${key}`).run()

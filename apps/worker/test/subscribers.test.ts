@@ -28,7 +28,7 @@ const operator = { id:'o', email:'o@example.test', role:'operator' }
 const request = (method: string, data?: unknown) => new Request('https://status.example.test', { method, headers: { 'Content-Type':'application/json' }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) })
 function fixture() {
   const local = new DB()
-  for (const file of ['0001_board.sql', '0004_aliases.sql', '0018_subscribers.sql', '0020_preview_subscribers.sql', '0021_preview_audit_scope.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
+  for (const file of ['0001_board.sql', '0004_aliases.sql', '0018_subscribers.sql', '0020_preview_subscribers.sql', '0021_preview_audit_scope.sql', '0022_preview_audit_events.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
   local.db.exec("INSERT INTO users (id,issuer,subject,email,role) VALUES ('a','issuer','a','a@example.test','viewer'),('b','issuer','b','b@example.test','viewer'),('o','issuer','o','o@example.test','operator')")
   local.db.exec("UPDATE subscription_settings SET enabled=1,allow_email=1 WHERE id=1")
   const messages: Array<{text:string}> = []
@@ -109,7 +109,7 @@ test('preview leases isolate settings, enrollments, confirmations and admin oper
   const second = {...env, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:'b'.repeat(64)}
   const update = { enabled:true, allowEmail:true, allowComponentScope:true, allowedEvents:['incident.created'] }
   await subscriberApi(request('PUT',update),first,operator,'/admin/subscribers/settings')
-  assert.equal((local.db.prepare("SELECT preview_scope FROM audit_events WHERE entity_type='subscription_settings' ORDER BY rowid DESC").get() as {preview_scope:string}).preview_scope,first.PREVIEW_SUBSCRIBER_SCOPE)
+  assert.equal((local.db.prepare("SELECT preview_scope FROM preview_audit_events WHERE entity_type='subscription_settings' ORDER BY rowid DESC").get() as {preview_scope:string}).preview_scope,first.PREVIEW_SUBSCRIBER_SCOPE)
   assert.equal(((await (await subscriberApi(request('GET'),second,operator,'/admin/subscribers/settings')).json()) as {enabled:boolean}).enabled,false)
   await subscriberApi(request('PUT',update),second,operator,'/admin/subscribers/settings')
   await subscriberApi(request('POST',enrollment),first,owner,'/public/subscriptions')
@@ -128,8 +128,17 @@ test('preview leases isolate settings, enrollments, confirmations and admin oper
   const secondRecord = local.db.prepare('SELECT status FROM preview_subscribers WHERE scope=?').get(second.PREVIEW_SUBSCRIBER_SCOPE) as {status:string}
   assert.equal(secondRecord.status,'active')
   await subscriberApi(request('DELETE'),first,operator,`/admin/subscribers/${firstSearch.subscribers[0]!.id}`)
-  assert.equal((local.db.prepare("SELECT preview_scope FROM audit_events WHERE entity_type='subscriber' ORDER BY rowid DESC").get() as {preview_scope:string}).preview_scope,first.PREVIEW_SUBSCRIBER_SCOPE)
+  assert.equal((local.db.prepare("SELECT preview_scope FROM preview_audit_events WHERE entity_type='subscriber' ORDER BY rowid DESC").get() as {preview_scope:string}).preview_scope,first.PREVIEW_SUBSCRIBER_SCOPE)
+  assert.equal((local.db.prepare("SELECT count(*) AS n FROM audit_events WHERE entity_type IN ('subscription_settings','subscriber')").get() as {n:number}).n,0)
   assert.equal((local.db.prepare('SELECT count(*) AS n FROM subscribers').get() as {n:number}).n,0)
   await assert.rejects(() => subscriberApi(request('GET'),{...env,PREVIEW_SUBSCRIBER_REQUIRED:'true'},operator,'/admin/subscribers/settings'), /Missing preview subscriber scope/)
   await assert.rejects(() => subscriberApi(request('GET'),{...first,PREVIEW_SUBSCRIBER_SCOPE:'bad'},operator,'/admin/subscribers/settings'), /Invalid preview subscriber scope/)
+})
+
+test('shared preview mutations retain an explicit unknown label if their lease is absent', () => {
+  const {local} = fixture()
+  const scope = 'd'.repeat(64)
+  local.db.prepare("INSERT INTO preview_audit_events (id,preview_scope,actor_email,action,entity_type,entity_id,created_at,details) VALUES ('missing-lease',?,'actor@example.test','publish','incident','incident-id',1,'{}')").run(scope)
+  const baseline = local.db.prepare("SELECT entity_type,entity_id,preview_scope FROM audit_events WHERE id='missing-lease'").get() as {entity_type:string;entity_id:string;preview_scope:string}
+  assert.deepEqual({...baseline},{entity_type:'preview_unknown_incident',entity_id:'incident-id',preview_scope:scope})
 })

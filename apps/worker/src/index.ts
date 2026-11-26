@@ -206,7 +206,13 @@ function safeAuditDetails(input: unknown): Json {
 function parsedAuditDetails(value: unknown): Json {
   try { return safeAuditDetails(JSON.parse(String(value))) } catch { return {} }
 }
-async function auditPage(db: D1Database, request: Request): Promise<Response> {
+function auditSource(scope: string | null): {sql:string; values:string[]} {
+  if (!scope) return {sql:'(SELECT id,actor_email,action,entity_type,entity_id,created_at,details,rowid AS sort_rowid,0 AS source_order,NULL AS previewScope FROM audit_events)',values:[]}
+  return {sql:`(SELECT id,actor_email,action,entity_type,entity_id,created_at,details,rowid AS sort_rowid,0 AS source_order,NULL AS previewScope FROM audit_events a
+    WHERE NOT EXISTS (SELECT 1 FROM preview_audit_events own WHERE own.preview_scope=? AND own.id=a.id)
+    UNION ALL SELECT id,actor_email,action,entity_type,entity_id,created_at,details,rowid AS sort_rowid,1 AS source_order,preview_scope AS previewScope FROM preview_audit_events WHERE preview_scope=?)`,values:[scope,scope]}
+}
+async function auditPage(db: D1Database, request: Request, scope: string | null): Promise<Response> {
   const params = new URL(request.url).searchParams
   const number = (key: string, fallback: number, min: number, max: number) => {
     const raw = params.get(key)
@@ -228,18 +234,17 @@ async function auditPage(db: D1Database, request: Request): Promise<Response> {
     else { clauses.push(`${column}=?`); values.push(value) }
   }
   const where = clauses.join(' AND ')
-  const count = await stmt(db, `SELECT COUNT(*) AS count FROM audit_events WHERE ${where}`, ...values).first<{count:number}>()
-  const columns = await db.prepare('PRAGMA table_info(audit_events)').all<{name:string}>()
-  const scopeColumn = columns.results.some(column => column.name === 'preview_scope') ? 'preview_scope' : 'NULL'
-  const rows = await stmt(db, `SELECT id, actor_email AS userEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS timestamp, details, ${scopeColumn} AS previewScope FROM audit_events WHERE ${where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`, ...values, limit, (page - 1) * limit).all<{id:string; userEmail:string; action:string; entityType:string; entityId:string; timestamp:number; details:string; previewScope:string | null}>()
+  const source = auditSource(scope)
+  const count = await stmt(db, `SELECT COUNT(*) AS count FROM ${source.sql} WHERE ${where}`, ...source.values, ...values).first<{count:number}>()
+  const rows = await stmt(db, `SELECT id, actor_email AS userEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS timestamp, details, previewScope FROM ${source.sql} WHERE ${where} ORDER BY created_at DESC, source_order ASC, sort_rowid DESC LIMIT ? OFFSET ?`, ...source.values, ...values, limit, (page - 1) * limit).all<{id:string; userEmail:string; action:string; entityType:string; entityId:string; timestamp:number; details:string; previewScope:string | null}>()
   const total = count?.count ?? 0
   return json({ entries: rows.results.map(({ details, previewScope, ...row }) => ({ ...row, entityName: row.entityId, diff: { ...parsedAuditDetails(details), ...(previewScope && /^[0-9a-f]{64}$/.test(previewScope) ? { previewScope } : {}) } })), total, page, limit, pages: Math.max(1, Math.ceil(total / limit)) })
 }
 function audit(db: D1Database, user: User, action: string, entityType: string, entityId: string, details: Json, guard?: { table: string; token: string; id?: string }, previewScope: string | null = null): D1PreparedStatement {
   const values = [id(), user.email, action, entityType, entityId, Date.now(), JSON.stringify(safeAuditDetails(details))]
   if (previewScope) {
-    if (!guard) return stmt(db, 'INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details, preview_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', ...values, previewScope)
-    return stmt(db, `INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details, preview_scope) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ${guard.table} WHERE id=? AND mutation_key=?)`, ...values, previewScope, guard.id ?? entityId, guard.token)
+    if (!guard) return stmt(db, 'INSERT INTO preview_audit_events (id, actor_email, action, entity_type, entity_id, created_at, details, preview_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', ...values, previewScope)
+    return stmt(db, `INSERT INTO preview_audit_events (id, actor_email, action, entity_type, entity_id, created_at, details, preview_scope) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ${guard.table} WHERE id=? AND mutation_key=?)`, ...values, previewScope, guard.id ?? entityId, guard.token)
   }
   if (!guard) return stmt(db, 'INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) VALUES (?, ?, ?, ?, ?, ?, ?)', ...values)
   return stmt(db, `INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ${guard.table} WHERE id=? AND mutation_key=?)`, ...values, guard.id ?? entityId, guard.token)
@@ -422,8 +427,9 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (resource === 'components' && !recordId) return json(await listComponents(db, await listIncidents(db, false), await listMaintenance(db, false), env))
     if (resource === 'users' && !recordId) return json((await db.prepare('SELECT id, email, role, version FROM users ORDER BY email').all()).results)
     if (resource === 'audit' && !recordId) {
-      const rows = await db.prepare('SELECT id, actor_email AS actorEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS createdAt, details FROM audit_events ORDER BY created_at DESC LIMIT 200').all<Row>()
-      return json(rows.results.map(row => ({ ...row, details: JSON.stringify(parsedAuditDetails(row.details)) })))
+      const source = auditSource(subscriberScope(env))
+      const rows = await stmt(db, `SELECT id, actor_email AS actorEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS createdAt, details, previewScope FROM ${source.sql} ORDER BY created_at DESC, source_order ASC, sort_rowid DESC LIMIT 200`, ...source.values).all<Row>()
+      return json(rows.results.map(({previewScope, ...row}) => ({ ...row, details: JSON.stringify(parsedAuditDetails(row.details)), ...(typeof previewScope === 'string' && /^[0-9a-f]{64}$/.test(previewScope) ? { previewScope } : {}) })))
     }
     if (resource === 'checks' && !recordId) {
       const checks = (await db.prepare('SELECT id, component_id AS componentId, endpoint_id AS endpointId, enabled, interval_minutes AS intervalMinutes, expected_status AS expectedStatus, config_version AS version, advanced_config AS advancedConfig FROM http_checks').all<Row>()).results
@@ -771,7 +777,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   }
   if (route === '/admin/audit-log' && method === 'GET') {
     requireRole(user, 'admin')
-    return auditPage(db, request)
+    return auditPage(db, request, subscriberScope(env))
   }
   const aliasRows = await db.prepare('SELECT alias, entity_type, entity_id FROM entity_aliases').all<{alias:number;entity_type:string;entity_id:string}>()
   const aliases = aliasRows.results

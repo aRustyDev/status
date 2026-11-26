@@ -29,7 +29,8 @@ export async function flushPreviewSubscriberDeliveries(env: SubscriberEnv & { SU
       AND (json_array_length(d.component_ids)=0 OR json_array_length(s.monitor_ids)=0 OR EXISTS
         (SELECT 1 FROM json_each(s.monitor_ids) m JOIN json_each(d.component_ids) c ON m.value=c.value)) AND ${fence}`).bind(scope,job.id,lease,...fenceArgs()).first<{subscriber_id:number;email:string;event_type:string}>()
     if (!current || !subscriberAddressApproved(env,current.email) || !subscriberEmailReady(env)) {
-      await env.DB.prepare(`UPDATE preview_subscriber_deliveries SET state='cancelled',lease_token=NULL,lease_until=NULL,updated_at=? WHERE scope=? AND id=? AND lease_token=? AND ${fence}`).bind(Date.now(),scope,job.id,lease,...fenceArgs()).run()
+      const cancelledAt = Date.now()
+      await env.DB.prepare(`UPDATE preview_subscriber_deliveries SET state='cancelled',lease_token=NULL,lease_until=NULL,updated_at=? WHERE scope=? AND id=? AND lease_token=? AND lease_until>? AND ${fence}`).bind(cancelledAt,scope,job.id,lease,cancelledAt,...fenceArgs()).run()
       continue
     }
     // This check is immediately before the external call. A send already in flight
@@ -41,13 +42,35 @@ export async function flushPreviewSubscriberDeliveries(env: SubscriberEnv & { SU
     catch { /* An unavailable authorization service is not permission to send. */ }
     if (!authorized) {
       // No provider call was made; return the claim to pending if we still own it.
-      await env.DB.prepare(`UPDATE preview_subscriber_deliveries SET state='pending',attempts=attempts-1,lease_token=NULL,lease_until=NULL,updated_at=? WHERE scope=? AND id=? AND state='sending' AND lease_token=? AND ${fence}`).bind(Date.now(),scope,job.id,lease,...fenceArgs()).run()
+      const returnedAt = Date.now()
+      await env.DB.prepare(`UPDATE preview_subscriber_deliveries SET state='pending',attempts=attempts-1,lease_token=NULL,lease_until=NULL,updated_at=? WHERE scope=? AND id=? AND state='sending' AND lease_token=? AND lease_until>? AND ${fence}`).bind(returnedAt,scope,job.id,lease,returnedAt,...fenceArgs()).run()
       return
     }
+    // Authorization can be slow. Recheck the claim, subscription, settings,
+    // current user identity and deployment fence after it returns. A change
+    // after this final check can still race the external provider call.
+    const checkedAt = Date.now()
+    const final = await env.DB.prepare(`SELECT s.id AS subscriber_id,s.email,d.lease_until,l.expires_at FROM preview_subscriber_deliveries d
+      JOIN preview_subscribers s ON s.id=d.subscriber_id AND s.scope=d.scope
+      JOIN users u ON u.id=s.user_id JOIN preview_subscription_settings cfg ON cfg.scope=d.scope
+      JOIN preview_subscriber_leases l ON l.scope=d.scope AND l.slot=? AND l.target=? AND l.release=?
+      WHERE d.scope=? AND d.id=? AND d.state='sending' AND d.lease_token=? AND d.lease_until>?
+      AND l.expires_at>? AND s.status='active' AND cfg.enabled=1 AND cfg.allow_email=1
+      AND lower(s.email)=lower(u.email) AND d.created_at>=cfg.updated_at AND d.created_at>=s.updated_at
+      AND EXISTS (SELECT 1 FROM json_each(cfg.allowed_events) WHERE value=d.event_type)
+      AND EXISTS (SELECT 1 FROM json_each(s.events) WHERE value=d.event_type)
+      AND (json_array_length(d.component_ids)=0 OR json_array_length(s.monitor_ids)=0 OR EXISTS
+        (SELECT 1 FROM json_each(s.monitor_ids) m JOIN json_each(d.component_ids) c ON m.value=c.value))`).bind(Number(slot),target,release,scope,job.id,lease,checkedAt,checkedAt).first<{subscriber_id:number;email:string;lease_until:number;expires_at:number}>()
+    const beforeSend = Date.now()
+    if (!final || final.subscriber_id !== current.subscriber_id || final.email !== current.email || !subscriberAddressApproved(env,final.email) || !subscriberEmailReady(env)) {
+      await env.DB.prepare(`UPDATE preview_subscriber_deliveries SET state='cancelled',lease_token=NULL,lease_until=NULL,updated_at=? WHERE scope=? AND id=? AND state='sending' AND lease_token=? AND lease_until>? AND ${fence}`).bind(beforeSend,scope,job.id,lease,beforeSend,...fenceArgs()).run()
+      continue
+    }
+    if (final.lease_until <= beforeSend || final.expires_at <= beforeSend) continue
     let sent = false
     try {
       const text = `A status update has been published. Visit ${env.SUBSCRIBER_PUBLIC_URL!} to view it or manage your subscription.`
-      await env.SUBSCRIBER_EMAIL!.send({from:env.SUBSCRIBER_EMAIL_FROM!,to:current.email,subject:'Status page update',text})
+      await env.SUBSCRIBER_EMAIL!.send({from:env.SUBSCRIBER_EMAIL_FROM!,to:final.email,subject:'Status page update',text})
       sent = true
     } catch { /* Record only a generic failure code. */ }
     const finishedAt = Date.now()
