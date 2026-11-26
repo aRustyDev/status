@@ -21,3 +21,5 @@ The Cloudflare Actions screen adapts the upstream sortable action list, modal sh
 The Cloudflare monitor Actions panel reuses the upstream `ActionsSection`, adapted to accept Cloudflare UUID action identifiers as well as upstream numeric identifiers. Its action links are saved separately from monitor settings with a version check, and new monitors are saved before links can be configured. Action execution and persistence use the Workers and D1 implementation; Gatus-managed monitors remain read-only.
 
 The Cloudflare Static Fallback screen adapts the upstream settings and status presentation. The Node implementation accepts S3 credentials and publishes a public copy. This profile uses a private, deployment-bound R2 bucket and a separate Access-protected Worker. The status reader reuses the upstream snapshot data source and banner.
+
+The Cloudflare Users screen adapts the upstream Users table, role buttons, and shared components. The upstream page is coupled to Node account, password, and SSO APIs; Cloudflare Access manages identity and sign-in, while the Workers API manages application roles.
