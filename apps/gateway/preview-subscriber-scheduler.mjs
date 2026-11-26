@@ -8,7 +8,7 @@ export async function runPreviewSubscriberScheduler(env, dispatch) {
     if (!/^[1-6]$/.test(slot || '') || !['a', 'b'].includes(target) ||
         typeof selector !== 'string' || !new RegExp(`^${slot}\\.[a-f0-9]{32}$`).test(selector) ||
         !/^[a-f0-9]{40}$/.test(release || '') || !/^[a-f0-9]{64}$/.test(scope || '') || !FLAGS || !DB) return
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(selector))
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', new globalThis.TextEncoder().encode(selector))
     if (Array.from(new Uint8Array(digest), n => n.toString(16).padStart(2, '0')).join('') !== scope) return
     const enabled = await FLAGS.getBooleanDetails('status-preview-enabled', false)
     if (enabled.errorCode || !enabled.value) return
