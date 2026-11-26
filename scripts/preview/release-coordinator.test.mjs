@@ -59,3 +59,16 @@ test('a retry resumes a partially prepared candidate with its recorded resources
   })
   assert.equal(result.active.resources.databaseIntent.name, 'db')
 })
+
+test('duplicate deploy of an active commit leaves its schema resources and inventory untouched', async () => {
+  const inventory = store()
+  await deployRelease({ ref, sha, store: inventory, readRemoteHead: async () => sha,
+    prepare: async () => ({ database: { id: 'schema-id', owned: true }, gateway: 'worker' }), activate: async () => {},
+  })
+  const before = await inventory.read()
+  const result = await deployRelease({ ref, sha, store: inventory, readRemoteHead: async () => sha,
+    prepare: async () => assert.fail('must not create the schema database again'), activate: async () => assert.fail('must not reactivate'),
+  })
+  assert.deepEqual(await inventory.read(), before)
+  assert.equal(result.active.resources.database.id, 'schema-id')
+})

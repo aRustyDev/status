@@ -17,6 +17,9 @@ export async function deployRelease({ ref, sha, store, readRemoteHead, prepare, 
   if (snapshot.record.retainedCleanup) throw new Error('Retained resource cleanup requires reconciliation before deployment')
   const candidate = snapshot.record.candidate
   if (candidate && (candidate.sha !== sha || candidate.phase !== 'preparing')) throw new Error('Candidate requires reconciliation before deployment')
+  // Queued push and reconciliation runs may both target the same commit.
+  // Recreating a schema candidate would collide with its active D1 database.
+  if (!candidate && snapshot.record.active?.sha === sha) return snapshot.record
   let record = candidate ? snapshot.record : nextGeneration(snapshot.record, sha)
   const generation = record.generation
   if (!candidate) record = { ...record, candidate: { sha, generation, phase: 'preparing', resources: {} } }
