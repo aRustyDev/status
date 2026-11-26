@@ -1,0 +1,178 @@
+name: Branch previews
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: ['feat/**', 'fix/**', 'stage/**', 'schema/**']
+  delete:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Eligible branch to deploy; leave empty for reconciliation
+        type: string
+        required: false
+      sha:
+        description: Commit to deploy
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    if: >-
+      vars.PREVIEW_AUTO_ENABLED == 'true' &&
+      ((github.event_name == 'workflow_run' &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && inputs.branch != '' && inputs.sha != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted branch verification code
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+          path: controller
+      - name: Verify current branch and successful CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.branch }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.sha }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { githubBranches } from './controller/scripts/preview/branch-github.mjs'
+          const branches = githubBranches({ repository: process.env.GITHUB_REPOSITORY, token: process.env.GH_TOKEN, apiUrl: process.env.GITHUB_API_URL })
+          const ref = `refs/heads/${process.env.BRANCH}`
+          if (await branches.head(ref) !== process.env.EXPECTED_SHA || await branches.ciStatus(ref, process.env.EXPECTED_SHA) !== 'success') throw new Error('Branch head or successful CI does not match')
+          NODE
+      - name: Check out feature commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.sha }}
+          persist-credentials: false
+          path: feature
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: feature/.nvmrc
+      - name: Build feature assets without deployment credentials
+        working-directory: feature
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          npm ci
+          npm run build -w @bsp/shared
+          npm run build -w @bsp/board
+          npm run build -w @bsp/status
+          npm run build -w @bsp/admin
+      - name: Package feature source and assets
+        run: tar --exclude='feature/node_modules' --exclude='feature/.git' -czf feature.tar.gz feature
+      - uses: actions/upload-artifact@v7
+        with:
+          name: feature-${{ github.run_id }}
+          path: feature.tar.gz
+          retention-days: 1
+
+  deploy:
+    needs: build
+    if: needs.build.result == 'success' && vars.PREVIEW_AUTO_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: staging-preview
+    timeout-minutes: 30
+    concurrency:
+      group: status-branch-preview-controller
+      queue: max
+    steps:
+      - name: Check out trusted controller
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v8
+        with:
+          name: feature-${{ github.run_id }}
+      - name: Verify and unpack feature artifact
+        run: |
+          python3 - <<'PY'
+          import pathlib, tarfile
+          with tarfile.open('feature.tar.gz', 'r:gz') as archive:
+              members = archive.getmembers()
+              if len(members) > 100000 or sum(m.size for m in members) > 1024 ** 3:
+                  raise SystemExit('Feature artifact exceeds size limits')
+              for member in members:
+                  path = pathlib.PurePosixPath(member.name)
+                  if path.is_absolute() or not path.parts or path.parts[0] != 'feature' or '..' in path.parts or not (member.isfile() or member.isdir()):
+                      raise SystemExit('Unsafe feature artifact entry')
+              archive.extractall(path='.', members=members, filter='data')
+          PY
+          npm ci --ignore-scripts --prefix feature
+      - name: Verify branch still points to the tested commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.branch }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          git check-ref-format "refs/heads/$BRANCH"
+          case "$BRANCH" in feat/*|fix/*|stage/*|schema/*) ;; *) exit 1 ;; esac
+          ENCODED_BRANCH=$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$BRANCH")
+          ACTUAL_SHA=$(gh api "repos/$REPOSITORY/commits/$ENCODED_BRANCH" --jq .sha)
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+      - name: Deploy branch preview
+        env:
+          PREVIEW_ACTION: deploy
+          PREVIEW_BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.branch }}
+          PREVIEW_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.sha }}
+          PREVIEW_BRANCH_CONFIG: ${{ secrets.PREVIEW_BRANCH_CONFIG }}
+          PREVIEW_WORKER_SECRETS: ${{ secrets.PREVIEW_WORKER_SECRETS }}
+          FLAGSHIP_APP_ID: ${{ vars.FLAGSHIP_APP_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_BRANCH_PREVIEW_API_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/preview/controller-cli.mjs
+
+  reconcile:
+    if: >-
+      vars.PREVIEW_AUTO_ENABLED == 'true' && vars.PREVIEW_RECONCILE_ENABLED == 'true' &&
+      (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.branch == '') ||
+      (github.event_name == 'delete' && github.event.ref_type == 'branch'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    environment: staging-preview
+    timeout-minutes: 30
+    concurrency:
+      group: status-branch-preview-controller
+      queue: max
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - run: npm ci --ignore-scripts
+      - name: Reconcile remote branches and preview resources
+        env:
+          PREVIEW_ACTION: reconcile
+          PREVIEW_BRANCH_CONFIG: ${{ secrets.PREVIEW_BRANCH_CONFIG }}
+          PREVIEW_WORKER_SECRETS: ${{ secrets.PREVIEW_WORKER_SECRETS }}
+          FLAGSHIP_APP_ID: ${{ vars.FLAGSHIP_APP_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_BRANCH_PREVIEW_API_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/preview/controller-cli.mjs
