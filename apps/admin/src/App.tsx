@@ -141,7 +141,7 @@ export default function App() {
             <Route path="actions" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/actions') ? <Actions /> : <Unavailable />} />
             <Route path="notifications" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/notifications') ? <Notifications /> : <Unavailable />} />
             <Route path="vault" element={identity.role === 'admin' && capabilities.supportedRoutes.includes("/admin/vault") ? <Vault /> : <Unavailable />} />
-            <Route path="users" element={identity.role === 'admin' ? <Users /> : <Unavailable />} />
+            <Route path="users" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/users') ? <Users key={identity.id} identityId={identity.id} /> : <Unavailable />} />
             <Route path="audit-log" element={identity.role === 'admin' ? <Audit /> : <Unavailable />} />
             <Route path="backups" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/backups') ? <Backups /> : <Unavailable />} />
             <Route path="static-fallback" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/static-fallback') ? <StaticFallback /> : <Unavailable />} />
