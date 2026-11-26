@@ -86,3 +86,19 @@ test('admin search, CSV export and deletion are filtered and audited', async () 
   assert.equal((local.db.prepare('SELECT COUNT(*) AS n FROM subscribers').get() as {n:number}).n,0)
   assert.equal((local.db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_type='subscriber'").get() as {n:number}).n,1)
 })
+
+test('resubscription sends a fresh single-use confirmation after the cooldown', async () => {
+  const { env, local, messages } = fixture()
+  await subscriberApi(request('POST',enrollment),env,owner,'/public/subscriptions')
+  const first = /token=([0-9a-f]+)/.exec(messages[0]!.text)![1]!
+  await subscriberApi(request('POST',{token:first}),env,owner,'/public/subscriptions/confirm')
+  await subscriberApi(request('POST',{}),env,owner,'/public/subscriptions/unsubscribe')
+  await assert.rejects(() => subscriberApi(request('POST',enrollment),env,owner,'/public/subscriptions'), (error:unknown) => error instanceof SubscriberError && error.status === 429)
+  local.db.exec('UPDATE subscribers SET confirmation_sent_at=0')
+  await subscriberApi(request('POST',enrollment),env,owner,'/public/subscriptions')
+  const second = /token=([0-9a-f]+)/.exec(messages[1]!.text)![1]!
+  assert.notEqual(first,second)
+  assert.equal((local.db.prepare('SELECT status FROM subscribers').get() as {status:string}).status,'pending')
+  await subscriberApi(request('POST',{token:second}),env,owner,'/public/subscriptions/confirm')
+  assert.equal((local.db.prepare('SELECT status FROM subscribers').get() as {status:string}).status,'active')
+})

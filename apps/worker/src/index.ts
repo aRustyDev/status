@@ -45,9 +45,15 @@ interface Env extends EmailChannelEnv {
   FALLBACK_READY?: string
 }
 
-function requireSubscriberDelivery(env: Env, requested: unknown): void {
+async function subscriberDeliveryReady(env: Env): Promise<boolean> {
+  if (env.SUBSCRIBERS_READY !== 'true' || !subscriberEmailReady(env)) return false
+  const settings = await env.DB.prepare("SELECT 1 FROM subscription_settings WHERE id=1 AND enabled=1 AND allow_email=1 AND json_array_length(allowed_events)>0").first()
+  return !!settings
+}
+
+async function requireSubscriberDelivery(env: Env, requested: unknown): Promise<void> {
   if (requested !== undefined && typeof requested !== 'boolean') throw new HttpError(400, 'Invalid subscriber notification setting')
-  if (requested === true && (env.SUBSCRIBERS_READY !== 'true' || !subscriberEmailReady(env))) throw new HttpError(503, 'Subscriber delivery is unavailable')
+  if (requested === true && !await subscriberDeliveryReady(env)) throw new HttpError(503, 'Subscriber delivery is unavailable')
 }
 
 async function notificationsReady(env: Env): Promise<boolean> {
@@ -500,7 +506,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
         extra.push(stmt(db,`DELETE FROM incident_components WHERE incident_id=? AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE value=incident_components.component_id) AND EXISTS (SELECT 1 FROM incidents WHERE id=? AND mutation_key=?)`,recordId,JSON.stringify(ids),recordId,token))
         extra.push(...links(db,'incident_components','incident_id',recordId,ids,'incidents',token))
       }
-      if (!draft && (event === 'publish' || event === 'timeline_update')) requireSubscriberDelivery(env, body.notifySubscribers)
+      if (!draft && (event === 'publish' || event === 'timeline_update')) await requireSubscriberDelivery(env, body.notifySubscribers)
       if (env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true && !draft && (event === 'publish' || event === 'timeline_update')) {
         const linked = await stmt(db, 'SELECT component_id FROM incident_components WHERE incident_id=?',recordId).all<{component_id:string}>()
         const eventType = event === 'publish' ? (status === 'resolved' ? 'incident.resolved' : 'incident.created') : (status === 'resolved' ? 'incident.resolved' : 'incident.updated')
@@ -515,7 +521,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
   if (resource === 'maintenance') {
     if (method === 'POST' && !recordId) {
       const maintenanceId = id()
-      requireSubscriberDelivery(env, body.notifySubscribers)
+      await requireSubscriberDelivery(env, body.notifySubscribers)
       const name = string(body.name,'name',200)
       const description = body.description === undefined || body.description === '' ? '' : string(body.description,'description')
       const starts = timestamp(body.startsAt,'startsAt'), ends = timestamp(body.endsAt,'endsAt')
@@ -1008,7 +1014,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
     const notificationsAvailable = await notificationsReady(env)
     const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
-    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.SUBSCRIBERS_READY === 'true' ? ['/admin/subscribers'] : []), ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: env.SUBSCRIBERS_READY === 'true', subscriberDelivery: env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env), notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.SUBSCRIBERS_READY === 'true' ? ['/admin/subscribers'] : []), ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: env.SUBSCRIBERS_READY === 'true', subscriberDelivery: await subscriberDeliveryReady(env), notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
@@ -1083,7 +1089,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const status = choice(body.status ?? 'investigating', 'status', incidentStatuses.slice(0, 3))
     const message = string(body.body, 'body')
     if (typeof body.draft !== 'boolean') bad('Invalid draft')
-    if (!body.draft) requireSubscriberDelivery(env, body.notifySubscribers)
+    if (!body.draft) await requireSubscriberDelivery(env, body.notifySubscribers)
     const ids = componentUuids(body.monitorIds ?? [])
     await validateComponents(db, ids)
     const now = Date.now()

@@ -2014,3 +2014,26 @@ test('subscriber routes enforce Access identity, roles, origin and capability ga
     for (const key of Object.keys(subscriberConfig) as Array<keyof typeof subscriberConfig>) delete mutable[key]
   }
 })
+
+test('disabled subscription settings do not advertise or accept subscriber delivery', async () => {
+  const configured = {
+    SUBSCRIBERS_READY:'true', SUBSCRIBER_EMAIL_READY:'true', SUBSCRIBER_EMAIL_FROM:'sender@example.com',
+    SUBSCRIBER_PUBLIC_URL:'https://status.example',
+    SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'viewer',name:'Viewer',address:'viewer@example.com'}]),
+    SUBSCRIBER_EMAIL:{ send:async () => ({messageId:'test'}) },
+  }
+  const mutable = env as typeof env & Partial<typeof configured>
+  Object.assign(mutable,configured)
+  try {
+    await db.prepare('UPDATE subscription_settings SET enabled=0,allow_email=1 WHERE id=1').run()
+    const caps = await request('/api/v1/bsp/capabilities',operatorToken)
+    assert.equal((caps.body as unknown as {subscriberDelivery:boolean}).subscriberDelivery,false)
+    const incident = await request('/api/v1/bsp/admin/incidents',operatorToken,'POST',{title:'Disabled subscription test',body:'Opening',impact:'minor',status:'investigating',draft:false,monitorIds:[],notifySubscribers:true})
+    assert.equal(incident.response.status,503)
+    await db.prepare('UPDATE subscription_settings SET enabled=1 WHERE id=1').run()
+    assert.equal(((await request('/api/v1/bsp/capabilities',operatorToken)).body as unknown as {subscriberDelivery:boolean}).subscriberDelivery,true)
+  } finally {
+    await db.prepare('UPDATE subscription_settings SET enabled=0,allow_email=0 WHERE id=1').run()
+    for (const key of Object.keys(configured) as Array<keyof typeof configured>) delete mutable[key]
+  }
+})
