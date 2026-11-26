@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -39,11 +39,21 @@ function report(value) {
 async function checkMigrations(settings) {
   const approved = path.join(root, 'apps/worker/migrations')
   const candidate = path.join(branchDir, 'apps/worker/migrations')
+  const approvedHashes = settings.approvedMigrationHashes ?? {}
+  if (!approvedHashes || typeof approvedHashes !== 'object' || Array.isArray(approvedHashes)) fail('Invalid approved migration hashes')
+  for (const [name, hash] of Object.entries(approvedHashes)) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*\.sql$/.test(name) || typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash)) fail(`Invalid approved migration hash for ${name}`)
+  }
   const files = readdirSync(candidate).filter(name => name.endsWith('.sql'))
   for (const file of files) {
-    try {
-      if (!readFileSync(path.join(candidate, file)).equals(readFileSync(path.join(approved, file)))) fail(`Unapproved migration ${file}`)
-    } catch (error) { fail(`Migration ${file} is absent from or differs from main: ${error.message}`) }
+    const content = readFileSync(path.join(candidate, file))
+    const mainFile = path.join(approved, file)
+    if (existsSync(mainFile)) {
+      if (!content.equals(readFileSync(mainFile))) fail(`Migration ${file} differs from main`)
+    } else {
+      const hash = createHash('sha256').update(content).digest('hex')
+      if (approvedHashes[file] !== hash) fail(`Migration ${file} is absent from main and lacks an approved matching hash`)
+    }
   }
   const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account)}/d1/database/${encodeURIComponent(settings.d1DatabaseId)}/query`
   const response = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ sql: 'SELECT name FROM d1_migrations' }) })
