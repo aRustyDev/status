@@ -479,7 +479,7 @@ function MethodChooser({ methods, onChoose }: { methods: SubscriptionMethod[]; o
   )
 }
 
-export function SubscribeDialog({ options, onClose }: { options: PublicSubscriptionOptions; onClose: () => void }) {
+export function SubscribeDialog({ options, onClose, email }: { options: PublicSubscriptionOptions; onClose: () => void; email?: string | undefined }) {
   const { t } = useLocale()
   const [method, setMethod] = useState<SubscriptionMethod | null>(null)
   const title = method ? t(METHOD_INFO[method].label) : t('subscribe.title')
@@ -502,7 +502,7 @@ export function SubscribeDialog({ options, onClose }: { options: PublicSubscript
           {method === 'slack' ? <SlackInstructions base={publicBase(options)} />
             : method === 'rss' ? <RssInstructions base={publicBase(options)} />
             : method === 'api' ? <ApiInstructions base={publicBase(options)} />
-            : <SignupForm type={method} options={options} onClose={onClose} />}
+            : <SignupForm type={method} options={options} onClose={onClose} email={email} />}
         </div>
       )}
     </Dialog>
@@ -510,11 +510,11 @@ export function SubscribeDialog({ options, onClose }: { options: PublicSubscript
 }
 
 /** The email and webhook signup, which needs confirmation by email. */
-function SignupForm({ type, options, onClose }: { type: SubscriberType; options: PublicSubscriptionOptions; onClose: () => void }) {
+function SignupForm({ type, options, onClose, email: accountEmail }: { type: SubscriberType; options: PublicSubscriptionOptions; onClose: () => void; email?: string | undefined }) {
   const { t } = useLocale()
   const emailId = useId()
   const urlId = useId()
-  const [email, setEmail] = useState('')
+  const [email, setEmail] = useState(accountEmail ?? '')
   const [webhookUrl, setWebhookUrl] = useState('')
   const [webhook, setWebhook] = useState<WebhookConfig>({ method: 'POST', headers: [], notifyOnFailure: true })
   const [website, setWebsite] = useState('')
@@ -561,7 +561,7 @@ function SignupForm({ type, options, onClose }: { type: SubscriberType; options:
 
       <div>
         <FieldLabel htmlFor={emailId}>{t('subscribe.email')}</FieldLabel>
-        <input id={emailId} type="email" required autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} className="bsp-input" style={inputStyle} />
+        <input id={emailId} type="email" required autoComplete="email" readOnly={!!accountEmail} value={email} onChange={(e) => setEmail(e.target.value)} className="bsp-input" style={inputStyle} />
         {type === 'webhook' && <p className="text-xs mt-1.5" style={{ color: 'var(--bsp-text-muted)' }}>{t('subscribe.webhookEmailHint')}</p>}
       </div>
 
@@ -709,16 +709,17 @@ function webhookConfigFrom(prefs: SubscriptionPreferences): WebhookConfig | null
   }
 }
 
-export function SubscriptionLinkDialog({ link, options, optionsFailed = false, onClose }: {
+export function SubscriptionLinkDialog({ link, options, optionsFailed = false, onClose, email }: {
   link: { mode: LinkMode; token: string }
   options: PublicSubscriptionOptions | undefined
   /** The options request failed, so the preferences form can never appear. */
   optionsFailed?: boolean
   onClose: () => void
+  email?: string | undefined
 }) {
   return link.mode === 'confirm'
     ? <ConfirmLinkDialog token={link.token} onClose={onClose} />
-    : <ManageLinkDialog link={{ mode: link.mode, token: link.token }} options={options} optionsFailed={optionsFailed} onClose={onClose} />
+    : <ManageLinkDialog link={{ mode: link.mode, token: link.token }} options={options} optionsFailed={optionsFailed} onClose={onClose} email={email} />
 }
 
 /**
@@ -745,7 +746,7 @@ function ConfirmLinkDialog({ token, onClose }: { token: string; onClose: () => v
     <Dialog title={title} onClose={onClose}>
       <div className="space-y-5">
         {state === 'confirming' && <p className="text-sm" style={{ color: 'var(--bsp-text-muted)' }}>{t('subscribe.confirming')}</p>}
-        {state === 'done' && <Notice tone="ok">{t('subscribe.confirmedEmailSent')}</Notice>}
+        {state === 'done' && <Notice tone="ok">{t('subscribe.confirmed')}</Notice>}
         {state === 'invalid' && <Notice tone="error">{t('subscribe.invalidLink')}</Notice>}
         {state === 'error' && <Notice tone="error">{t('subscribe.error')}</Notice>}
         {state !== 'confirming' && (
@@ -756,11 +757,12 @@ function ConfirmLinkDialog({ token, onClose }: { token: string; onClose: () => v
   )
 }
 
-function ManageLinkDialog({ link, options, optionsFailed, onClose }: {
+function ManageLinkDialog({ link, options, optionsFailed, onClose, email }: {
   link: { mode: Exclude<LinkMode, 'confirm'>; token: string }
   options: PublicSubscriptionOptions | undefined
   optionsFailed: boolean
   onClose: () => void
+  email?: string | undefined
 }) {
   const { t } = useLocale()
   const [mode, setMode] = useState<Exclude<LinkMode, 'confirm'>>(link.mode)
@@ -810,6 +812,11 @@ function ManageLinkDialog({ link, options, optionsFailed, onClose }: {
 
   const save = (resubscribe = false) => run(async () => {
     if (!scope) return
+    if (resubscribe && email) {
+      await send('POST', '', { type: 'email', email, ...scope })
+      setNotice({ tone: 'ok', text: t('subscribe.checkInbox') })
+      return
+    }
     const webhookFields = prefs?.type === 'webhook' && webhook
       ? { webhookMethod: webhook.method, webhookHeaders: cleanHeaders(webhook.headers, prefs.webhookHeaderNames), notifyOnFailure: webhook.notifyOnFailure }
       : {}

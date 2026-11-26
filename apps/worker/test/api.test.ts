@@ -97,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql', '0018_subscribers.sql', '0019_subscriber_deliveries.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -129,6 +129,8 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0016_dependency_observations.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0015_monitor_request.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0017_monitor_action_links.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0018_subscribers.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0019_subscriber_deliveries.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -1974,5 +1976,41 @@ test('saved Vault header tests do not require the monitoring API to hold the Vau
     if (vaultId) await db.prepare('DELETE FROM vaults WHERE id=?').bind(vaultId).run()
     await db.prepare('DELETE FROM vault_key_verifier').run()
     delete env.PROBE; delete env.VAULT_ENCRYPTION_KEY; delete env.MONITOR_AUTH_READY; delete env.MONITOR_REQUEST_READY; env.ENDPOINTS = '[]'
+  }
+})
+
+test('publication fails before writes when requested subscriber delivery is unavailable', async () => {
+  const incident = await request('/api/v1/bsp/admin/incidents', operatorToken, 'POST', {title:'Unavailable delivery test',body:'Opening',impact:'minor',status:'investigating',draft:false,monitorIds:[],notifySubscribers:true})
+  assert.equal(incident.response.status,503)
+  const maintenance = await request('/api/v1/bsp/admin/maintenance', operatorToken, 'POST', {name:'Unavailable delivery test',description:'',startsAt:Date.now()+60_000,endsAt:Date.now()+120_000,monitorIds:[],notifySubscribers:true})
+  assert.equal(maintenance.response.status,503)
+  const stored = await db.prepare("SELECT count(*) AS n FROM incidents WHERE title='Unavailable delivery test'").first<{n:number}>()
+  assert.equal(stored?.n,0)
+})
+
+test('subscriber routes enforce Access identity, roles, origin and capability gates', async () => {
+  const subscriberConfig = {
+    SUBSCRIBERS_READY: 'true', SUBSCRIBER_EMAIL_READY: 'true',
+    SUBSCRIBER_EMAIL_FROM: 'sender@example.com', SUBSCRIBER_PUBLIC_URL: 'https://status.example',
+    SUBSCRIBER_EMAIL_DESTINATIONS: JSON.stringify([{id:'viewer',name:'Viewer',address:'viewer@example.com'}]),
+    SUBSCRIBER_EMAIL: { send: async () => ({messageId:'test'}) },
+  }
+  const mutable = env as typeof env & Partial<typeof subscriberConfig>
+  Object.assign(mutable, subscriberConfig)
+  try {
+    await db.prepare('UPDATE subscription_settings SET enabled=1,allow_email=1 WHERE id=1').run()
+    assert.equal((await request('/api/v1/bsp/public/subscriptions/options')).response.status,401)
+    assert.equal((await request('/api/v1/bsp/admin/subscribers/search',viewerToken,'POST',{})).response.status,403)
+    assert.equal((await request('/api/v1/bsp/admin/subscribers/search',operatorToken,'POST',{})).response.status,200)
+    const enrollment = {type:'email',email:'viewer@example.com',events:['incident.created'],monitorIds:[],tags:[]}
+    assert.equal((await request('/api/v1/bsp/public/subscriptions',viewerToken,'POST',enrollment,'https://wrong.example')).response.status,403)
+    assert.equal((await request('/api/v1/bsp/public/subscriptions',viewerToken,'POST',enrollment)).response.status,202)
+    assert.equal((await request('/api/v1/bsp/public/subscriptions/preferences',operatorToken,'POST',{})).response.status,404)
+    mutable.SUBSCRIBERS_READY = 'false'
+    assert.equal((await request('/api/v1/bsp/public/subscriptions/preferences',viewerToken,'POST',{})).response.status,503)
+  } finally {
+    await db.prepare('DELETE FROM subscribers').run()
+    await db.prepare('UPDATE subscription_settings SET enabled=0,allow_email=0 WHERE id=1').run()
+    for (const key of Object.keys(subscriberConfig) as Array<keyof typeof subscriberConfig>) delete mutable[key]
   }
 })

@@ -1,6 +1,4 @@
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { deliveryHistoryUrl } from '../deliveryHistoryUrl'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { SUBSCRIBER_EVENT_TYPES, SUBSCRIPTION_METHODS, subscriptionMethodStatuses } from '@bsp/shared'
 import type {
@@ -40,7 +38,7 @@ const panelStyle = { background: 'var(--m3-surface-container-lowest)', border: '
 const METHOD_CONFIG: Record<SubscriptionMethod, { title: string; icon: string; toggle: MethodToggle; description: string }> = {
   email: {
     title: 'Email', icon: 'mail', toggle: 'allowEmail',
-    description: 'Visitors enter their address and confirm it with a link (double opt-in). Every email carries a manage link and one-click unsubscribe.',
+    description: 'Approved visitors confirm their signed-in email address to receive updates.',
   },
   webhook: {
     title: 'Webhook', icon: 'webhook', toggle: 'allowWebhook',
@@ -61,12 +59,9 @@ const METHOD_CONFIG: Record<SubscriptionMethod, { title: string; icon: string; t
 }
 
 function subscribersQuery(filter: Filter, search: string, page: number) {
-  const params = new URLSearchParams({ page: String(page), limit: '25' })
-  if (filter !== 'all') params.set('status', filter)
-  if (search) params.set('search', search)
   return {
     queryKey: ['subscribers', filter, search, page],
-    queryFn: () => api.get<SubscriberList>(`/admin/subscribers?${params.toString()}`),
+    queryFn: () => api.post<SubscriberList>('/admin/subscribers/search', { status: filter === 'all' ? undefined : filter, search, page, limit: 25 }),
   }
 }
 
@@ -90,10 +85,10 @@ export default function SubscribersPage() {
         title="Subscribers"
         subtitle="Choose how visitors of the status page can follow incidents and maintenance"
         actions={
-          <Link to={deliveryHistoryUrl('subscribers')} className="btn btn-secondary">
+          <button type="button" className="btn btn-secondary" disabled title="Delivery history is unavailable">
             <span className="material-symbols-outlined" aria-hidden="true">history</span>
             Delivery history
-          </Link>
+          </button>
         }
       >
         <div role="tablist" aria-label="Subscribers sections" className="flex gap-6" style={{ borderBottom: '1px solid var(--m3-outline-variant)' }}>
@@ -141,10 +136,10 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 function ProblemText({ problem }: { problem: SubscriptionMethodProblem }) {
   switch (problem) {
     case 'disabled': return <>Turn on <strong>Allow visitors to subscribe</strong> above.</>
-    case 'smtp': return <>SMTP is not configured — set it up in <Link to="/admin/notifications" className="underline">Notifications → SMTP Settings</Link>.</>
+    case 'smtp': return <>Email delivery is unavailable.</>
     case 'publicUrl': return <>Set <code>PUBLIC_URL</code> in the server environment and restart — confirmation links point to it.</>
     case 'events': return <>Allow at least one notification type below.</>
-    case 'private': return <>The status page is private, and feed readers, Slack and scripts cannot sign in. Make it public in <Link to="/admin/users" className="underline">Users → Status page access</Link>.</>
+    case 'private': return <>This method is unavailable on the protected status page.</>
   }
 }
 
@@ -155,7 +150,8 @@ function MethodRow({ method, status, onToggle, feedBase }: {
   feedBase: string
 }) {
   const config = METHOD_CONFIG[method]
-  const badge = !status.enabled
+  const unsupported = method !== 'email'
+  const badge = unsupported ? { label: 'Unavailable', bg: 'var(--m3-surface-container-high)', fg: 'var(--m3-secondary)' } : !status.enabled
     ? { label: 'Off', bg: 'var(--m3-surface-container-high)', fg: 'var(--m3-secondary)' }
     : status.available
       ? { label: 'Offered to visitors', bg: 'var(--m3-up-bg)', fg: 'var(--m3-up)' }
@@ -176,7 +172,7 @@ function MethodRow({ method, status, onToggle, feedBase }: {
           <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: badge.bg, color: badge.fg }}>{badge.label}</span>
         </div>
         <p className="text-xs max-w-[720px]" style={{ color: 'var(--m3-secondary)' }}>{config.description}</p>
-        {status.enabled && status.problems.length > 0 && (
+        {!unsupported && status.enabled && status.problems.length > 0 && (
           <ul className="text-xs space-y-1 pt-1.5" style={{ color: 'var(--m3-on-surface-variant)' }}>
             {status.problems.map((problem) => (
               <li key={problem} className="flex gap-1.5">
@@ -186,7 +182,7 @@ function MethodRow({ method, status, onToggle, feedBase }: {
             ))}
           </ul>
         )}
-        {status.enabled && urls.length > 0 && (
+        {!unsupported && status.enabled && urls.length > 0 && (
           <div className="pt-1.5 space-y-1.5">
             {urls.map((url) => (
               <div key={url} className="flex items-center gap-2 max-w-[640px] py-1 pl-2.5 pr-1 rounded-lg font-mono text-xs" style={{ background: 'var(--m3-surface-container)', color: 'var(--m3-on-surface-variant)' }}>
@@ -197,7 +193,7 @@ function MethodRow({ method, status, onToggle, feedBase }: {
           </div>
         )}
       </div>
-      <Switch checked={status.enabled} onChange={onToggle} aria-label={`Enable ${config.title}`} />
+      <Switch checked={unsupported ? false : status.enabled} onChange={onToggle} disabled={unsupported} aria-label={`Enable ${config.title}`} />
     </div>
   )
 }
@@ -232,7 +228,7 @@ function SettingsPanel({ settings }: { settings: AdminSubscriptionSettings }) {
   const feedBase = publicUrl || window.location.origin
   // Same rule the server applies, evaluated on the unsaved draft so every change shows its effect.
   const statuses = subscriptionMethodStatuses(draft, { smtpConfigured: settings.smtpConfigured, publicUrl, statusPagePrivate: settings.statusPagePrivate })
-  const offered = SUBSCRIPTION_METHODS.filter((method) => statuses[method].available)
+  const offered = SUBSCRIPTION_METHODS.filter((method) => method === 'email' && statuses[method].available)
   const dirty = JSON.stringify(draft) !== JSON.stringify(pick(settings))
   const offeredText = !draft.enabled ? 'Off — the Subscribe button is hidden and subscribers receive nothing.'
     : offered.length ? `Visitors choose from: ${offered.map((m) => METHOD_CONFIG[m].title).join(', ')}`
@@ -283,7 +279,7 @@ function SettingsPanel({ settings }: { settings: AdminSubscriptionSettings }) {
               </label>
             ))}
             <p className="text-xs pt-1" style={{ color: 'var(--m3-secondary)' }}>
-              Applies to email, webhook and Slack. Subscribers pick from these; monitor status flaps are never sent — only what you publish.
+              Subscribers pick which published updates they receive.
             </p>
           </div>
         </div>
@@ -292,7 +288,7 @@ function SettingsPanel({ settings }: { settings: AdminSubscriptionSettings }) {
           <SectionLabel>Scope</SectionLabel>
           <Switch
             label="Let subscribers choose components"
-            description="Email and webhook subscribers can follow only selected monitors or tags. Only monitors placed on the public page are offered. Incidents with no linked monitors go to everyone."
+            description="Subscribers can follow selected components. Updates without linked components go to everyone."
             checked={draft.allowComponentScope}
             onChange={(v) => set('allowComponentScope', v)}
           />
@@ -360,13 +356,7 @@ function SubscriberTable() {
   })
 
   function exportCsv(ids?: number[]) {
-    const params = new URLSearchParams()
-    if (ids) params.set('ids', ids.join(','))
-    else {
-      if (filter !== 'all') params.set('status', filter)
-      if (term) params.set('search', term)
-    }
-    api.download(`/admin/subscribers/export?${params.toString()}`, ids ? 'subscribers-selected.csv' : 'subscribers.csv')
+    api.downloadPost('/admin/subscribers/export', { ids, status: filter === 'all' ? undefined : filter, search: term }, ids ? 'subscribers-selected.csv' : 'subscribers.csv')
       .catch(() => toast.error('Export failed'))
   }
 
@@ -527,14 +517,9 @@ function SubscriberTable() {
                       )}
                     </td>
                     <td className="py-2 pr-4 pl-0 align-top text-right whitespace-nowrap">
-                      <Link
-                        to={deliveryHistoryUrl('subscribers', s.id)}
-                        aria-label={`Delivery history for ${destination(s)}`}
-                        title="Delivery history"
-                        className="btn-icon"
-                      >
+                      <button type="button" disabled aria-label={`Delivery history for ${destination(s)} is unavailable`} title="Delivery history is unavailable" className="btn-icon">
                         <span className="material-symbols-outlined" aria-hidden="true">history</span>
-                      </Link>
+                      </button>
                       <button
                         type="button"
                         onClick={() => setConfirmDelete([s])}

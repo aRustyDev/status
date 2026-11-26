@@ -8,7 +8,7 @@ import { api } from '../api/client'
 import { ToastProvider } from '@better-forge/ui'
 import SubscribersPage from './Subscribers'
 
-vi.mock('../api/client', () => ({ api: { get: vi.fn(), put: vi.fn(), delete: vi.fn(), download: vi.fn() } }))
+vi.mock('../api/client', () => ({ api: { get: vi.fn(), post: vi.fn(), put: vi.fn(), delete: vi.fn(), downloadPost: vi.fn() } }))
 
 const base = {
   enabled: true,
@@ -46,11 +46,8 @@ function renderPage() {
 describe('SubscribersPage methods', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.mocked(api.get).mockImplementation(async (path: string) => (
-      path === '/admin/subscribers/settings'
-        ? settings()
-        : path === '/admin/monitors' ? [] : { subscribers: [], stats: { total: 0, active: 0, pending: 0, unsubscribed: 0, disabled: 0 }, total: 0, page: 1, limit: 25, pages: 0 }
-    ) as never)
+    vi.mocked(api.get).mockImplementation(async (path: string) => (path === '/admin/subscribers/settings' ? settings() : []) as never)
+    vi.mocked(api.post).mockResolvedValue({ subscribers: [], stats: { total: 0, active: 0, pending: 0, unsubscribed: 0, disabled: 0 }, total: 0, page: 1, limit: 25, pages: 1 } as never)
   })
 
   it('keeps the table headers when empty and resets a filter from the empty row', async () => {
@@ -59,7 +56,7 @@ describe('SubscribersPage methods', () => {
 
     expect(await screen.findByText('No subscribers yet')).toBeInTheDocument()
     expect(screen.getByRole('columnheader', { name: 'Destination' })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'Delivery history' })).toHaveAttribute('href', '/admin/delivery-history?tab=subscribers')
+    expect(screen.getByRole('button', { name: 'Delivery history' })).toBeDisabled()
 
     await user.click(screen.getByRole('button', { name: /^Pending/ }))
     expect(await screen.findByText('No subscribers match this filter')).toBeInTheDocument()
@@ -68,47 +65,17 @@ describe('SubscribersPage methods', () => {
     expect(await screen.findByText('No subscribers yet')).toBeInTheDocument()
   })
 
-  it('explains why email and webhook are hidden while Slack is offered', async () => {
+  it('disables unsupported methods and keeps email available when configured', async () => {
     const user = userEvent.setup()
     renderPage()
     await user.click(await screen.findByRole('tab', { name: /^Settings/ }))
-    const email = await screen.findByTestId('method-email')
-    expect(within(email).getByText('Not available')).toBeInTheDocument()
-    expect(within(email).getByText(/SMTP is not configured/)).toBeInTheDocument()
-    expect(within(email).getByText(/in the server environment/)).toBeInTheDocument()
-    expect(within(screen.getByTestId('method-webhook')).getByText('Not available')).toBeInTheDocument()
-    expect(within(screen.getByTestId('method-slack')).getByText('Offered to visitors')).toBeInTheDocument()
-    expect(within(screen.getByTestId('method-rss')).getByText('Off')).toBeInTheDocument()
-    expect(screen.getByText('Visitors choose from: Slack')).toBeInTheDocument()
+    expect(within(screen.getByTestId('method-email')).getByText('Not available')).toBeInTheDocument()
+    expect(within(screen.getByTestId('method-email')).getByText('Email delivery is unavailable.')).toBeInTheDocument()
+    for (const method of ['webhook', 'slack', 'rss', 'api']) {
+      expect(within(screen.getByTestId(`method-${method}`)).getByRole('switch')).toBeDisabled()
+    }
   })
 
-  it('updates what visitors are offered as soon as a method is toggled', async () => {
-    const user = userEvent.setup()
-    renderPage()
-    await user.click(await screen.findByRole('tab', { name: /^Settings/ }))
-    const rss = await screen.findByTestId('method-rss')
-    await user.click(within(rss).getByRole('switch', { name: 'Enable RSS / Atom' }))
-    expect(within(rss).getByText('Offered to visitors')).toBeInTheDocument()
-    expect(screen.getByText('Visitors choose from: Slack, RSS / Atom')).toBeInTheDocument()
-    expect(screen.getByText('You have unsaved changes')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Save settings' })).toBeEnabled()
-  })
-
-  it('saves with the floating bar and discards back to the saved values', async () => {
-    const user = userEvent.setup()
-    vi.mocked(api.put).mockResolvedValue(settings({ rssEnabled: true }) as never)
-    renderPage()
-    await user.click(await screen.findByRole('tab', { name: /^Settings/ }))
-    await user.click(within(await screen.findByTestId('method-rss')).getByRole('switch', { name: 'Enable RSS / Atom' }))
-    await user.click(screen.getByRole('button', { name: 'Discard' }))
-    expect(screen.queryByText('You have unsaved changes')).not.toBeInTheDocument()
-    expect(within(screen.getByTestId('method-rss')).getByText('Off')).toBeInTheDocument()
-
-    await user.click(within(screen.getByTestId('method-rss')).getByRole('switch', { name: 'Enable RSS / Atom' }))
-    await user.click(screen.getByRole('button', { name: 'Save settings' }))
-    await waitFor(() => expect(api.put).toHaveBeenCalledWith('/admin/subscribers/settings', expect.objectContaining({ rssEnabled: true })))
-    expect(await screen.findByText(/Saved — the status page picks it up/)).toBeInTheDocument()
-  })
 })
 
 describe('SubscribersPage table', () => {
@@ -125,10 +92,11 @@ describe('SubscribersPage table', () => {
       path === '/admin/subscribers/settings' ? settings() : path === '/admin/monitors' ? [] : list()
     ) as never)
     vi.mocked(api.delete).mockResolvedValue(undefined as never)
-    vi.mocked(api.download).mockResolvedValue(undefined as never)
+    vi.mocked(api.downloadPost).mockResolvedValue(undefined as never)
+    vi.mocked(api.post).mockResolvedValue(list() as never)
   })
 
-  const subscriberCalls = () => vi.mocked(api.get).mock.calls.map(([path]) => String(path)).filter((path) => path.startsWith('/admin/subscribers?'))
+  const subscriberCalls = () => vi.mocked(api.post).mock.calls.filter(([path]) => path === '/admin/subscribers/search').map(([, body]) => body as { search?: string; page?: number; status?: string })
 
   it('debounces search, pages with the shared pagination and confirms deletes', async () => {
     const user = userEvent.setup()
@@ -136,11 +104,11 @@ describe('SubscribersPage table', () => {
     expect(await screen.findByText('reader@example.test')).toBeInTheDocument()
 
     await user.type(screen.getByRole('searchbox', { name: 'Search subscribers' }), 'rea')
-    await waitFor(() => expect(subscriberCalls().some((path) => path.includes('search=rea'))).toBe(true))
-    expect(subscriberCalls().filter((path) => /search=r(&|$)|search=re(&|$)/.test(path))).toHaveLength(0)
+    await waitFor(() => expect(subscriberCalls().some((body) => body.search === 'rea')).toBe(true))
+    expect(subscriberCalls().filter((body) => body.search === 'r' || body.search === 're')).toHaveLength(0)
 
     await user.click(screen.getByRole('button', { name: 'Next page' }))
-    await waitFor(() => expect(subscriberCalls().at(-1)).toContain('page=2'))
+    await waitFor(() => expect(subscriberCalls().at(-1)).toMatchObject({ page: 2 }))
 
     await user.click(screen.getByRole('button', { name: 'Delete reader@example.test' }))
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete' }))
@@ -155,12 +123,12 @@ describe('SubscribersPage table', () => {
     expect(screen.getByRole('button', { name: /^All/ })).toHaveAttribute('aria-pressed', 'true')
     await user.click(screen.getByRole('button', { name: /^Paused/ }))
     expect(screen.getByRole('button', { name: /^Paused/ })).toHaveAttribute('aria-pressed', 'true')
-    await waitFor(() => expect(subscriberCalls().at(-1)).toContain('status=disabled'))
+    await waitFor(() => expect(subscriberCalls().at(-1)).toMatchObject({ status: 'disabled' }))
   })
 
   it('links each row to the delivery history of its subscriber', async () => {
     renderPage()
-    expect(await screen.findByRole('link', { name: 'Delivery history for reader@example.test' })).toHaveAttribute('href', '/admin/delivery-history?tab=subscribers&subscriberId=7')
+    expect(await screen.findByRole('button', { name: 'Delivery history for reader@example.test is unavailable' })).toBeDisabled()
   })
 
   it('exports the filtered list, or only the selected rows, and deletes a selection in bulk', async () => {
@@ -170,12 +138,12 @@ describe('SubscribersPage table', () => {
 
     await user.click(screen.getByRole('button', { name: /^Active/ }))
     await user.click(screen.getByRole('button', { name: 'Export CSV' }))
-    expect(api.download).toHaveBeenLastCalledWith('/admin/subscribers/export?status=active', 'subscribers.csv')
+    expect(api.downloadPost).toHaveBeenLastCalledWith('/admin/subscribers/export', expect.objectContaining({ status: 'active' }), 'subscribers.csv')
 
     await user.click(screen.getByRole('checkbox', { name: 'Select all' }))
     expect(screen.getByText('1 selected')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Export selected' }))
-    expect(api.download).toHaveBeenLastCalledWith('/admin/subscribers/export?ids=7', 'subscribers-selected.csv')
+    expect(api.downloadPost).toHaveBeenLastCalledWith('/admin/subscribers/export', expect.objectContaining({ ids: [7] }), 'subscribers-selected.csv')
 
     await user.click(screen.getByRole('button', { name: 'Delete' }))
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete' }))
@@ -186,9 +154,7 @@ describe('SubscribersPage table', () => {
   it('shows a retryable error instead of a stuck loading message', async () => {
     const user = userEvent.setup()
     let fail = true
-    vi.mocked(api.get).mockImplementation(async (path: string) => {
-      if (path === '/admin/subscribers/settings') return settings() as never
-      if (path === '/admin/monitors') return [] as never
+    vi.mocked(api.post).mockImplementation(async () => {
       if (fail) throw new Error('down')
       return list(1) as never
     })

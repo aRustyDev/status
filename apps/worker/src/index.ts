@@ -1,4 +1,5 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose'
+import { enqueueSubscriberDeliveries, flushSubscriberDeliveries } from './subscriber-delivery'
 import { endpointFingerprint, parseEndpoints, type Endpoint } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
 import { parsePersistedHttpConfig, parseVaultBasicAuth, requestAllowedForEndpoint } from '../../probe/src/http-monitor'
@@ -11,10 +12,17 @@ import { emailChannelFingerprint, emailDestinations, emailReady, type EmailChann
 import { resolveChannelCredential } from './vault-resolver'
 import { actionApi, ActionError } from './actions'
 import { actionEndpoints, type ActionEnvironment } from './actions-runtime'
+import { subscriberApi, SubscriberError, subscriberEmailReady } from './subscribers'
 import { checkFallback, FallbackConflictError, getFallback, publishFallback, saveFallback } from './static-fallback'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
 interface Env extends EmailChannelEnv {
+  SUBSCRIBERS_READY?: string
+  SUBSCRIBER_EMAIL_READY?: string
+  SUBSCRIBER_EMAIL_FROM?: string
+  SUBSCRIBER_EMAIL_DESTINATIONS?: string
+  SUBSCRIBER_EMAIL?: SendEmail
+  SUBSCRIBER_PUBLIC_URL?: string
   DB: D1Database
   VAULT_ENCRYPTION_KEY?: string
   MONITOR_AUTH_READY?: string
@@ -35,6 +43,11 @@ interface Env extends EmailChannelEnv {
   BACKUPS_READY?: string
   FALLBACK_BUCKET?: R2Bucket
   FALLBACK_READY?: string
+}
+
+function requireSubscriberDelivery(env: Env, requested: unknown): void {
+  if (requested !== undefined && typeof requested !== 'boolean') throw new HttpError(400, 'Invalid subscriber notification setting')
+  if (requested === true && (env.SUBSCRIBERS_READY !== 'true' || !subscriberEmailReady(env))) throw new HttpError(503, 'Subscriber delivery is unavailable')
 }
 
 async function notificationsReady(env: Env): Promise<boolean> {
@@ -487,6 +500,12 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
         extra.push(stmt(db,`DELETE FROM incident_components WHERE incident_id=? AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE value=incident_components.component_id) AND EXISTS (SELECT 1 FROM incidents WHERE id=? AND mutation_key=?)`,recordId,JSON.stringify(ids),recordId,token))
         extra.push(...links(db,'incident_components','incident_id',recordId,ids,'incidents',token))
       }
+      if (!draft && (event === 'publish' || event === 'timeline_update')) requireSubscriberDelivery(env, body.notifySubscribers)
+      if (env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true && !draft && (event === 'publish' || event === 'timeline_update')) {
+        const linked = await stmt(db, 'SELECT component_id FROM incident_components WHERE incident_id=?',recordId).all<{component_id:string}>()
+        const eventType = event === 'publish' ? (status === 'resolved' ? 'incident.resolved' : 'incident.created') : (status === 'resolved' ? 'incident.resolved' : 'incident.updated')
+        extra.push(enqueueSubscriberDeliveries(db,token,eventType,linked.results.map(row => row.component_id),now,{table:'incidents',id:recordId,mutationKey:token}))
+      }
       extra.push(audit(db,user,event,'incident',recordId,{title,status,impact},{table:'incidents',token}))
       const replay = await mutate(db,stmt(db,'UPDATE incidents SET title=?,impact=?,status=?,draft=?,resolved_at=?,updated_at=?,version=version+1,mutation_key=? WHERE id=? AND version=?',title,impact,status,draft,resolved,now,token,recordId,version(body)),extra,receipt,recordId,Number(body.version)+1,'SELECT 1 FROM incidents WHERE id=? AND mutation_key=?',[recordId,token])
       if (replay) return replayReceipt(db, receipt!, replay)
@@ -496,13 +515,14 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
   if (resource === 'maintenance') {
     if (method === 'POST' && !recordId) {
       const maintenanceId = id()
+      requireSubscriberDelivery(env, body.notifySubscribers)
       const name = string(body.name,'name',200)
       const description = body.description === undefined || body.description === '' ? '' : string(body.description,'description')
       const starts = timestamp(body.startsAt,'startsAt'), ends = timestamp(body.endsAt,'endsAt')
       if (ends <= starts) bad('End must be after start')
       const ids = componentIds(body.componentIds ?? [])
       await validateComponents(db,ids)
-      const replay = await commitMutation(db,[stmt(db,'INSERT INTO maintenance (id,name,description,starts_at,ends_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',maintenanceId,name,description,starts,ends,now,now),...links(db,'maintenance_components','maintenance_id',maintenanceId,ids),audit(db,user,'create','maintenance',maintenanceId,{name,startsAt:starts,endsAt:ends})],receipt,maintenanceId,1,201,'SELECT 1 FROM maintenance WHERE id=?',[maintenanceId])
+      const replay = await commitMutation(db,[stmt(db,'INSERT INTO maintenance (id,name,description,starts_at,ends_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',maintenanceId,name,description,starts,ends,now,now),...links(db,'maintenance_components','maintenance_id',maintenanceId,ids),audit(db,user,'create','maintenance',maintenanceId,{name,startsAt:starts,endsAt:ends}),...(env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,maintenanceId,'maintenance.scheduled',ids,now)] : [])],receipt,maintenanceId,1,201,'SELECT 1 FROM maintenance WHERE id=?',[maintenanceId])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:maintenanceId,name,description,startsAt:starts,endsAt:ends,componentIds:ids,version:1},201)
     }
@@ -629,6 +649,11 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   const db = env.DB
   const method = request.method
   const route = path.slice('/api/v1/bsp'.length)
+  if (route === '/public/subscriptions' || route.startsWith('/public/subscriptions/') || route === '/admin/subscribers' || route.startsWith('/admin/subscribers/')) {
+    if (route.startsWith('/admin/')) requireRole(user, 'operator')
+    if (env.SUBSCRIBERS_READY !== 'true') throw new HttpError(503, 'Subscriptions are unavailable')
+    return subscriberApi(request, env, user, route)
+  }
   if (route === '/admin/static-mirror' || route === '/admin/static-mirror/check' || route === '/admin/static-mirror/test') {
     requireRole(user, 'admin')
     if (!env.FALLBACK_BUCKET || env.FALLBACK_READY !== 'true') throw new HttpError(503, 'Static fallback is unavailable')
@@ -983,7 +1008,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
     const notificationsAvailable = await notificationsReady(env)
     const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
-    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.SUBSCRIBERS_READY === 'true' ? ['/admin/subscribers'] : []), ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: env.SUBSCRIBERS_READY === 'true', subscriberDelivery: env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env), notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
@@ -1058,6 +1083,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const status = choice(body.status ?? 'investigating', 'status', incidentStatuses.slice(0, 3))
     const message = string(body.body, 'body')
     if (typeof body.draft !== 'boolean') bad('Invalid draft')
+    if (!body.draft) requireSubscriberDelivery(env, body.notifySubscribers)
     const ids = componentUuids(body.monitorIds ?? [])
     await validateComponents(db, ids)
     const now = Date.now()
@@ -1067,6 +1093,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       ...links(db,'incident_components','incident_id',incidentId,ids),
       audit(db,user,'create','incident',incidentId,{title,impact}),
       ...(!body.draft ? [audit(db,user,'publish','incident',incidentId,{title,status,impact})] : []),
+      ...(!body.draft && env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,incidentId,'incident.created',ids,now)] : []),
     ], receipt, incidentId, 1, 201, "SELECT 1 FROM incidents i JOIN entity_aliases a ON a.entity_id=i.id AND a.entity_type='incident' WHERE i.id=?", [incidentId], 'incident')
     if (replay) return replayReceipt(db, receipt!, replay)
     const alias = await stmt(db, 'SELECT alias FROM entity_aliases WHERE entity_type=? AND entity_id=?', 'incident', incidentId).first<{alias:number}>()
@@ -1111,6 +1138,10 @@ async function buildFallbackSnapshot(env: Env, intervalSeconds: number) {
 }
 
 export async function scheduledFallback(env: Env): Promise<void> {
+  if (env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env)) {
+    try { await flushSubscriberDeliveries(env) }
+    catch { console.error(JSON.stringify({ event: 'subscriber_dispatch_failed' })) }
+  }
   if (env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true') {
     try { await publishFallback(env.FALLBACK_BUCKET, interval => buildFallbackSnapshot(env, interval), true) }
     catch (error) { if (!(error instanceof FallbackConflictError)) throw error }
@@ -1173,6 +1204,7 @@ export default {
     } catch (error) {
       if (error instanceof FallbackConflictError) return json({error:'Static fallback changed. Reload and try again.'},409)
       if (error instanceof ActionError) return json({error:error.message},error.status)
+      if (error instanceof SubscriberError) return json({error:error.message},error.status)
       if (error instanceof ChannelError) return json({error:error.message},error.status)
       if (error instanceof VaultError) return json({error:error.message},error.status)
       if (error instanceof ReceiptError) return json({error:error.message,...(error.code ? {code:error.code} : {})},error.status)

@@ -1,5 +1,6 @@
 export function apiScope(path: string): 'status' | 'monitoring' | 'operations' {
   const route = path.replace(/^\/api\/v1\/bsp\//, '/api/v1/')
+  if (route === '/api/v1/public/subscriptions' || route.startsWith('/api/v1/public/subscriptions/')) return 'operations'
   if (route.startsWith('/api/v1/public/')) return 'status'
   if (/^\/api\/v1\/admin\/(checks|endpoints)(\/|$)/.test(route) ||
       route === '/api/v1/admin/monitors/test' ||

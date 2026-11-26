@@ -69,8 +69,20 @@ export const api = {
     if (!response.ok) throw new ApiError('Request failed', response.status)
     return response.json() as Promise<T>
   },
+  downloadPost: async (path: string, body: unknown, filename: string) => {
+    const response = await fetch(`/api/v1/bsp${path}`, { method: 'POST', headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    if (response.status === 401) window.dispatchEvent(new Event('access-expired'))
+    if (!response.ok) throw new ApiError('Request failed', response.status)
+    const url = URL.createObjectURL(await response.blob())
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = filename
+    anchor.click()
+    URL.revokeObjectURL(url)
+  },
   download: async (path: string, filename: string) => {
     const response = await fetch(`/api/v1/bsp${path}`, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+    if (response.status === 401) window.dispatchEvent(new Event('access-expired'))
     if (!response.ok) throw new ApiError('Request failed', response.status)
     const url = URL.createObjectURL(await response.blob())
     const anchor = document.createElement('a')

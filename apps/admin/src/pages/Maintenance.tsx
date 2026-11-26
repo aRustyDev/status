@@ -403,7 +403,7 @@ function MaintenanceModal({
   onSaved: () => void
 }) {
   const capabilities = useCapabilities()
-  const [notifySubscribers, setNotifySubscribers] = useState(false)
+  const [notifySubscribers, setNotifySubscribers] = useState(true)
   const isEdit = !!initial
   const title = isEdit ? 'Edit Maintenance Window' : 'Schedule Maintenance'
 
@@ -457,7 +457,7 @@ function MaintenanceModal({
       if (isEdit) {
         await api.patch(`/admin/maintenance/${initial!.id}`, { ...payload, version: initial!.version })
       } else {
-        await api.post('/admin/maintenance', { ...payload, ...(capabilities.notifications ? { notifySubscribers } : {}) })
+        await api.post('/admin/maintenance', { ...payload, ...(capabilities.subscriberDelivery ? { notifySubscribers } : {}) })
       }
       onSaved()
     } catch {
@@ -601,7 +601,7 @@ function MaintenanceModal({
             )}
           </fieldset>
 
-          {!isEdit && (capabilities.notifications ? <NotifySubscribersCheckbox checked={notifySubscribers} onChange={setNotifySubscribers} /> : <span className="text-sm" aria-disabled="true">Subscriber notifications are unavailable</span>)}
+          {!isEdit && (capabilities.subscriberDelivery ? <NotifySubscribersCheckbox checked={notifySubscribers} onChange={setNotifySubscribers} /> : <span className="text-sm" aria-disabled="true">Subscriber notifications are unavailable</span>)}
 
           {error && <Alert tone="error">{error}</Alert>}
         </div>

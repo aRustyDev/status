@@ -36,6 +36,18 @@ afterEach(() => {
 })
 
 describe('SubscribeDialog', () => {
+  it('uses the signed-in address for enrollment', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockFetch({ ok: true }, 202)
+    render(<SubscribeDialog options={options} onClose={() => {}} email="reader@example.com" />)
+    await choose(user, 'Email')
+    expect(screen.getByLabelText('Email address')).toHaveValue('reader@example.com')
+    expect(screen.getByLabelText('Email address')).toHaveAttribute('readonly')
+    await user.click(screen.getByRole('button', { name: 'Subscribe' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    expect(JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body))).toMatchObject({ email: 'reader@example.com' })
+  })
+
   it('submits the chosen events and components, then asks to check the inbox', async () => {
     const user = userEvent.setup()
     const fetchMock = mockFetch({ ok: true }, 202)
@@ -232,13 +244,13 @@ describe('subscription links', () => {
     const fetchMock = mockFetch({ type: 'email' })
     render(<SubscriptionLinkDialog link={{ mode: 'confirm', token: 'confirm-token' }} options={options} onClose={() => {}} />)
 
-    expect(await screen.findByText(/Your subscription is confirmed/)).toBeInTheDocument()
+    expect(await screen.findByText('You are subscribed.')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'You are subscribed' })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
     expect(url).toBe('/api/v1/bsp/public/subscriptions/confirm')
     expect(JSON.parse(String(init.body))).toEqual({ token: 'confirm-token' })
-    // No preferences here — the manage link arrives by email.
+    // Preferences remain available from the signed-in status page.
     expect(screen.queryByText('Notify me about')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Unsubscribe' })).not.toBeInTheDocument()
   })
@@ -250,7 +262,7 @@ describe('subscription links', () => {
         <SubscriptionLinkDialog link={{ mode: 'confirm', token: 'confirm-token' }} options={options} onClose={() => {}} />
       </StrictMode>,
     )
-    expect(await screen.findByText(/Your subscription is confirmed/)).toBeInTheDocument()
+    expect(await screen.findByText('You are subscribed.')).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
