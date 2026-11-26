@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -18,7 +19,7 @@ function harness(t, current = {}) {
   for (const name of ['apps/worker/migrations/0001.sql', 'feature/apps/worker/migrations/0001.sql']) writeFileSync(path.join(directory, name), 'SELECT 1;')
   writeFileSync(path.join(directory, 'feature/.preview-commit'), sha)
   writeFileSync(path.join(directory, 'state.json'), JSON.stringify({ enabled: true, default_variation: 'current', rules: [], variations: { current } }))
-  writeFileSync(path.join(directory, 'fetch.mjs'), `globalThis.fetch = async () => ({ ok: true, json: async () => ({ success: true, result: [{ results: [{ name: '0001.sql' }] }] }) })`)
+  writeFileSync(path.join(directory, 'fetch.mjs'), `globalThis.fetch = async () => ({ ok: true, json: async () => ({ success: true, result: [{ results: JSON.parse(process.env.TEST_MIGRATIONS || '["0001.sql"]').map(name => ({ name })) }] }) })`)
   writeFileSync(path.join(directory, 'node_modules/.bin/wrangler'), `#!/usr/bin/env node
 const fs = require('node:fs');
 const args = process.argv.slice(2);
@@ -94,5 +95,38 @@ test('unapproved migrations and unsupported binding types stop before upload', t
   const consumer = h.run('deploy')
   assert.equal(consumer.status, 1)
   assert.match(consumer.stderr, /only configure producers/)
+  assert.deepEqual(h.state(), {})
+})
+
+test('reviewed feature migrations require matching filename, hash, and staging ledger', t => {
+  const h = harness(t)
+  const migration = 'CREATE TABLE feature (id INTEGER);'
+  const migrationPath = path.join(h.directory, 'feature/apps/worker/migrations/0002_feature.sql')
+  writeFileSync(migrationPath, migration)
+  const hash = createHash('sha256').update(migration).digest('hex')
+
+  assert.match(h.run('deploy').stderr, /lacks an approved matching hash/)
+  h.settings.approvedMigrationHashes = { '0002_other.sql': hash }
+  assert.match(h.run('deploy').stderr, /lacks an approved matching hash/)
+  h.settings.approvedMigrationHashes = { '0002_feature.sql': '0'.repeat(64) }
+  assert.match(h.run('deploy').stderr, /lacks an approved matching hash/)
+  h.settings.approvedMigrationHashes = { '0002_feature.sql': hash }
+  assert.match(h.run('deploy').stderr, /Staging is missing migrations: 0002_feature.sql/)
+  const applied = JSON.stringify(['0001.sql', '0002_feature.sql'])
+  assert.equal(h.run('deploy', { TEST_MIGRATIONS: applied }).status, 0)
+
+  writeFileSync(migrationPath, `${migration}\n`)
+  assert.match(h.run('deploy', { TEST_MIGRATIONS: applied }).stderr, /lacks an approved matching hash/)
+  writeFileSync(path.join(h.directory, 'feature/apps/worker/migrations/0001.sql'), 'SELECT 2;')
+  h.settings.approvedMigrationHashes['0001.sql'] = createHash('sha256').update('SELECT 2;').digest('hex')
+  assert.match(h.run('deploy', { TEST_MIGRATIONS: applied }).stderr, /differs from main/)
+})
+
+test('invalid approved migration mappings stop deployment', t => {
+  const h = harness(t)
+  h.settings.approvedMigrationHashes = { '../0002.sql': '0'.repeat(64) }
+  assert.match(h.run('deploy').stderr, /Invalid approved migration hash/)
+  h.settings.approvedMigrationHashes = { '0002.sql': 'bad' }
+  assert.match(h.run('deploy').stderr, /Invalid approved migration hash/)
   assert.deepEqual(h.state(), {})
 })
