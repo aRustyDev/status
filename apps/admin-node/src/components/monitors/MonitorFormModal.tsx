@@ -40,7 +40,7 @@ export interface CloudflareProfile {
   settingsUnavailable?: boolean | undefined
   alertSettingsUnavailable?: boolean | undefined
   retrySettings?: (() => void) | undefined
-  endpoints: { id: string; name: string; requestPolicy?: RequestPolicy }[]
+  endpoints: { id: string; name: string; requestPolicy?: RequestPolicy; authProviders?: { oauth2?: { id: string; name: string }; cas?: { id: string; name: string } } }[]
   check?: { id: string; version: number; endpointId: string; enabled: boolean | number; intervalMinutes: number; expectedStatus: number; advancedConfig?: Record<string, unknown> | null; advancedConfigInvalid?: boolean } | undefined
   manualStatus: string
   position: number
@@ -170,9 +170,9 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
   useEffect(() => {
     if (!cloudflare?.monitorAuth || !cloudflare.listVaults) return
     cloudflare.listVaults().then(setVaults).catch(() => setVaultError(true))
-    const auth = cloudflare.check?.advancedConfig?.auth as {basic?: {vault?: {vaultId?: number}}} | undefined
+    const auth = cloudflare.check?.advancedConfig?.auth as {basic?: {vault?: {vaultId?: number}}; oauth2?: {vault?: {vaultId?: number}}; cas?: {vault?: {vaultId?: number}}} | undefined
     const refs = cloudflare.check?.advancedConfig?.vaultHeaders as Record<string, {vaultId: number}> | undefined
-    const vaultIds = new Set([auth?.basic?.vault?.vaultId, ...Object.values(refs ?? {}).map(ref => ref.vaultId)])
+    const vaultIds = new Set([auth?.basic?.vault?.vaultId, auth?.oauth2?.vault?.vaultId, auth?.cas?.vault?.vaultId, ...Object.values(refs ?? {}).map(ref => ref.vaultId)])
     for (const vaultId of vaultIds) if (vaultId && cloudflare.listVaultSecrets) cloudflare.listVaultSecrets(vaultId).then(secrets => setSecretsByVault(prev => ({ ...prev, [vaultId]: secrets }))).catch(() => setVaultError(true))
   // Initial configuration and picker state belong to this editor instance.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -326,7 +326,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
     if (Object.keys(headers).some(name => !allowed(name, policy?.plaintextHeaders))) return 'Remove plaintext headers that are unavailable for this destination.'
     if (Object.keys(refs).some(name => !allowed(name, policy?.vaultHeaders))) return 'Remove Vault headers that are unavailable for this destination.'
     if (Object.values(refs).some(ref => !ref.vaultId || !ref.secretId)) return 'Select a Secure Value Vault secret for every Vault header.'
-    if (config['auth'] && Object.keys(refs).some(name => name.toLowerCase() === 'authorization')) return 'Choose Basic authentication or an Authorization Vault header.'
+    if (config['auth'] && Object.keys(refs).some(name => name.toLowerCase() === 'authorization')) return 'Choose authentication or an Authorization Vault header.'
     const values = Object.values(headers)
     if (values.some(value => Array.from(value).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127))) return 'Header values cannot contain control characters.'
     const sizes = values.map(value => new TextEncoder().encode(value).length)
@@ -348,8 +348,14 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
         const advanced = cloudflareConfig()
         const requestError = requestProblem()
         if (requestError) { setSidePanel('request'); throw new Error(requestError) }
-        const basicAuth = advanced.auth as { type?: string; basic?: { vault?: { vaultId?: number; secretId?: number } } } | undefined
-        if (basicAuth && (!basicAuth.basic?.vault?.vaultId || !basicAuth.basic.vault.secretId)) { setSidePanel('auth'); throw new Error('Select a User / Password Vault secret.') }
+        const selectedAuth = advanced.auth as { type?: 'basic' | 'oauth2' | 'cas'; basic?: { vault?: { vaultId?: number; secretId?: number } }; oauth2?: { providerId?: string; scope?: string; vault?: { vaultId?: number; secretId?: number } }; cas?: { providerId?: string; vault?: { vaultId?: number; secretId?: number } } } | undefined
+        if (selectedAuth?.type) {
+          const settings = selectedAuth[selectedAuth.type]
+          if (!settings?.vault?.vaultId || !settings.vault.secretId) { setSidePanel('auth'); throw new Error('Select a User / Password Vault secret.') }
+          if (selectedAuth.type !== 'basic' && cloudflare.endpoints.find(endpoint => endpoint.id === endpointId)?.authProviders?.[selectedAuth.type]?.id !== (settings as { providerId?: string }).providerId) { setSidePanel('auth'); throw new Error('Authentication is unavailable for this destination.') }
+          if (selectedAuth.type === 'oauth2' && selectedAuth.oauth2?.scope && (selectedAuth.oauth2.scope.length > 1024 || Array.from(selectedAuth.oauth2.scope).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127))) { setSidePanel('auth'); throw new Error('Scope must be at most 1024 characters without control characters.') }
+          if (selectedAuth.type === 'cas' && (String(config['method'] ?? 'GET').toUpperCase() !== 'GET' || config['body'] !== undefined || Object.keys((config['headers'] as object | undefined) ?? {}).length || Object.keys((config['vaultHeaders'] as object | undefined) ?? {}).length)) { setSidePanel('auth'); throw new Error('CAS requires GET without custom headers or a request body.') }
+        }
         const rangeProblem = statusRangesProblem((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? [])
         if (rangeProblem) { setSidePanel('checks'); throw new Error(rangeProblem) }
         if (cloudflare.isAdmin && !endpointId && (config['auth'] || config['headers'] || config['vaultHeaders'] || config['body'] || ((config['acceptedStatusRanges'] as StatusRange[] | undefined) ?? []).length || config['keyword'] || ((config['assertions'] as HttpAssertion[] | undefined) ?? []).length || config['degradedAboveMs'] !== undefined)) {
@@ -479,7 +485,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
             </details>
             {cloudflare.check?.advancedConfigInvalid && <Alert tone="error">Check settings are invalid. Contact an administrator to review the configuration.</Alert>}
             {cloudflare.isAdmin && <>
-              <Field label="Approved destination"><select value={endpointId} onChange={e => { invalidateCloudflareTest(); setEndpointId(e.target.value) }} className="input-sig"><option value="">No check</option>{cloudflare.endpoints.map(endpoint => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>
+              <Field label="Approved destination"><select value={endpointId} onChange={e => { invalidateCloudflareTest(); setEndpointId(e.target.value); if (e.target.value !== endpointId) setConfig(previous => ({ ...previous, auth: undefined })) }} className="input-sig"><option value="">No check</option>{cloudflare.endpoints.map(endpoint => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>
               {endpointId && <>
                 <div className="grid grid-cols-2 gap-3"><Field label="Method"><select value={String(config['method'] ?? 'GET')} onChange={e => updateConfig('method', e.target.value)} className="input-sig"><option>GET</option><option>HEAD</option>{(cloudflare.monitorRequest && cloudflare.endpoints.find(endpoint => endpoint.id === endpointId)?.requestPolicy?.allowPost || config['method'] === 'POST') && <option>POST</option>}</select></Field>
                 <Field label="Expected status"><input type="number" min={100} max={599} required disabled={Array.isArray(config['acceptedStatusRanges']) && config['acceptedStatusRanges'].length > 0} value={Number(config['expectedStatus'] ?? 200)} onChange={e => updateConfig('expectedStatus', Number(e.target.value))} className="input-sig" /></Field></div>
@@ -561,7 +567,7 @@ export default function MonitorFormModal({ monitor, initialType = 'https', allTa
             </>
           )}
           {sidePanel === 'credentials' && <CredentialsSection config={config} updateConfig={updateConfig} vaultPicker={vaultPicker} userKey={isDatabaseType(type) ? 'user' : 'username'} />}
-          {sidePanel === 'auth' && <AuthSection auth={auth} onChange={(next) => updateConfig('auth', cloudflare && next.type === 'none' ? undefined : next)} vaultPicker={vaultPicker} cloudflare={!!cloudflare} vaultError={vaultError} />}
+          {sidePanel === 'auth' && <AuthSection auth={auth} onChange={(next) => updateConfig('auth', cloudflare && next.type === 'none' ? undefined : next)} vaultPicker={vaultPicker} cloudflare={!!cloudflare} vaultError={vaultError} authProviders={cloudflare?.endpoints.find(endpoint => endpoint.id === endpointId)?.authProviders} />}
           <div className={sidePanel === 'tags' ? undefined : 'hidden'}><TagsSection tags={tags} allTags={allTags} onChange={setTags} limits={cloudflare ? { count: 20, labelLength: 40 } : undefined} /></div>
           {sidePanel === 'channels' && (cloudflare ? <>
             <p className="text-xs">Alerts are sent when an HTTP check runs and its status changes.</p>

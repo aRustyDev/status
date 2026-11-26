@@ -486,6 +486,57 @@ it('enables only Vault Basic auth when the runtime capability is ready and saves
 })
 
 
+it('saves OAuth2 provider and Vault metadata and clears credentials when the destination changes', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [check]
+    if (path === '/admin/endpoints') return [
+      { id: 'api', name: 'Approved API', authProviders: { oauth2: { id: 'auth', name: 'Identity' }, cas: { id: 'cas', name: 'CAS identity' } } },
+      { id: 'other', name: 'Other API' },
+    ]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    if (path === '/admin/vaults') return [{ id: 12, name: 'Operations' }]
+    if (path === '/admin/vaults/12/secrets') return [{ id: 20, name: 'client', type: 'userpass' }]
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor, [], true)
+  await user.click(await screen.findByRole('button', { name: 'Auth' }))
+  await user.click(screen.getByRole('button', { name: 'OAuth2' }))
+  expect(screen.getByText('Approved provider: Identity')).toBeInTheDocument()
+  await user.type(screen.getByLabelText('Scope (optional)'), 'read')
+  await user.selectOptions(await screen.findByLabelText('Vault'), '12')
+  await screen.findByRole('option', { name: 'client' })
+  await user.selectOptions(screen.getByLabelText('Secret'), '20')
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(api.patch).toHaveBeenCalledWith('/admin/monitors/7', expect.objectContaining({ check: expect.objectContaining({ advancedConfig: expect.objectContaining({ auth: { type: 'oauth2', oauth2: { providerId: 'auth', vault: { vaultId: 12, secretId: 20 }, scope: 'read' } } }) }) })))
+  await user.selectOptions(screen.getByLabelText('Approved destination'), 'other')
+  expect(screen.getByText('No authentication configured.')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'OAuth2 (unavailable)' })).toBeDisabled()
+})
+
+it('reopens scoped CAS with the saved secret and rejects a non-GET check', async () => {
+  const user = userEvent.setup()
+  const auth = { type: 'cas', cas: { providerId: 'cas', vault: { vaultId: 12, secretId: 20 } } }
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/admin/checks') return [{ ...check, advancedConfig: { auth } }]
+    if (path === '/admin/endpoints') return [{ id: 'api', name: 'Approved API', authProviders: { cas: { id: 'cas', name: 'CAS identity' } } }]
+    if (path === '/admin/monitors/7/history') return { results: [], retentionDays: 14 }
+    if (path === '/admin/vaults') return [{ id: 12, name: 'Operations' }]
+    if (path === '/admin/vaults/12/secrets') return [{ id: 20, name: 'login', type: 'userpass' }]
+    throw new Error(`Unexpected request ${path}`)
+  })
+  renderModal(monitor, [], true)
+  await user.click(await screen.findByRole('button', { name: 'Auth' }))
+  expect(await screen.findByRole('option', { name: 'login' })).toBeInTheDocument()
+  expect(screen.getByLabelText('Secret')).toHaveValue('20')
+  expect(screen.getByText('Approved provider: CAS identity')).toBeInTheDocument()
+  await user.selectOptions(screen.getByLabelText('Method'), 'HEAD')
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  expect(await screen.findByText('CAS requires GET without custom headers or a request body.')).toBeInTheDocument()
+  expect(api.patch).not.toHaveBeenCalled()
+})
+
+
 it('selects alert channels in a new monitor and saves them atomically', async () => {
   const user = userEvent.setup()
   renderModal(null, [], false, true)

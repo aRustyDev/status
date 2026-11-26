@@ -1,7 +1,7 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose'
 import { endpointFingerprint, parseEndpoints, type Endpoint } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
-import { parsePersistedHttpConfig, parseVaultBasicAuth, requestAllowedForEndpoint } from '../../probe/src/http-monitor'
+import { parsePersistedHttpConfig, parseVaultHttpAuth, requestAllowedForEndpoint } from '../../probe/src/http-monitor'
 import { ProbeTestTimeout, requestProbeTest } from './probe-test'
 import { getSystemHealthReport } from './system-health'
 import { vaultApi, vaultKeyReady, VaultError } from './vault'
@@ -18,6 +18,8 @@ interface Env extends EmailChannelEnv {
   DB: D1Database
   VAULT_ENCRYPTION_KEY?: string
   MONITOR_AUTH_READY?: string
+  MONITOR_OAUTH2_READY?: string
+  MONITOR_CAS_READY?: string
   MONITOR_REQUEST_READY?: string
   CHANNEL_ENDPOINTS?: string
   CHANNELS_READY?: string
@@ -80,12 +82,17 @@ async function validateMonitorAuth(env: Env, value: unknown, endpointId: string)
   }
   const auth = config.auth
   if (auth === undefined) return
-  const parsed = parseVaultBasicAuth(auth)
+  const parsed = parseVaultHttpAuth(auth)
   if (!parsed) return bad('Invalid monitor authentication')
   if (env.MONITOR_AUTH_READY !== 'true') throw new HttpError(503, 'Monitor authentication is unavailable')
   const endpoint = parseEndpoints(env.ENDPOINTS).get(endpointId)
   if (!endpoint || new URL(endpoint.url).protocol !== 'https:') return bad('Monitor authentication requires an approved HTTPS destination')
-  const ref = parsed.basic.vault
+  if (parsed.type !== 'basic') {
+    if ((parsed.type === 'oauth2' ? env.MONITOR_OAUTH2_READY : env.MONITOR_CAS_READY) !== 'true') throw new HttpError(503, 'Authentication mode is unavailable')
+    const providerId = parsed.type === 'oauth2' ? parsed.oauth2.providerId : parsed.cas.providerId
+    if (endpoint.authProviders?.[parsed.type]?.id !== providerId) return bad('Select an approved authentication provider')
+  }
+  const ref = parsed.type === 'basic' ? parsed.basic.vault : parsed.type === 'oauth2' ? parsed.oauth2.vault : parsed.cas.vault
   if (!await stmt(env.DB, "SELECT id FROM vault_secrets WHERE id=? AND vault_id=? AND type='userpass'", ref.secretId, ref.vaultId).first()) return bad('Select an available user/password secret')
 }
 // Reuse jose's issuer-scoped JWKS cache across requests in this isolate. The
@@ -407,7 +414,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
         } catch { return { ...check, advancedConfig: null, advancedConfigInvalid: true } }
       }))
     }
-    if (resource === 'endpoints' && !recordId) return json(approvedEndpoints(env).map(endpoint => ({ id: endpoint.id, name: endpoint.name, ...(env.MONITOR_REQUEST_READY === 'true' && endpoint.requestPolicy ? { requestPolicy: endpoint.requestPolicy } : {}) })))
+    if (resource === 'endpoints' && !recordId) return json(approvedEndpoints(env).map(endpoint => ({ id: endpoint.id, name: endpoint.name, ...(env.MONITOR_REQUEST_READY === 'true' && endpoint.requestPolicy ? { requestPolicy: endpoint.requestPolicy } : {}), ...(endpoint.authProviders ? { authProviders: Object.fromEntries(Object.entries(endpoint.authProviders).filter(([mode]) => (mode === 'oauth2' ? env.MONITOR_OAUTH2_READY : env.MONITOR_CAS_READY) === 'true').map(([mode, provider]) => [mode, { id: provider.id, name: provider.name }])) } : {}) })))
     throw new HttpError(404, 'Not found')
   }
   if (resource === 'components' && recordId && method !== 'GET' && await stmt(db, 'SELECT component_id FROM gatus_sources WHERE component_id=?', recordId).first()) throw new HttpError(403, 'Gatus-managed component is read-only')
@@ -576,7 +583,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
       if (existing && existing.endpoint_id !== endpointId && existing.advanced_config) {
         let previous: Json
         try { previous = JSON.parse(existing.advanced_config) as Json } catch { return bad('Check settings are invalid') }
-        if (previous.headers || previous.body !== undefined || previous.vaultHeaders || String(previous.method ?? '').toUpperCase() === 'POST') return bad('Use the monitor editor to change the destination of a custom request')
+        if (previous.auth || previous.headers || previous.body !== undefined || previous.vaultHeaders || String(previous.method ?? '').toUpperCase() === 'POST') return bad('Use the monitor editor to change the destination of a custom request')
       }
     }
     await validateComponents(db, [componentId])
@@ -857,21 +864,24 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     serializeAdvancedConfig(env, body.advancedConfig, endpointId, Number(body.expectedStatus))
     const config = body.advancedConfig as Record<string, unknown> | null
     let payload: unknown = { endpointId, expectedStatus: body.expectedStatus, advancedConfig: body.advancedConfig }
-    if (config?.auth !== undefined || (config?.vaultHeaders && Object.keys(config.vaultHeaders as object).length > 0)) {
-      await validateMonitorAuth(env, config, endpointId)
-      if (typeof body.checkId !== 'string' || !Number.isSafeInteger(body.checkVersion)) return bad('Save authentication settings before testing')
+    const hasCredentials = config?.auth !== undefined || Boolean(config?.vaultHeaders && Object.keys(config.vaultHeaders as object).length > 0)
+    if (hasCredentials) await validateMonitorAuth(env, config, endpointId)
+    let same = false
+    if (typeof body.checkId === 'string' && Number.isSafeInteger(body.checkVersion)) {
       const saved = await stmt(db, 'SELECT endpoint_id,expected_status,advanced_config FROM http_checks WHERE id=? AND config_version=?', body.checkId, body.checkVersion).first<{endpoint_id:string;expected_status:number;advanced_config:string | null}>()
-      let same = false
       try {
-        if (saved && saved.endpoint_id === endpointId && saved.expected_status === body.expectedStatus && saved.advanced_config !== null) {
-          const stored: unknown = JSON.parse(saved.advanced_config)
-          if (stored && typeof stored === 'object' && !Array.isArray(stored) && parsePersistedHttpConfig(stored, endpointId, 'validation', Number(body.expectedStatus))) {
+        if (saved && saved.endpoint_id === endpointId && saved.expected_status === body.expectedStatus) {
+          const stored: unknown = saved.advanced_config === null ? { timeoutMs: 5000, attempts: 1 } : JSON.parse(saved.advanced_config)
+          if (stored && typeof stored === 'object' && !Array.isArray(stored) && parsePersistedHttpConfig(stored, endpointId, 'validation', Number(body.expectedStatus)) && config) {
             same = stableJson(effectiveTestConfig(stored as Json)) === stableJson(effectiveTestConfig(config))
           }
         }
       } catch { /* invalid stored configuration */ }
-      if (!same) throw new HttpError(409, 'Save authentication settings before testing')
-      payload = { checkId: body.checkId, checkVersion: body.checkVersion }
+      if (same) payload = { checkId: body.checkId, checkVersion: body.checkVersion }
+    }
+    if (hasCredentials && !same) {
+      if (typeof body.checkId !== 'string' || !Number.isSafeInteger(body.checkVersion)) return bad('Save authentication settings before testing')
+      throw new HttpError(409, 'Save authentication settings before testing')
     }
     if (!env.PROBE) throw new HttpError(503, 'Monitor testing is unavailable')
     try { return await requestProbeTest(env.PROBE, payload, request.signal) }
