@@ -70,5 +70,15 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
         if (database?.owned) await deleteOwnedDatabase({ database, config: databaseConfig, adapter: databaseAdapter })
       }
     },
+    async deleteAbandonedResources({ ref, release }) {
+      const resources = release.resources || {}
+      if (resources.workers) await this.deleteOwnedResources({ ref, release: { ...release, resources: { ...resources, database: null, validationDatabase: null } } })
+      for (const database of [resources.database, resources.validationDatabase]) {
+        if (database?.owned) await deleteOwnedDatabase({ database, config: databaseConfig, adapter: databaseAdapter })
+      }
+      // Intent alone is not proof of a database's identity. Keep the record
+      // for an operator rather than deleting a potentially unrelated D1.
+      return { unresolved: Boolean((resources.databaseIntent && !resources.database) || (resources.validationDatabaseIntent && !resources.validationDatabase)) }
+    },
   }
 }

@@ -13,6 +13,7 @@ export async function deployRelease({ ref, sha, store, readRemoteHead, prepare, 
     if (!snapshot) throw new Error('Created inventory is unavailable')
   }
   if (snapshot.record.retirement) throw new Error('Retirement requires reconciliation before deployment')
+  if (snapshot.record.abandonedCleanup) throw new Error('Abandoned resource cleanup requires reconciliation before deployment')
   const candidate = snapshot.record.candidate
   if (candidate && (candidate.sha !== sha || candidate.phase !== 'preparing')) throw new Error('Candidate requires reconciliation before deployment')
   let record = candidate ? snapshot.record : nextGeneration(snapshot.record, sha)

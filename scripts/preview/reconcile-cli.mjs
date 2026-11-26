@@ -11,6 +11,7 @@ import { reconcilePreviews } from './reconcile.mjs'
 import { createActivationAdapter } from './release-activation.mjs'
 import { recoverCandidate } from './recover-candidate.mjs'
 import { branchKey } from './release-contract.mjs'
+import { cleanupAbandoned } from './cleanup-abandoned.mjs'
 
 function object(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Missing ${name}`)
@@ -56,6 +57,7 @@ export async function reconcile(env = process.env) {
     const result = await reconcilePreviews({ branches, store,
       retire: ref => retireDeletedBranch({ ref, store, readRemoteHead: branches.head, ...adapter }),
       recoverCandidate: (ref, sha, options) => recoverCandidate({ ref, sha, store, readRemoteHead: branches.head, activate, isPublishedCandidate, ...options }),
+      cleanupAbandoned: ref => cleanupAbandoned({ ref, store, deleteResources: input => adapter.deleteAbandonedResources(input) }),
       ciStatus: branches.ciStatus, dispatchCi: branches.dispatchCi, dispatchPreview: branches.dispatchPreview })
     console.log(JSON.stringify(result, null, 2))
     if (result.errors.length) throw new Error('Some branches need reconciliation')

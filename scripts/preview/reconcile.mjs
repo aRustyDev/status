@@ -2,11 +2,21 @@ import { branchPolicy } from './release-contract.mjs'
 
 // Run under the same non-preemptive workflow concurrency group as deployments.
 // A failed or ambiguous candidate is reported instead of being overwritten.
-export async function reconcilePreviews({ branches, store, retire, recoverCandidate, ciStatus, dispatchCi, dispatchPreview }) {
-  const [remote, inventory] = await Promise.all([branches.list(), store.list()])
+export async function reconcilePreviews({ branches, store, retire, recoverCandidate, cleanupAbandoned, ciStatus, dispatchCi, dispatchPreview, now = Date.now }) {
+  const [remote, initialInventory] = await Promise.all([branches.list(), store.list()])
+  let inventory = initialInventory
+  const result = { retired: [], scheduled: [], pending: [], errors: [] }
+  if (typeof cleanupAbandoned === 'function') {
+    for (const { record } of inventory) {
+      try {
+        const outcome = await cleanupAbandoned(record.ref)
+        if (outcome?.status === 'unresolved') result.pending.push({ ref: record.ref, reason: 'database creation intent has no recorded identity' })
+      } catch (error) { result.errors.push({ ref: record.ref, message: error.message }) }
+    }
+    inventory = await store.list()
+  }
   const records = new Map(inventory.map(({ record }) => [record.ref, record]))
   const remoteRefs = new Set(remote.map(branch => branch.ref))
-  const result = { retired: [], scheduled: [], pending: [], errors: [] }
 
   for (const { record } of inventory) {
     if (remoteRefs.has(record.ref)) continue
@@ -34,7 +44,7 @@ export async function reconcilePreviews({ branches, store, retire, recoverCandid
       // Neither phase can have issued a Flagship write. Keep all recorded
       // resources for later cleanup while freeing the branch for its new SHA.
       const snapshot = inventory.find(item => item.record.ref === ref)
-      const updated = { ...record, candidate: null, abandoned: [...(record.abandoned || []), record.candidate] }
+      const updated = { ...record, candidate: null, abandoned: [...(record.abandoned || []), { ...record.candidate, abandonedAt: now() }] }
       if (await branches.head(ref) !== sha || !await store.compareAndSwap(ref, snapshot.revision, updated)) {
         result.pending.push({ ref, reason: 'branch changed during candidate abandonment' })
         continue
@@ -59,7 +69,7 @@ export async function reconcilePreviews({ branches, store, retire, recoverCandid
       }
       continue
     }
-    if (record?.retirement || (record?.candidate && (record.candidate.phase !== 'preparing' || record.candidate.sha !== sha))) {
+    if (record?.retirement || record?.abandonedCleanup || (record?.candidate && (record.candidate.phase !== 'preparing' || record.candidate.sha !== sha))) {
       result.pending.push({ ref, reason: 'release or retirement needs reconciliation' })
       continue
     }
