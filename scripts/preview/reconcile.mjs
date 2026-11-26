@@ -24,10 +24,17 @@ export async function reconcilePreviews({ branches, store, retire, recoverCandid
   const records = new Map(inventory.map(({ record }) => [record.ref, record]))
   const remoteRefs = new Set(remote.map(branch => branch.ref))
 
-  for (const { record } of inventory) {
+  for (const snapshot of inventory) {
+    const { record } = snapshot
     if (remoteRefs.has(record.ref)) continue
     try {
       if (await branches.head(record.ref) !== null) continue
+      if (record.candidate && ['preparing', 'ready'].includes(record.candidate.phase)) {
+        const updated = { ...record, candidate: null, abandoned: [...(record.abandoned || []), { ...record.candidate, abandonedAt: now() }] }
+        if (await branches.head(record.ref) !== null || !await store.compareAndSwap(record.ref, snapshot.revision, updated)) throw new Error('Branch or inventory changed during candidate abandonment')
+      } else if (record.candidate?.phase === 'activating') {
+        throw new Error('Deleted branch activation requires operator reconciliation')
+      }
       const outcome = await retire(record.ref)
       result.retired.push({ ref: record.ref, status: outcome.status })
     } catch (error) {

@@ -45,3 +45,30 @@ test('a stale preparation is abandoned without publishing and retains its resour
   assert.equal(updated.abandoned[0].resources.database.id, 'owned')
   assert.equal(result.scheduled[0].sha, sha)
 })
+
+test('deleted branch with a preparing candidate preserves resources and retires', async () => {
+  const ref = 'refs/heads/feat/deleted'
+  const candidate = { sha: 'a'.repeat(40), generation: 1, phase: 'preparing', resources: { database: { id: 'db', owned: true } } }
+  let record = { ref, candidate, active: { sha: 'b'.repeat(40) } }
+  let retired = false
+  const result = await reconcilePreviews({
+    branches: { list: async () => [], head: async () => null },
+    store: { list: async () => [{ revision: 1, record }], compareAndSwap: async (_ref, revision, updated) => { assert.equal(revision, 1); record = updated; return true } },
+    retire: async () => { retired = true; assert.equal(record.candidate, null); assert.equal(record.abandoned[0].resources.database.id, 'db'); return { status: 'draining' } },
+    ciStatus: async () => assert.fail(), dispatchCi: async () => assert.fail(), dispatchPreview: async () => assert.fail(),
+  })
+  assert.equal(retired, true)
+  assert.equal(result.errors.length, 0)
+})
+
+test('deleted branch leaves an ambiguous activation and active route untouched', async () => {
+  const ref = 'refs/heads/feat/deleted'
+  const record = { ref, candidate: { sha: 'a'.repeat(40), phase: 'activating' }, active: { sha: 'b'.repeat(40) } }
+  const result = await reconcilePreviews({
+    branches: { list: async () => [], head: async () => null }, store: { list: async () => [{ revision: 1, record }] },
+    recoverCandidate: async () => assert.fail('ambiguous activation must be resolved by an operator'),
+    retire: async () => assert.fail('must not disable routing while activation is ambiguous'), ciStatus: async () => assert.fail(), dispatchCi: async () => assert.fail(), dispatchPreview: async () => assert.fail(),
+  })
+  assert.match(result.errors[0].message, /operator reconciliation/)
+  assert.equal(record.active.sha, 'b'.repeat(40))
+})

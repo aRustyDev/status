@@ -28,3 +28,14 @@ test('outdated activation is promoted only if its flag is already published', as
   await recoverCandidate({ ...args, isPublishedCandidate: async () => true })
   assert.equal(record.active.sha, sha)
 })
+
+test('deleted branch candidate is left for operator reconciliation', async () => {
+  const ref = 'refs/heads/feat/test'
+  const sha = 'a'.repeat(40)
+  let record = { ...newRelease({ ref, sha }), candidate: { sha, generation: 1, phase: 'activating', resources: { gateway: 'worker' } } }
+  let revision = 1
+  const store = { read: async () => ({ revision, record }), compareAndSwap: async (_ref, expected, next) => { assert.equal(expected, revision); revision++; record = next; return true } }
+  const args = { ref, sha, store, readRemoteHead: async () => null, activate: async () => {}, allowStaleIfPublished: true }
+  await assert.rejects(recoverCandidate({ ...args, isPublishedCandidate: async () => true }), /head changed/)
+  assert.equal(record.candidate.phase, 'activating')
+})
