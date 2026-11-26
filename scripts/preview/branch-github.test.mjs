@@ -7,12 +7,27 @@ test('reads current branch SHA and distinguishes a deleted branch', async () => 
   const urls = []
   const api = githubBranches({ repository: 'owner/repo', token: 'token', fetcher: async url => {
     urls.push(url)
-    return url.endsWith('feat%2Fdeleted') ? { status: 404 } : { ok: true, json: async () => ({ sha }) }
+    return url.endsWith('feat/deleted') ? { status: 404 } : { ok: true, json: async () => ({ ref: 'refs/heads/feat/example', object: { type: 'commit', sha } }) }
   } })
   assert.equal(await api.head('refs/heads/feat/example'), sha)
   assert.equal(await api.head('refs/heads/feat/deleted'), null)
   await assert.rejects(api.head('refs/heads/main'), /Invalid branch/)
-  assert.match(urls[0], /feat%2Fexample$/)
+  assert.match(urls[0], /\/git\/ref\/heads\/feat\/example$/)
+})
+
+test('does not treat reference errors or a mismatched reference as a deleted branch', async () => {
+  for (const status of [403, 422, 500]) {
+    const api = githubBranches({ repository: 'owner/repo', token: 'token', fetcher: async () => ({ ok: false, status }) })
+    await assert.rejects(api.head('refs/heads/feat/example'), new RegExp(String(status)))
+  }
+  for (const value of [
+    { ref: 'refs/heads/feat/other', object: { type: 'commit', sha } },
+    { ref: 'refs/heads/feat/example', object: { type: 'tag', sha } },
+    { ref: 'refs/heads/feat/example', object: { type: 'commit', sha: 'bad' } },
+  ]) {
+    const api = githubBranches({ repository: 'owner/repo', token: 'token', fetcher: async () => ({ ok: true, json: async () => value }) })
+    await assert.rejects(api.head('refs/heads/feat/example'), /Invalid GitHub branch reference/)
+  }
 })
 test('lists eligible branches across pages without treating errors as deletion', async () => {
   const page1 = Array.from({ length: 100 }, (_, i) => ({ name: `other/${i}`, commit: { sha } }))

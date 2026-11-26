@@ -15,10 +15,14 @@ export function githubBranches({ repository, token, apiUrl = 'https://api.github
     async head(ref) {
       const policy = branchPolicy(ref)
       if (!policy) throw new Error('Invalid branch ref')
-      const result = await request(`${root}/commits/${encodeURIComponent(policy.name)}`, true)
+      // The commits endpoint responds 422 for an absent branch. The exact Git
+      // reference endpoint returns 404, allowing deletion to be distinguished
+      // from validation and permission errors without interpreting messages.
+      const path = policy.name.split('/').map(encodeURIComponent).join('/')
+      const result = await request(`${root}/git/ref/heads/${path}`, true)
       if (result === null) return null
-      if (!/^[a-f0-9]{40}$/.test(result.sha || '')) throw new Error('Invalid GitHub branch SHA')
-      return result.sha
+      if (result.ref !== ref || result.object?.type !== 'commit' || !/^[a-f0-9]{40}$/.test(result.object.sha || '')) throw new Error('Invalid GitHub branch reference')
+      return result.object.sha
     },
     async list() {
       const found = []
