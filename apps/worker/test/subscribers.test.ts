@@ -28,7 +28,7 @@ const operator = { id:'o', email:'o@example.test', role:'operator' }
 const request = (method: string, data?: unknown) => new Request('https://status.example.test', { method, headers: { 'Content-Type':'application/json' }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) })
 function fixture() {
   const local = new DB()
-  for (const file of ['0001_board.sql', '0004_aliases.sql', '0018_subscribers.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
+  for (const file of ['0001_board.sql', '0004_aliases.sql', '0018_subscribers.sql', '0020_preview_subscribers.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
   local.db.exec("INSERT INTO users (id,issuer,subject,email,role) VALUES ('a','issuer','a','a@example.test','viewer'),('b','issuer','b','b@example.test','viewer'),('o','issuer','o','o@example.test','operator')")
   local.db.exec("UPDATE subscription_settings SET enabled=1,allow_email=1 WHERE id=1")
   const messages: Array<{text:string}> = []
@@ -101,4 +101,32 @@ test('resubscription sends a fresh single-use confirmation after the cooldown', 
   assert.equal((local.db.prepare('SELECT status FROM subscribers').get() as {status:string}).status,'pending')
   await subscriberApi(request('POST',{token:second}),env,owner,'/public/subscriptions/confirm')
   assert.equal((local.db.prepare('SELECT status FROM subscribers').get() as {status:string}).status,'active')
+})
+
+test('preview leases isolate settings, enrollments, confirmations and admin operations', async () => {
+  const {env, local, messages} = fixture()
+  const first = {...env, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:'a'.repeat(64)}
+  const second = {...env, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:'b'.repeat(64)}
+  const update = { enabled:true, allowEmail:true, allowComponentScope:true, allowedEvents:['incident.created'] }
+  await subscriberApi(request('PUT',update),first,operator,'/admin/subscribers/settings')
+  assert.equal(((await (await subscriberApi(request('GET'),second,operator,'/admin/subscribers/settings')).json()) as {enabled:boolean}).enabled,false)
+  await subscriberApi(request('PUT',update),second,operator,'/admin/subscribers/settings')
+  await subscriberApi(request('POST',enrollment),first,owner,'/public/subscriptions')
+  const firstToken = /token=([0-9a-f]+)/.exec(messages[0]!.text)![1]!
+  await subscriberApi(request('POST',enrollment),second,owner,'/public/subscriptions')
+  const secondToken = /token=([0-9a-f]+)/.exec(messages[1]!.text)![1]!
+  await assert.rejects(() => subscriberApi(request('POST',{token:firstToken}),second,owner,'/public/subscriptions/confirm'), SubscriberError)
+  await subscriberApi(request('POST',{token:firstToken}),first,owner,'/public/subscriptions/confirm')
+  await subscriberApi(request('POST',{token:secondToken}),second,owner,'/public/subscriptions/confirm')
+  const firstSearch = await (await subscriberApi(request('POST',{}),first,operator,'/admin/subscribers/search')).json() as {total:number; subscribers:Array<{id:number}>}
+  const secondSearch = await (await subscriberApi(request('POST',{}),second,operator,'/admin/subscribers/search')).json() as {total:number; subscribers:Array<{id:number}>}
+  assert.equal(firstSearch.total,1)
+  assert.equal(secondSearch.total,1)
+  await assert.rejects(() => subscriberApi(request('DELETE'),second,operator,`/admin/subscribers/${firstSearch.subscribers[0]!.id}`), SubscriberError)
+  await subscriberApi(request('POST',{}),first,owner,'/public/subscriptions/unsubscribe')
+  const secondRecord = local.db.prepare('SELECT status FROM preview_subscribers WHERE scope=?').get(second.PREVIEW_SUBSCRIBER_SCOPE) as {status:string}
+  assert.equal(secondRecord.status,'active')
+  assert.equal((local.db.prepare('SELECT count(*) AS n FROM subscribers').get() as {n:number}).n,0)
+  await assert.rejects(() => subscriberApi(request('GET'),{...env,PREVIEW_SUBSCRIBER_REQUIRED:'true'},operator,'/admin/subscribers/settings'), /Missing preview subscriber scope/)
+  await assert.rejects(() => subscriberApi(request('GET'),{...first,PREVIEW_SUBSCRIBER_SCOPE:'bad'},operator,'/admin/subscribers/settings'), /Invalid preview subscriber scope/)
 })

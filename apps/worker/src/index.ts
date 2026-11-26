@@ -12,12 +12,14 @@ import { emailChannelFingerprint, emailDestinations, emailReady, type EmailChann
 import { resolveChannelCredential } from './vault-resolver'
 import { actionApi, ActionError } from './actions'
 import { actionEndpoints, type ActionEnvironment } from './actions-runtime'
-import { subscriberApi, SubscriberError, subscriberEmailReady } from './subscribers'
+import { subscriberApi, SubscriberError, subscriberEmailReady, subscriberScope } from './subscribers'
 import { checkFallback, FallbackConflictError, getFallback, publishFallback, saveFallback } from './static-fallback'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
 interface Env extends EmailChannelEnv {
   SUBSCRIBERS_READY?: string
+  PREVIEW_SUBSCRIBER_SCOPE?: string
+  PREVIEW_SUBSCRIBER_REQUIRED?: string
   SUBSCRIBER_EMAIL_READY?: string
   SUBSCRIBER_EMAIL_FROM?: string
   SUBSCRIBER_EMAIL_DESTINATIONS?: string
@@ -47,7 +49,10 @@ interface Env extends EmailChannelEnv {
 
 async function subscriberDeliveryReady(env: Env): Promise<boolean> {
   if (env.SUBSCRIBERS_READY !== 'true' || !subscriberEmailReady(env)) return false
-  const settings = await env.DB.prepare("SELECT 1 FROM subscription_settings WHERE id=1 AND enabled=1 AND allow_email=1 AND json_array_length(allowed_events)>0").first()
+  const scope = subscriberScope(env)
+  const settings = scope
+    ? await env.DB.prepare("SELECT 1 FROM preview_subscription_settings WHERE scope=? AND enabled=1 AND allow_email=1 AND json_array_length(allowed_events)>0").bind(scope).first()
+    : await env.DB.prepare("SELECT 1 FROM subscription_settings WHERE id=1 AND enabled=1 AND allow_email=1 AND json_array_length(allowed_events)>0").first()
   return !!settings
 }
 
@@ -510,7 +515,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
       if (env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true && !draft && (event === 'publish' || event === 'timeline_update')) {
         const linked = await stmt(db, 'SELECT component_id FROM incident_components WHERE incident_id=?',recordId).all<{component_id:string}>()
         const eventType = event === 'publish' ? (status === 'resolved' ? 'incident.resolved' : 'incident.created') : (status === 'resolved' ? 'incident.resolved' : 'incident.updated')
-        extra.push(enqueueSubscriberDeliveries(db,token,eventType,linked.results.map(row => row.component_id),now,{table:'incidents',id:recordId,mutationKey:token}))
+        extra.push(enqueueSubscriberDeliveries(db,token,eventType,linked.results.map(row => row.component_id),now,{table:'incidents',id:recordId,mutationKey:token},env))
       }
       extra.push(audit(db,user,event,'incident',recordId,{title,status,impact},{table:'incidents',token}))
       const replay = await mutate(db,stmt(db,'UPDATE incidents SET title=?,impact=?,status=?,draft=?,resolved_at=?,updated_at=?,version=version+1,mutation_key=? WHERE id=? AND version=?',title,impact,status,draft,resolved,now,token,recordId,version(body)),extra,receipt,recordId,Number(body.version)+1,'SELECT 1 FROM incidents WHERE id=? AND mutation_key=?',[recordId,token])
@@ -528,7 +533,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
       if (ends <= starts) bad('End must be after start')
       const ids = componentIds(body.componentIds ?? [])
       await validateComponents(db,ids)
-      const replay = await commitMutation(db,[stmt(db,'INSERT INTO maintenance (id,name,description,starts_at,ends_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',maintenanceId,name,description,starts,ends,now,now),...links(db,'maintenance_components','maintenance_id',maintenanceId,ids),audit(db,user,'create','maintenance',maintenanceId,{name,startsAt:starts,endsAt:ends}),...(env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,maintenanceId,'maintenance.scheduled',ids,now)] : [])],receipt,maintenanceId,1,201,'SELECT 1 FROM maintenance WHERE id=?',[maintenanceId])
+      const replay = await commitMutation(db,[stmt(db,'INSERT INTO maintenance (id,name,description,starts_at,ends_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',maintenanceId,name,description,starts,ends,now,now),...links(db,'maintenance_components','maintenance_id',maintenanceId,ids),audit(db,user,'create','maintenance',maintenanceId,{name,startsAt:starts,endsAt:ends}),...(env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,maintenanceId,'maintenance.scheduled',ids,now,undefined,env)] : [])],receipt,maintenanceId,1,201,'SELECT 1 FROM maintenance WHERE id=?',[maintenanceId])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:maintenanceId,name,description,startsAt:starts,endsAt:ends,componentIds:ids,version:1},201)
     }
@@ -1099,7 +1104,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       ...links(db,'incident_components','incident_id',incidentId,ids),
       audit(db,user,'create','incident',incidentId,{title,impact}),
       ...(!body.draft ? [audit(db,user,'publish','incident',incidentId,{title,status,impact})] : []),
-      ...(!body.draft && env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,incidentId,'incident.created',ids,now)] : []),
+      ...(!body.draft && env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,incidentId,'incident.created',ids,now,undefined,env)] : []),
     ], receipt, incidentId, 1, 201, "SELECT 1 FROM incidents i JOIN entity_aliases a ON a.entity_id=i.id AND a.entity_type='incident' WHERE i.id=?", [incidentId], 'incident')
     if (replay) return replayReceipt(db, receipt!, replay)
     const alias = await stmt(db, 'SELECT alias FROM entity_aliases WHERE entity_type=? AND entity_id=?', 'incident', incidentId).first<{alias:number}>()
@@ -1186,7 +1191,7 @@ export default {
         const resource = /^\/api\/v1\/admin\/([^/]+)/.exec(normalized)?.[1]
         if (!resource || !['components','incidents','maintenance','checks','users','monitors'].includes(resource)) throw new HttpError(400, 'Idempotency is not available for this route')
         requireRole(user, ['checks','users'].includes(resource) ? 'admin' : 'operator')
-        receipt = await receiptContext(request, user)
+        receipt = await receiptContext(request, user, subscriberScope(env))
         if (receipt) {
           const existing = await findReceipt(env.DB, receipt)
           if (existing) return replayReceipt(env.DB, receipt, existing)

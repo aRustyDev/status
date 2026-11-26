@@ -3,6 +3,11 @@ import { boundedBody } from './idempotency'
 
 export interface SubscriberEnv {
   DB: D1Database
+  PREVIEW_SUBSCRIBER_SCOPE?: string
+  PREVIEW_SUBSCRIBER_REQUIRED?: string
+  PREVIEW_SLOT?: string
+  PREVIEW_TARGET?: string
+  PREVIEW_RELEASE?: string
   SUBSCRIBER_EMAIL_READY?: string
   SUBSCRIBER_EMAIL_FROM?: string
   SUBSCRIBER_EMAIL_DESTINATIONS?: string
@@ -21,6 +26,15 @@ export class SubscriberError extends Error {
 const fail = (status: number, message: string): never => { throw new SubscriberError(status, message) }
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store' } })
 const query = (env: SubscriberEnv, sql: string, ...values: unknown[]) => env.DB.prepare(sql).bind(...values)
+/** Only trusted Worker configuration chooses a namespace; invalid preview config fails closed. */
+export function subscriberScope(env: Pick<SubscriberEnv, 'PREVIEW_SUBSCRIBER_SCOPE' | 'PREVIEW_SUBSCRIBER_REQUIRED'>): string | null {
+  const scope = env.PREVIEW_SUBSCRIBER_SCOPE
+  if (scope === undefined && env.PREVIEW_SUBSCRIBER_REQUIRED !== 'true') return null
+  if (scope === undefined) throw new Error('Missing preview subscriber scope')
+  if (!/^[0-9a-f]{64}$/.test(scope)) throw new Error('Invalid preview subscriber scope')
+  return scope
+}
+function subscriberTable(scope: string | null): string { return scope ? 'preview_subscribers' : 'subscribers' }
 function publicUrl(env: SubscriberEnv): string {
   try {
     const url = new URL(env.SUBSCRIBER_PUBLIC_URL ?? '')
@@ -41,7 +55,11 @@ async function body(request: Request): Promise<Body> {
   return parsed as Body
 }
 async function settings(env: SubscriberEnv): Promise<Settings> {
-  const row = await query(env, 'SELECT * FROM subscription_settings WHERE id=1').first<Settings>()
+  const scope = subscriberScope(env)
+  const row = scope
+    ? await query(env, 'SELECT * FROM preview_subscription_settings WHERE scope=?', scope).first<Settings>()
+    : await query(env, 'SELECT * FROM subscription_settings WHERE id=1').first<Settings>()
+  if (scope && !row) return { enabled: 0, allow_email: 0, allowed_events: JSON.stringify(eventTypes), allow_component_scope: 1, updated_at: 0 }
   if (!row) throw new Error('Missing subscription settings')
   return row
 }
@@ -101,6 +119,10 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
   const isAdmin = route.startsWith('/admin/subscribers')
   if (isAdmin && user.role !== 'operator' && user.role !== 'admin') return fail(403, 'Insufficient role')
   const current = await settings(env)
+  const scope = subscriberScope(env)
+  const table = subscriberTable(scope)
+  const inScope = scope ? 'scope=? AND ' : ''
+  const scoped = (...values: unknown[]) => scope ? [scope, ...values] : values
   if (route === '/public/subscriptions/options' && method === 'GET') {
     const config = settingsView(env, current)
     const visible = await components(env)
@@ -111,7 +133,9 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
     const input = await body(request)
     if (typeof input.enabled !== 'boolean' || typeof input.allowEmail !== 'boolean' || typeof input.allowComponentScope !== 'boolean' || !Array.isArray(input.allowedEvents) || input.allowedEvents.some(event => typeof event !== 'string' || !eventTypes.includes(event)) || input.allowWebhook || input.allowSlack || input.rssEnabled || input.apiEnabled) return fail(400, 'Invalid settings')
     await env.DB.batch([
-      query(env, 'UPDATE subscription_settings SET enabled=?,allow_email=?,allow_component_scope=?,allowed_events=?,updated_at=? WHERE id=1', Number(input.enabled), Number(input.allowEmail), Number(input.allowComponentScope), JSON.stringify([...new Set(input.allowedEvents)]), Date.now()),
+      scope
+        ? query(env, 'INSERT INTO preview_subscription_settings (scope,enabled,allow_email,allow_component_scope,allowed_events,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET enabled=excluded.enabled,allow_email=excluded.allow_email,allow_component_scope=excluded.allow_component_scope,allowed_events=excluded.allowed_events,updated_at=excluded.updated_at', scope, Number(input.enabled), Number(input.allowEmail), Number(input.allowComponentScope), JSON.stringify([...new Set(input.allowedEvents)]), Date.now())
+        : query(env, 'UPDATE subscription_settings SET enabled=?,allow_email=?,allow_component_scope=?,allowed_events=?,updated_at=? WHERE id=1', Number(input.enabled), Number(input.allowEmail), Number(input.allowComponentScope), JSON.stringify([...new Set(input.allowedEvents)]), Date.now()),
       query(env, 'INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES (?,?,?,?,?,?,?)', crypto.randomUUID(), user.email, 'update', 'subscription_settings', '1', Date.now(), '{}'),
     ])
     return json(settingsView(env, await settings(env)))
@@ -120,15 +144,15 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
     const input = await body(request)
     if (!current.enabled || !current.allow_email || !subscriberEmailReady(env)) return fail(503, 'Subscriptions unavailable')
     if (input.type !== 'email' || typeof input.email !== 'string' || input.email.toLowerCase() !== user.email.toLowerCase() || !subscriberAddressApproved(env, user.email) || input.website) return fail(400, 'Invalid subscription')
-    const scope = await validateScope(env, input, current)
+    const selection = await validateScope(env, input, current)
     const now = Date.now()
     const bytes = crypto.getRandomValues(new Uint8Array(32))
     const token = [...bytes].map(n => n.toString(16).padStart(2, '0')).join('')
     const hash = await tokenHash(token)
-    const saved = await query(env, `INSERT INTO subscribers (user_id,email,status,events,monitor_ids,created_at,updated_at,confirmation_hash,confirmation_expires_at,confirmation_sent_at)
-      VALUES (?,?,'pending',?,?,?,?,?,?,?)
-      ON CONFLICT(user_id) DO UPDATE SET email=excluded.email,status='pending',events=excluded.events,monitor_ids=excluded.monitor_ids,updated_at=excluded.updated_at,confirmation_hash=excluded.confirmation_hash,confirmation_expires_at=excluded.confirmation_expires_at,confirmation_sent_at=excluded.confirmation_sent_at
-      WHERE subscribers.status <> 'active' AND (subscribers.confirmation_sent_at IS NULL OR subscribers.confirmation_sent_at < ?)`, user.id, user.email, JSON.stringify(scope.events), JSON.stringify(scope.ids), now, now, hash, now + 48 * 3600000, now, now - 600000).run()
+    const saved = await query(env, `INSERT INTO ${table} (${scope ? 'scope,' : ''}user_id,email,status,events,monitor_ids,created_at,updated_at,confirmation_hash,confirmation_expires_at,confirmation_sent_at)
+      VALUES (${scope ? '?,' : ''}?,?,'pending',?,?,?,?,?,?,?)
+      ON CONFLICT(${scope ? 'scope,' : ''}user_id) DO UPDATE SET email=excluded.email,status='pending',events=excluded.events,monitor_ids=excluded.monitor_ids,updated_at=excluded.updated_at,confirmation_hash=excluded.confirmation_hash,confirmation_expires_at=excluded.confirmation_expires_at,confirmation_sent_at=excluded.confirmation_sent_at
+      WHERE ${table}.status <> 'active' AND (${table}.confirmation_sent_at IS NULL OR ${table}.confirmation_sent_at < ?)`, ...scoped(user.id, user.email, JSON.stringify(selection.events), JSON.stringify(selection.ids), now, now, hash, now + 48 * 3600000, now, now - 600000)).run()
     if (!saved.meta.changes) return fail(429, 'A subscription is active or confirmation was recently requested. Try again in 10 minutes.')
     const link = `${publicUrl(env)}/#subscription=confirm&token=${token}`
     try {
@@ -142,23 +166,23 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
     if (typeof input.token !== 'string' || !/^[0-9a-f]{64}$/.test(input.token)) return fail(404, 'Invalid confirmation link')
     const hash = await tokenHash(input.token)
     const now = Date.now()
-    const result = await query(env, "UPDATE subscribers SET status='active',confirmed_at=?,updated_at=?,confirmation_hash=NULL,confirmation_expires_at=NULL WHERE user_id=? AND lower(email)=lower(?) AND status='pending' AND confirmation_hash=? AND confirmation_expires_at>?", now, now, user.id, user.email, hash, now).run()
+    const result = await query(env, `UPDATE ${table} SET status='active',confirmed_at=?,updated_at=?,confirmation_hash=NULL,confirmation_expires_at=NULL WHERE ${inScope}user_id=? AND lower(email)=lower(?) AND status='pending' AND confirmation_hash=? AND confirmation_expires_at>?`, now, now, ...scoped(user.id, user.email, hash, now)).run()
     if (!result.meta.changes) return fail(404, 'Invalid confirmation link')
     return json({ ok: true })
   }
   if ((route === '/public/subscriptions/preferences' && (method === 'POST' || method === 'PUT')) || (route === '/public/subscriptions/unsubscribe' && method === 'POST')) {
     const input = await body(request)
-    const existing = await query(env, 'SELECT * FROM subscribers WHERE user_id=? AND lower(email)=lower(?)', user.id, user.email).first<Subscriber>()
+    const existing = await query(env, `SELECT * FROM ${table} WHERE ${inScope}user_id=? AND lower(email)=lower(?)`, ...scoped(user.id, user.email)).first<Subscriber>()
     if (!existing) return fail(404, 'Subscription not found')
     if (route.endsWith('/unsubscribe')) {
-      await query(env, "UPDATE subscribers SET status='unsubscribed',confirmation_hash=NULL,confirmation_expires_at=NULL,updated_at=? WHERE user_id=?", Date.now(), user.id).run()
+      await query(env, `UPDATE ${table} SET status='unsubscribed',confirmation_hash=NULL,confirmation_expires_at=NULL,updated_at=? WHERE ${inScope}user_id=?`, Date.now(), ...scoped(user.id)).run()
       return json({ ok: true })
     }
     if (method === 'PUT') {
       if (input.resubscribe) return fail(400, 'Confirm a new subscription to resubscribe')
-      const scope = await validateScope(env, input, current)
-      await query(env, 'UPDATE subscribers SET events=?,monitor_ids=?,updated_at=? WHERE user_id=?', JSON.stringify(scope.events), JSON.stringify(scope.ids), Date.now(), user.id).run()
-      return json(await subscriberView(env, { ...existing, events: JSON.stringify(scope.events), monitor_ids: JSON.stringify(scope.ids) }, true))
+      const selection = await validateScope(env, input, current)
+      await query(env, `UPDATE ${table} SET events=?,monitor_ids=?,updated_at=? WHERE ${inScope}user_id=?`, JSON.stringify(selection.events), JSON.stringify(selection.ids), Date.now(), ...scoped(user.id)).run()
+      return json(await subscriberView(env, { ...existing, events: JSON.stringify(selection.events), monitor_ids: JSON.stringify(selection.ids) }, true))
     }
     return json(await subscriberView(env, existing, true))
   }
@@ -167,9 +191,9 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
     const { page, limit } = pagination(input)
     const { status, search } = filters(input)
     const conditions = "(? IS NULL OR status=?) AND email LIKE ? ESCAPE '\\'"
-    const records = await query(env, `SELECT * FROM subscribers WHERE ${conditions} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, status, status, search, limit, (page - 1) * limit).all<Subscriber>()
-    const count = await query(env, `SELECT count(*) AS total FROM subscribers WHERE ${conditions}`, status, status, search).first<{total:number}>()
-    const counts = await query(env, 'SELECT status,count(*) AS count FROM subscribers GROUP BY status').all<{status:string;count:number}>()
+    const records = await query(env, `SELECT * FROM ${table} WHERE ${inScope}${conditions} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, ...scoped(status, status, search, limit, (page - 1) * limit)).all<Subscriber>()
+    const count = await query(env, `SELECT count(*) AS total FROM ${table} WHERE ${inScope}${conditions}`, ...scoped(status, status, search)).first<{total:number}>()
+    const counts = await query(env, `SELECT status,count(*) AS count FROM ${table} ${scope ? 'WHERE scope=?' : ''} GROUP BY status`, ...scoped()).all<{status:string;count:number}>()
     const stats = { total: 0, active: 0, pending: 0, unsubscribed: 0, disabled: 0 }
     for (const item of counts.results) { stats.total += item.count; if (item.status in stats && item.status !== 'total') stats[item.status as 'active' | 'pending' | 'unsubscribed'] = item.count }
     const total = count?.total ?? 0
@@ -180,7 +204,7 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
     const { status, search } = filters(input)
     if (input.ids !== undefined && (!Array.isArray(input.ids) || input.ids.length > 100 || input.ids.some(id => !Number.isSafeInteger(id) || id < 1))) return fail(400, 'Invalid selection')
     const ids = input.ids === undefined ? null : JSON.stringify(input.ids)
-    const rows = await query(env, "SELECT * FROM subscribers WHERE ((? IS NOT NULL AND id IN (SELECT value FROM json_each(?))) OR (? IS NULL AND (? IS NULL OR status=?) AND email LIKE ? ESCAPE '\\')) ORDER BY id LIMIT 10001", ids, ids, ids, status, status, search).all<Subscriber>()
+    const rows = await query(env, `SELECT * FROM ${table} WHERE ${inScope}((? IS NOT NULL AND id IN (SELECT value FROM json_each(?))) OR (? IS NULL AND (? IS NULL OR status=?) AND email LIKE ? ESCAPE '\\')) ORDER BY id LIMIT 10001`, ...scoped(ids, ids, ids, status, status, search)).all<Subscriber>()
     if (rows.results.length > 10000) return fail(413, 'Export exceeds the supported size. Narrow the filter.')
     const views = await Promise.all(rows.results.map(row => subscriberView(env, row)))
     const lines = [['id','type','destination','status','events','monitors','last_notified_at','last_error'].map(csvCell).join(','), ...views.map(row => [row.id, row.type, row.email, row.status, row.events.join(','), row.monitorIds.join(','), row.lastNotifiedAt, row.lastError].map(csvCell).join(','))]
@@ -188,10 +212,10 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
   }
   const deletion = /^\/admin\/subscribers\/(\d+)$/.exec(route)
   if (deletion && method === 'DELETE') {
-    const record = await query(env, 'SELECT id FROM subscribers WHERE id=?', Number(deletion[1])).first<{id:number}>()
+    const record = await query(env, `SELECT id FROM ${table} WHERE ${inScope}id=?`, ...scoped(Number(deletion[1]))).first<{id:number}>()
     if (!record) return fail(404, 'Subscriber not found')
     await env.DB.batch([
-      query(env, 'DELETE FROM subscribers WHERE id=?', record.id),
+      query(env, `DELETE FROM ${table} WHERE ${inScope}id=?`, ...scoped(record.id)),
       query(env, 'INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details) VALUES (?,?,?,?,?,?,?)', crypto.randomUUID(), user.email, 'delete', 'subscriber', String(record.id), Date.now(), '{}'),
     ])
     return new Response(null, { status: 204, headers: { 'Cache-Control': 'no-store' } })

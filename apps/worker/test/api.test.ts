@@ -97,7 +97,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql', '0018_subscribers.sql', '0019_subscriber_deliveries.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql', '0018_subscribers.sql', '0019_subscriber_deliveries.sql', '0020_preview_subscribers.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -131,6 +131,7 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0017_monitor_action_links.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0018_subscribers.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0019_subscriber_deliveries.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0020_preview_subscribers.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -2073,6 +2074,60 @@ test('disabled subscription settings do not advertise or accept subscriber deliv
     assert.equal(((await request('/api/v1/bsp/capabilities',operatorToken)).body as unknown as {subscriberDelivery:boolean}).subscriberDelivery,true)
   } finally {
     await db.prepare('UPDATE subscription_settings SET enabled=0,allow_email=0 WHERE id=1').run()
+    for (const key of Object.keys(configured) as Array<keyof typeof configured>) delete mutable[key]
+  }
+})
+
+test('preview publication atomically queues only its lease-scoped subscribers', async () => {
+  const a = 'a'.repeat(64), b = 'b'.repeat(64)
+  const configured = {
+    PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:a,
+    SUBSCRIBERS_READY:'true', SUBSCRIBER_EMAIL_READY:'true', SUBSCRIBER_EMAIL_FROM:'sender@example.com',
+    SUBSCRIBER_PUBLIC_URL:'https://status.example',
+    SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'viewer',name:'Viewer',address:'viewer@example.com'}]),
+    SUBSCRIBER_EMAIL:{ send:async () => ({messageId:'test'}) },
+  }
+  const mutable = env as typeof env & Partial<typeof configured>
+  Object.assign(mutable,configured)
+  let maintenanceId = ''
+  let secondMaintenanceId = ''
+  const key = `${Date.now()}.${crypto.randomUUID()}`
+  try {
+    const viewer = await db.prepare("SELECT id FROM users WHERE subject='viewer-id'").first<{id:string}>()
+    assert.ok(viewer)
+    await db.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email) VALUES (?,1,1)").bind(a).run()
+    for (const scope of [a,b]) await db.prepare("INSERT INTO preview_subscribers(scope,user_id,email,status,events,monitor_ids,created_at,updated_at) VALUES (?,?,'viewer@example.com','active','[\"maintenance.scheduled\"]','[]',0,0)").bind(scope,viewer.id).run()
+    const publication = {name:'Scoped publication test',description:'',startsAt:Date.now()+60_000,endsAt:Date.now()+120_000,monitorIds:[],notifySubscribers:true}
+    const result = await request('/api/v1/bsp/admin/maintenance',operatorToken,'POST',publication,undefined,key)
+    assert.equal(result.response.status,201)
+    const fixture = await db.prepare("SELECT id FROM maintenance WHERE name='Scoped publication test'").first<{id:string}>()
+    assert.ok(fixture)
+    maintenanceId = fixture.id
+    const jobs = await db.prepare('SELECT scope,event_id FROM preview_subscriber_deliveries').all<{scope:string;event_id:string}>()
+    assert.deepEqual(jobs.results.map(row => ({...row})),[{scope:a,event_id:maintenanceId}])
+    assert.equal((await db.prepare('SELECT count(*) AS n FROM subscriber_deliveries').first<{n:number}>())?.n,0)
+    const replay = await request('/api/v1/bsp/admin/maintenance',operatorToken,'POST',publication,undefined,key)
+    assert.equal(replay.response.status,201)
+    assert.equal(replay.body.id,result.body.id)
+    mutable.PREVIEW_SUBSCRIBER_SCOPE = b
+    const rejected = await request('/api/v1/bsp/admin/maintenance',operatorToken,'POST',{name:'Blocked scoped publication test',description:'',startsAt:Date.now()+60_000,endsAt:Date.now()+120_000,monitorIds:[],notifySubscribers:true})
+    assert.equal(rejected.response.status,503)
+    assert.equal((await db.prepare("SELECT count(*) AS n FROM maintenance WHERE name='Blocked scoped publication test'").first<{n:number}>())?.n,0)
+    await db.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email) VALUES (?,1,1)").bind(b).run()
+    const other = await request('/api/v1/bsp/admin/maintenance',operatorToken,'POST',publication,undefined,key)
+    assert.equal(other.response.status,201)
+    assert.notEqual(other.body.id,result.body.id)
+    const secondJob = await db.prepare('SELECT event_id FROM preview_subscriber_deliveries WHERE scope=?').bind(b).first<{event_id:string}>()
+    assert.ok(secondJob)
+    secondMaintenanceId = secondJob.event_id
+    assert.notEqual(secondMaintenanceId,maintenanceId)
+  } finally {
+    await db.prepare('DELETE FROM preview_subscriber_deliveries').run()
+    await db.prepare('DELETE FROM preview_subscribers').run()
+    await db.prepare('DELETE FROM preview_subscription_settings').run()
+    if (maintenanceId) await db.prepare('DELETE FROM maintenance WHERE id=?').bind(maintenanceId).run()
+    if (secondMaintenanceId) await db.prepare('DELETE FROM maintenance WHERE id=?').bind(secondMaintenanceId).run()
+    await db.prepare('DELETE FROM mutation_receipts WHERE request_key IN (?,?)').bind(`preview:${a}:${key}`,`preview:${b}:${key}`).run()
     for (const key of Object.keys(configured) as Array<keyof typeof configured>) delete mutable[key]
   }
 })

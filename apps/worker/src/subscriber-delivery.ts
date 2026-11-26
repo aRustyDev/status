@@ -1,4 +1,4 @@
-import { subscriberAddressApproved, subscriberEmailReady, type SubscriberEnv } from './subscribers'
+import { subscriberAddressApproved, subscriberEmailReady, subscriberScope, type SubscriberEnv } from './subscribers'
 
 type DeliveryEnv = SubscriberEnv & { DB: D1Database }
 
@@ -6,8 +6,19 @@ type DeliveryEnv = SubscriberEnv & { DB: D1Database }
 export function enqueueSubscriberDeliveries(
   db: D1Database, eventId: string, eventType: string, components: string[], now: number,
   guard?: { table: 'incidents'; id: string; mutationKey: string },
+  env?: Pick<SubscriberEnv, 'PREVIEW_SUBSCRIBER_SCOPE' | 'PREVIEW_SUBSCRIBER_REQUIRED'>,
 ): D1PreparedStatement {
   const guardSql = guard ? 'AND EXISTS (SELECT 1 FROM incidents WHERE id=? AND mutation_key=? AND draft=0)' : ''
+  const scope = env ? subscriberScope(env) : null
+  if (scope) return db.prepare(`INSERT OR IGNORE INTO preview_subscriber_deliveries
+    (id,scope,subscriber_id,event_id,event_type,component_ids,created_at,updated_at)
+    SELECT lower(hex(randomblob(16))),s.scope,s.id,?,?,?,?,? FROM preview_subscribers s JOIN preview_subscription_settings cfg ON cfg.scope=s.scope
+    WHERE s.scope=? AND cfg.enabled=1 AND cfg.allow_email=1 AND s.status='active'
+      AND EXISTS (SELECT 1 FROM json_each(cfg.allowed_events) WHERE value=?)
+      AND EXISTS (SELECT 1 FROM json_each(s.events) WHERE value=?)
+      AND (json_array_length(?)=0 OR json_array_length(s.monitor_ids)=0 OR EXISTS
+        (SELECT 1 FROM json_each(s.monitor_ids) m JOIN json_each(?) c ON m.value=c.value)) ${guardSql}`)
+    .bind(eventId,eventType,JSON.stringify(components),now,now,scope,eventType,eventType,JSON.stringify(components),JSON.stringify(components),...(guard ? [guard.id,guard.mutationKey] : []))
   return db.prepare(`INSERT OR IGNORE INTO subscriber_deliveries
     (id,subscriber_id,event_id,event_type,component_ids,created_at,updated_at)
     SELECT lower(hex(randomblob(16))),s.id,?,?,?,?,? FROM subscribers s JOIN subscription_settings cfg ON cfg.id=1
@@ -21,6 +32,7 @@ export function enqueueSubscriberDeliveries(
 
 /** Email acceptance can be ambiguous, so an expired claim is failed without resending. */
 export async function flushSubscriberDeliveries(env: DeliveryEnv): Promise<void> {
+  if (subscriberScope(env)) throw new Error('Preview dispatch requires the fenced preview scheduler')
   if (!subscriberEmailReady(env)) return
   const now = Date.now()
   await env.DB.prepare("DELETE FROM subscriber_deliveries WHERE rowid IN (SELECT rowid FROM subscriber_deliveries WHERE state IN ('delivered','failed','cancelled') AND updated_at<? LIMIT 500)").bind(now - 90 * 86_400_000).run()

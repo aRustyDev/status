@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
 import { enqueueSubscriberDeliveries, flushSubscriberDeliveries } from '../src/subscriber-delivery.ts'
+import { flushPreviewSubscriberDeliveries } from '../src/preview-subscriber-scheduler.ts'
 
 class Statement {
   private values: unknown[] = []
@@ -27,6 +28,7 @@ function fixture(send?: () => Promise<unknown>) {
     INSERT INTO subscription_settings VALUES (1,1,1,'["incident.created"]',0);
     INSERT INTO subscribers VALUES (1,'test@example.test','active','["incident.created"]','["component-a"]',NULL,NULL,0,'owner');`)
   local.sqlite.exec(readFileSync(new URL('../migrations/0019_subscriber_deliveries.sql',import.meta.url),'utf8'))
+  local.sqlite.exec(readFileSync(new URL('../migrations/0020_preview_subscribers.sql',import.meta.url),'utf8'))
   let calls = 0
   const env = { DB: local as unknown as D1Database, SUBSCRIBER_EMAIL_READY: 'true', SUBSCRIBER_EMAIL_FROM: 'status@example.test', SUBSCRIBER_EMAIL_DESTINATIONS: JSON.stringify([{id:'test',name:'Test',address:'test@example.test'}]), SUBSCRIBER_PUBLIC_URL: 'https://status.example.test', SUBSCRIBER_EMAIL: {send: async () => { calls++; return send ? send() : {messageId:'accepted'} }} as unknown as SendEmail }
   return {local,env,get calls() { return calls }}
@@ -101,4 +103,69 @@ test('an Access identity email change cancels a queued delivery to the old addre
   await flushSubscriberDeliveries(x.env)
   assert.equal(x.calls,0)
   assert.equal((x.local.sqlite.prepare('SELECT state FROM subscriber_deliveries').get() as {state:string}).state,'cancelled')
+})
+
+test('preview dispatch and maintenance isolate leases and baseline deliveries', async () => {
+  const x = fixture()
+  const a = 'a'.repeat(64), b = 'b'.repeat(64), release = 'c'.repeat(40)
+  const preview = (scope:string, slot:string) => ({...x.env, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:scope, PREVIEW_SLOT:slot, PREVIEW_TARGET:'a', PREVIEW_RELEASE:release, SUBSCRIBERS_READY:'true'})
+  const first = preview(a,'1'), second = preview(b,'2')
+  const now = Date.now()
+  const settings = x.local.sqlite.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email,allowed_events,updated_at) VALUES (?,1,1,'[\"incident.created\"]',0)")
+  const subscriber = x.local.sqlite.prepare("INSERT INTO preview_subscribers(scope,user_id,email,status,events,monitor_ids,created_at,updated_at) VALUES (?,'owner','test@example.test','active','[\"incident.created\"]','[]',0,0)")
+  const lease = x.local.sqlite.prepare('INSERT INTO preview_subscriber_leases(scope,slot,target,release,expires_at) VALUES (?,?,\'a\',?,?)')
+  for (const [scope,slot] of [[a,1],[b,2]] as const) { settings.run(scope); subscriber.run(scope); lease.run(scope,slot,release,now+60_000) }
+  await enqueueSubscriberDeliveries(x.env.DB,'baseline','incident.created',[],now).run()
+  await enqueueSubscriberDeliveries(x.env.DB,'first','incident.created',[],now,undefined,first).run()
+  await enqueueSubscriberDeliveries(x.env.DB,'second','incident.created',[],now,undefined,second).run()
+  const old = now-91*86_400_000
+  x.local.sqlite.prepare("INSERT INTO preview_subscriber_deliveries(id,scope,subscriber_id,event_id,event_type,component_ids,state,created_at,updated_at) SELECT 'old-b',scope,id,'old-b','incident.created','[]','delivered',?,? FROM preview_subscribers WHERE scope=?").run(old,old,b)
+  await flushPreviewSubscriberDeliveries(first)
+  assert.equal(x.calls,1)
+  assert.equal((x.local.sqlite.prepare("SELECT state FROM preview_subscriber_deliveries WHERE event_id='first'").get() as {state:string}).state,'delivered')
+  assert.equal((x.local.sqlite.prepare("SELECT state FROM preview_subscriber_deliveries WHERE event_id='second'").get() as {state:string}).state,'pending')
+  assert.equal((x.local.sqlite.prepare("SELECT count(*) AS n FROM preview_subscriber_deliveries WHERE id='old-b'").get() as {n:number}).n,1)
+  assert.equal((x.local.sqlite.prepare('SELECT state FROM subscriber_deliveries').get() as {state:string}).state,'pending')
+  x.local.sqlite.prepare('UPDATE preview_subscriber_leases SET target=\'b\' WHERE scope=?').run(b)
+  await flushPreviewSubscriberDeliveries(second)
+  assert.equal(x.calls,1)
+  assert.equal((x.local.sqlite.prepare("SELECT state FROM preview_subscriber_deliveries WHERE event_id='second'").get() as {state:string}).state,'pending')
+  assert.equal((x.local.sqlite.prepare("SELECT count(*) AS n FROM preview_subscriber_deliveries WHERE id='old-b'").get() as {n:number}).n,1)
+  await assert.rejects(() => flushPreviewSubscriberDeliveries({...first, PREVIEW_SUBSCRIBER_SCOPE:undefined}), /Missing preview subscriber scope/)
+  await assert.rejects(() => flushSubscriberDeliveries(first), /fenced preview scheduler/)
+})
+
+test('a lease revoked after claim is fenced before the provider call', async () => {
+  const x = fixture(), scope = 'a'.repeat(64), release = 'b'.repeat(40), now = Date.now()
+  x.local.sqlite.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email,allowed_events,updated_at) VALUES (?,1,1,'[\"incident.created\"]',0)").run(scope)
+  x.local.sqlite.prepare("INSERT INTO preview_subscribers(scope,user_id,email,status,events,monitor_ids,created_at,updated_at) VALUES (?,'owner','test@example.test','active','[\"incident.created\"]','[]',0,0)").run(scope)
+  x.local.sqlite.prepare('INSERT INTO preview_subscriber_leases(scope,slot,target,release,expires_at) VALUES (?,1,\'a\',?,?)').run(scope,release,now+60_000)
+  const config = {...x.env,PREVIEW_SUBSCRIBER_REQUIRED:'true',PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_SLOT:'1',PREVIEW_TARGET:'a',PREVIEW_RELEASE:release,SUBSCRIBERS_READY:'true'}
+  await enqueueSubscriberDeliveries(x.env.DB,'race','incident.created',[],now,undefined,config).run()
+  const db = { prepare(sql:string) {
+    const statement = x.local.prepare(sql)
+    if (sql.startsWith('SELECT s.id AS subscriber_id')) {
+      const first = statement.first.bind(statement)
+      statement.first = async <T>() => { x.local.sqlite.prepare("UPDATE preview_subscriber_leases SET target='b' WHERE scope=?").run(scope); return first<T>() }
+    }
+    return statement
+  }, batch: x.local.batch.bind(x.local) } as unknown as D1Database
+  await flushPreviewSubscriberDeliveries({...config,DB:db})
+  assert.equal(x.calls,0)
+  assert.equal((x.local.sqlite.prepare("SELECT state FROM preview_subscriber_deliveries WHERE event_id='race'").get() as {state:string}).state,'sending')
+})
+
+test('deleting a shared identity cascades only its preview subscriptions and deliveries', async () => {
+  const x = fixture(), a = 'a'.repeat(64), b = 'b'.repeat(64), now = Date.now()
+  x.local.sqlite.exec("PRAGMA foreign_keys=ON; INSERT INTO users VALUES ('other','other@example.test')")
+  const settings = x.local.sqlite.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email,allowed_events) VALUES (?,1,1,'[\"incident.created\"]')")
+  const subscriber = x.local.sqlite.prepare("INSERT INTO preview_subscribers(scope,user_id,email,status,events,monitor_ids,created_at,updated_at) VALUES (?,?,?,'active','[\"incident.created\"]','[]',0,0)")
+  for (const scope of [a,b]) { settings.run(scope); subscriber.run(scope,'owner','test@example.test') }
+  subscriber.run(b,'other','other@example.test')
+  for (const scope of [a,b]) await enqueueSubscriberDeliveries(x.env.DB,`event-${scope[0]}`,'incident.created',[],now,undefined,{PREVIEW_SUBSCRIBER_SCOPE:scope}).run()
+  x.local.sqlite.prepare('DELETE FROM users WHERE id=?').run('owner')
+  const left = x.local.sqlite.prepare('SELECT scope,user_id FROM preview_subscribers').all().map(row => ({...row}))
+  assert.deepEqual(left,[{scope:b,user_id:'other'}])
+  const deliveries = x.local.sqlite.prepare('SELECT d.scope,s.user_id FROM preview_subscriber_deliveries d JOIN preview_subscribers s ON s.id=d.subscriber_id').all().map(row => ({...row}))
+  assert.deepEqual(deliveries,[{scope:b,user_id:'other'}])
 })
