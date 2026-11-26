@@ -80,8 +80,9 @@ test('changed scheduler module disables scheduling until newly reviewed', t => {
   h.settings.subscriberSchedulingEnabled = true
   h.settings.approvedSubscriberSchedulers = { [sha]: {}, ['e'.repeat(40)]: { 'index.ts': '0'.repeat(64) } }
   for (const name of ['preview-subscriber-scheduler.ts', 'subscriber-delivery.ts', 'subscribers.ts', 'email-channel.ts', 'idempotency.ts', 'index.ts']) {
-    writeFileSync(path.join(dir, name), name)
-    h.settings.approvedSubscriberSchedulers[sha][name] = createHash('sha256').update(name).digest('hex')
+    const content = name === 'preview-subscriber-scheduler.ts' ? 'export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT = 2' : name
+    writeFileSync(path.join(dir, name), content)
+    h.settings.approvedSubscriberSchedulers[sha][name] = createHash('sha256').update(content).digest('hex')
   }
   writeFileSync(path.join(dir, 'subscriber-delivery.ts'), 'changed since approval')
   h.settings.apiVars = { SUBSCRIBERS_READY: 'true', SUBSCRIBER_EMAIL_READY: 'true' }
@@ -91,6 +92,23 @@ test('changed scheduler module disables scheduling until newly reviewed', t => {
   assert.equal(h.config('status-preview-1-a-operations').vars.SUBSCRIBERS_READY, 'false')
   assert.equal(h.config('status-preview-1-a-operations').vars.SUBSCRIBER_EMAIL_READY, 'false')
   assert.equal(requireExists(path.join(h.directory, 'configs/status-preview-1-a-subscriber.json')), false)
+})
+
+test('a reviewed obsolete scheduler contract cannot enable subscriber scheduling', t => {
+  const h = harness(t)
+  const dir = path.join(h.directory, 'feature/apps/worker/src')
+  mkdirSync(dir, { recursive: true })
+  h.settings.subscriberSchedulingEnabled = true
+  h.settings.approvedSubscriberSchedulers = { [sha]: {} }
+  for (const name of ['preview-subscriber-scheduler.ts', 'subscriber-delivery.ts', 'subscribers.ts', 'email-channel.ts', 'idempotency.ts', 'index.ts']) {
+    const content = name === 'preview-subscriber-scheduler.ts' ? 'export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT = 1' : name
+    writeFileSync(path.join(dir, name), content)
+    h.settings.approvedSubscriberSchedulers[sha][name] = createHash('sha256').update(content).digest('hex')
+  }
+  const result = h.run('deploy')
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(h.state().subscriberScheduler, false)
+  assert.equal(h.config('status-preview-1-a-operations').vars.SUBSCRIBERS_READY, 'false')
 })
 
 function requireExists(file) { try { readFileSync(file); return true } catch { return false } }
@@ -104,7 +122,7 @@ test('reviewed scheduler uses slot fence and restricted email; release revokes f
   h.settings.subscriberSchedulingEnabled = true
   h.settings.approvedSubscriberSchedulers = { [sha]: {} }
   for (const name of files) {
-    const content = `// reviewed ${name}`
+    const content = name === 'preview-subscriber-scheduler.ts' ? 'export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT = 2' : `// reviewed ${name}`
     writeFileSync(path.join(dir, name), content)
     h.settings.approvedSubscriberSchedulers[sha][name] = createHash('sha256').update(content).digest('hex')
   }

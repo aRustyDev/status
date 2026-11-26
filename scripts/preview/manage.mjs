@@ -45,11 +45,14 @@ function schedulerSupported(settings, release) {
   if (settings.subscriberSchedulingEnabled !== true) return false
   const approved = settings.approvedSubscriberSchedulers?.[release]
   if (!approved || typeof approved !== 'object' || Array.isArray(approved)) return false
-  return schedulerFiles.every(name => {
+  const reviewed = schedulerFiles.every(name => {
     const file = path.join(branchDir, 'apps/worker/src', name)
     if (!existsSync(file) || !/^[a-f0-9]{64}$/.test(approved[name] || '')) return false
     return createHash('sha256').update(readFileSync(file)).digest('hex') === approved[name]
   })
+  if (!reviewed) return false
+  const entry = readFileSync(path.join(branchDir, 'apps/worker/src/preview-subscriber-scheduler.ts'), 'utf8')
+  return /^export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT = 2\s*$/m.test(entry)
 }
 async function setSchedulerFence(settings, value) {
   if (!settings.d1DatabaseId || typeof settings.d1DatabaseId !== 'string') fail('Missing D1 database for subscriber scheduler fence')
@@ -147,7 +150,7 @@ function createConfigs(settings, target, selector, sha, dir, subscriberScheduler
     const email = (settings.resourceBindings?.api?.send_email || []).filter(x => x.name === 'SUBSCRIBER_EMAIL')
     if (email.length !== 1 || !Array.isArray(email[0].allowed_sender_addresses) || email[0].allowed_sender_addresses.length !== 1 || !Array.isArray(email[0].allowed_destination_addresses) || email[0].allowed_destination_addresses.length !== 1) fail('Subscriber scheduler requires a restricted email binding')
     const scheduler = path.join(dir, 'preview-subscriber.ts')
-    writeFileSync(scheduler, `import { runPreviewSubscriberScheduler } from ${JSON.stringify(path.join(root, 'apps/gateway/preview-subscriber-scheduler.mjs'))}\nimport { PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT, flushPreviewSubscriberDeliveries } from ${JSON.stringify(source('apps/worker/src/preview-subscriber-scheduler.ts'))}\nexport default { async scheduled(_controller, env) { if (PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT === 1) await runPreviewSubscriberScheduler(env, flushPreviewSubscriberDeliveries) } }\n`, { mode: 0o600 })
+    writeFileSync(scheduler, `import { runPreviewSubscriberScheduler } from ${JSON.stringify(path.join(root, 'apps/gateway/preview-subscriber-scheduler.mjs'))}\nimport { PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT, flushPreviewSubscriberDeliveries } from ${JSON.stringify(source('apps/worker/src/preview-subscriber-scheduler.ts'))}\nexport default { async scheduled(_controller, env) { if (PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT === 2) await runPreviewSubscriberScheduler(env, flushPreviewSubscriberDeliveries) } }\n`, { mode: 0o600 })
     const subscriberVars = Object.fromEntries(Object.entries(settings.apiVars || {}).filter(([name]) => name.startsWith('SUBSCRIBER_') || name === 'SUBSCRIBERS_READY'))
     configs.subscriber = { ...shared, main: scheduler, name: `${stem}-subscriber`, d1_databases: database, flagship: [{ binding: 'FLAGS', app_id: app }], send_email: email, vars: { ...subscriberVars, ...vars, PREVIEW_SELECTOR: selector }, triggers: { crons: ['* * * * *'] } }
   }
