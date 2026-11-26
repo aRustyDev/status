@@ -1,5 +1,5 @@
-import { act, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
 import { api } from './api/client'
@@ -137,6 +137,21 @@ it.each([
   render(<App />)
   expect(await screen.findByText('This feature is unavailable.')).toBeInTheDocument()
   expect(api.get).not.toHaveBeenCalledWith('/admin/static-mirror')
+})
+
+it.each([
+  ['operator', ['/admin/', '/admin/actions']],
+  ['admin', ['/admin/']],
+])('keeps action delivery history unavailable for %s without its role and capability', async (role, supportedRoutes) => {
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path === '/auth/me') return { id: 'identity', email: 'test@example.com', role }
+    if (path === '/capabilities') return { supportedRoutes }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  window.history.replaceState({}, '', '/admin/delivery-history?tab=actions')
+  render(<App />)
+  expect(await screen.findByText('This feature is unavailable.')).toBeInTheDocument()
+  expect(api.get).not.toHaveBeenCalledWith('/admin/actions/runs')
 })
 
 it.each([

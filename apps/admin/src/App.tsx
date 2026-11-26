@@ -16,6 +16,7 @@ const Audit = lazy(() => import('./pages/AuditLog'))
 const Vault = lazy(() => import('./pages/Vault'))
 const Notifications = lazy(() => import('./pages/CloudflareNotifications'))
 const Actions = lazy(() => import('./pages/CloudflareActions'))
+const DeliveryHistory = lazy(() => import('./pages/CloudflareDeliveryHistory'))
 const Backups = lazy(() => import('./pages/Backups'))
 const SystemHealth = lazy(() => import('./pages/SystemHealth'))
 const StaticFallback = lazy(() => import('./pages/CloudflareStaticFallback'))
@@ -50,7 +51,9 @@ function Shell({ identity, capabilities }: { identity: Identity; capabilities: C
     <nav aria-label="Administration" className="flex-1 px-3 overflow-y-auto pb-2">
       {ALL_SECTIONS.map(section => <section key={section.label} className="mt-4">
         <h2 className="px-4 pb-1 font-mono uppercase tracking-widest text-xs">{section.label}</h2>
-        {section.items.map(item => supported.has(item.to) && (item.minRole !== 'admin' || identity.role === 'admin')
+        {section.items.map(item => (item.to === '/admin/delivery-history'
+          ? identity.role === 'admin' && supported.has('/admin/actions')
+          : supported.has(item.to) && (item.minRole !== 'admin' || identity.role === 'admin'))
           ? <Link key={item.to} className="admin-nav-item" to={item.to} onClick={() => setDrawerOpen(false)}>
               <span className="material-symbols-outlined" aria-hidden="true">{item.icon}</span>{item.label}
             </Link>
@@ -139,6 +142,7 @@ export default function App() {
             <Route path="incidents" element={capabilities.supportedRoutes.includes("/admin/incidents") ? <Incidents /> : <Unavailable />} />
             <Route path="maintenance" element={capabilities.supportedRoutes.includes("/admin/maintenance") ? <Maintenance /> : <Unavailable />} />
             <Route path="actions" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/actions') ? <Actions /> : <Unavailable />} />
+            <Route path="delivery-history" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/actions') ? <DeliveryHistory /> : <Unavailable />} />
             <Route path="notifications" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/notifications') ? <Notifications /> : <Unavailable />} />
             <Route path="vault" element={identity.role === 'admin' && capabilities.supportedRoutes.includes("/admin/vault") ? <Vault /> : <Unavailable />} />
             <Route path="users" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/users') ? <Users key={identity.id} identityId={identity.id} /> : <Unavailable />} />

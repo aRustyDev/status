@@ -5,10 +5,11 @@ import {ApiError} from '@better-forge/ui'
 import {beforeEach,describe,expect,it,vi} from 'vitest'
 import {api} from '../api/client'
 import CloudflareActions from './CloudflareActions'
+import { MemoryRouter } from 'react-router-dom'
 vi.mock('../api/client',()=>({api:{get:vi.fn(),post:vi.fn(),patch:vi.fn(),delete:vi.fn()}}))
 const checkId='00000000-0000-4000-8000-000000000001'
 const action={id:'00000000-0000-4000-8000-000000000002',name:'Recover',endpointId:'approved',vaultId:1,secretId:2,enabled:1,version:3,checkIds:[checkId],triggerStatus:'down'}
-function setup(client=new QueryClient({defaultOptions:{queries:{retry:false}}})){render(<QueryClientProvider client={client}><CloudflareActions /></QueryClientProvider>);return userEvent.setup()}
+function setup(client=new QueryClient({defaultOptions:{queries:{retry:false}}})){render(<MemoryRouter><QueryClientProvider client={client}><CloudflareActions /></QueryClientProvider></MemoryRouter>);return userEvent.setup()}
 beforeEach(()=>{
  vi.resetAllMocks()
  vi.mocked(api.get).mockImplementation(async path=>{
@@ -41,6 +42,25 @@ describe('Cloudflare actions',()=>{
   await user.click(screen.getByRole('button',{name:'Delete action Recover'}));vi.mocked(api.delete).mockResolvedValueOnce(undefined)
   await user.click(within(screen.getByRole('dialog')).getByRole('button',{name:'Delete'}))
   await waitFor(()=>expect(api.delete).toHaveBeenCalledWith(`/admin/actions/${action.id}`,{version:3}))
+ })
+ it('shows the approved destination and links to action history', async () => {
+  setup()
+  expect(await screen.findByText('HTTP POST · Approved action')).toBeInTheDocument()
+  expect(screen.getByRole('link', {name:'Run history'})).toHaveAttribute('href', '/admin/delivery-history?tab=actions')
+ })
+ it('prevents edits and closing while an action save is pending', async () => {
+  const user=setup()
+  await user.click(await screen.findByRole('button',{name:'Edit'}))
+  const form=screen.getByRole('dialog')
+  await waitFor(()=>expect(within(form).getByRole('button',{name:'Save Action'})).toBeEnabled())
+  let finish!: (value: unknown) => void
+  vi.mocked(api.patch).mockReturnValueOnce(new Promise(resolve => { finish=resolve }))
+  await user.click(within(form).getByRole('button',{name:'Save Action'}))
+  expect(within(form).getByLabelText('Action name')).toBeDisabled()
+  expect(within(form).getByRole('button',{name:'Cancel'})).toBeDisabled()
+  expect(within(form).getByRole('button',{name:'Save Action'})).toBeDisabled()
+  finish({})
+  await waitFor(()=>expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
  })
  it('keeps the selected monitor snapshot if choices refresh while editing',async()=>{
   const client=new QueryClient({defaultOptions:{queries:{retry:false}}}),user=setup(client)
