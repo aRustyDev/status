@@ -6,6 +6,7 @@ export async function retireDeletedBranch({ ref, store, readRemoteHead, disableF
   if (!snapshot) return { status: 'absent' }
   let record = snapshot.record
   if (record.abandonedCleanup) throw new Error('Abandoned resource cleanup requires reconciliation before retirement')
+  if (record.retainedCleanup) throw new Error('Retained resource cleanup requires reconciliation before retirement')
   if (record.candidate) throw new Error('Candidate requires reconciliation before retirement')
   async function save(updated) {
     if (!await store.compareAndSwap(ref, snapshot.revision, updated)) throw new Error('Inventory changed concurrently')

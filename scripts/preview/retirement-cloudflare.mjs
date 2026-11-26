@@ -38,14 +38,18 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
       const flag = await request(flagUrl(ref))
       return !flag || (flag.enabled === true && flag.default_variation === 'current' && !flag.rules?.length && flag.variations?.current && Object.keys(flag.variations.current).length === 0)
     },
-    async removeBindings({ ref }) {
+    async removeBindings({ ref, releases = [], keepBranch = false }) {
       const snapshots = await store.list()
       const services = new Map()
+      const removedShas = new Set(releases.map(release => release.sha))
       for (const { record } of snapshots) {
         validateInventory(record)
-        if (record.ref === ref) continue
+        if (record.ref === ref && !keepBranch) continue
+        if (record.retainedCleanup?.sha && (record.active?.sha === record.retainedCleanup.sha || record.previous?.sha === record.retainedCleanup.sha)) throw new Error('Retained cleanup conflicts with active routing')
         for (const release of [record.active, record.previous, ...(record.retained || []), ...(['ready', 'activating'].includes(record.candidate?.phase) ? [record.candidate] : [])]) {
           if (!release) continue
+          if (record.retainedCleanup?.sha === release.sha) continue
+          if (record.ref === ref && removedShas.has(release.sha)) continue
           const expected = `status-p-${createHash('sha256').update(`${record.selector}:${release.sha}`).digest('hex').slice(0, 24)}-gateway`
           if (release.resources?.gateway !== expected) throw new Error('Invalid retained Worker binding')
           services.set(`PREVIEW_BRANCH_${record.key.toUpperCase()}_${release.sha.toUpperCase()}`, expected)

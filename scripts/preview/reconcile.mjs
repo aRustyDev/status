@@ -2,7 +2,7 @@ import { branchPolicy } from './release-contract.mjs'
 
 // Run under the same non-preemptive workflow concurrency group as deployments.
 // A failed or ambiguous candidate is reported instead of being overwritten.
-export async function reconcilePreviews({ branches, store, retire, recoverCandidate, cleanupAbandoned, ciStatus, dispatchCi, dispatchPreview, now = Date.now }) {
+export async function reconcilePreviews({ branches, store, retire, recoverCandidate, cleanupAbandoned, cleanupRetained, ciStatus, dispatchCi, dispatchPreview, now = Date.now }) {
   const [remote, initialInventory] = await Promise.all([branches.list(), store.list()])
   let inventory = initialInventory
   const result = { retired: [], scheduled: [], pending: [], errors: [] }
@@ -12,6 +12,12 @@ export async function reconcilePreviews({ branches, store, retire, recoverCandid
         const outcome = await cleanupAbandoned(record.ref)
         if (outcome?.status === 'unresolved') result.pending.push({ ref: record.ref, reason: 'database creation intent has no recorded identity' })
       } catch (error) { result.errors.push({ ref: record.ref, message: error.message }) }
+    }
+    inventory = await store.list()
+  }
+  if (typeof cleanupRetained === 'function') {
+    for (const { record } of inventory) {
+      try { await cleanupRetained(record.ref) } catch (error) { result.errors.push({ ref: record.ref, message: error.message }) }
     }
     inventory = await store.list()
   }
@@ -69,7 +75,7 @@ export async function reconcilePreviews({ branches, store, retire, recoverCandid
       }
       continue
     }
-    if (record?.retirement || record?.abandonedCleanup || (record?.candidate && (record.candidate.phase !== 'preparing' || record.candidate.sha !== sha))) {
+    if (record?.retirement || record?.abandonedCleanup || record?.retainedCleanup || (record?.candidate && (record.candidate.phase !== 'preparing' || record.candidate.sha !== sha))) {
       result.pending.push({ ref, reason: 'release or retirement needs reconciliation' })
       continue
     }

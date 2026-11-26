@@ -25,8 +25,10 @@ export function createActivationAdapter({ store, appId, accountId, token, dispat
     const services = new Map()
     for (const { record } of snapshots) {
       validateInventory(record)
+      if (record.retainedCleanup?.sha && (record.active?.sha === record.retainedCleanup.sha || record.previous?.sha === record.retainedCleanup.sha)) throw new Error('Retained cleanup conflicts with active routing')
       for (const release of [record.active, record.previous, ...(record.retained || []), ...(['ready', 'activating'].includes(record.candidate?.phase) ? [record.candidate] : [])]) {
         if (!release) continue
+        if (record.retainedCleanup?.sha === release.sha) continue
         const gateway = release.resources?.gateway
         const expectedGateway = `status-p-${createHash('sha256').update(`${record.selector}:${release.sha}`).digest('hex').slice(0, 24)}-gateway`
         if (!/^[a-f0-9]{40}$/.test(release.sha) || gateway !== expectedGateway) throw new Error('Invalid retained Worker binding')

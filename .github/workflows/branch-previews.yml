@@ -139,7 +139,7 @@ jobs:
           PREVIEW_WORKER_SECRETS: ${{ secrets.PREVIEW_WORKER_SECRETS }}
           FLAGSHIP_APP_ID: ${{ vars.FLAGSHIP_APP_ID }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_BRANCH_PREVIEW_API_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: node scripts/preview/controller-cli.mjs
 
@@ -173,6 +173,6 @@ jobs:
           PREVIEW_WORKER_SECRETS: ${{ secrets.PREVIEW_WORKER_SECRETS }}
           FLAGSHIP_APP_ID: ${{ vars.FLAGSHIP_APP_ID }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_BRANCH_PREVIEW_API_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: node scripts/preview/controller-cli.mjs

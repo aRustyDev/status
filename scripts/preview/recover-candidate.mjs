@@ -1,6 +1,6 @@
 // The caller holds the deployment workflow concurrency group. Activation must
 // accept both the previous flag value and the same already-published candidate.
-export async function recoverCandidate({ ref, sha, store, readRemoteHead, activate, allowStaleIfPublished = false, isPublishedCandidate }) {
+export async function recoverCandidate({ ref, sha, store, readRemoteHead, activate, allowStaleIfPublished = false, isPublishedCandidate, now = Date.now }) {
   const head = await readRemoteHead(ref)
   const stale = head !== sha
   if (stale && (!allowStaleIfPublished || head === null || typeof isPublishedCandidate !== 'function')) throw new Error('Branch head changed before recovery')
@@ -18,7 +18,7 @@ export async function recoverCandidate({ ref, sha, store, readRemoteHead, activa
   await activate({ ref, sha, generation: record.candidate.generation, selector: record.selector, resources: record.candidate.resources, active: record.active, previous: record.previous })
   const active = { ...record.candidate }
   delete active.phase
-  const retained = [...(record.retained || []), ...(record.previous ? [record.previous] : [])]
+  const retained = [...(record.retained || []), ...(record.previous ? [{ ...record.previous, retainedAt: now() }] : [])]
   await save({ ...record, previous: record.active, active, retained, candidate: null })
   return record
 }

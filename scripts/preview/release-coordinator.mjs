@@ -3,7 +3,7 @@ import { newRelease, nextGeneration, validateInventory } from './release-contrac
 // All callers must hold the same external, non-preemptive deployment lock for the
 // entire operation, including calls to Cloudflare. D1 CAS protects inventory only.
 // An interrupted activation is deliberately left for explicit reconciliation.
-export async function deployRelease({ ref, sha, store, readRemoteHead, prepare, activate }) {
+export async function deployRelease({ ref, sha, store, readRemoteHead, prepare, activate, now = Date.now }) {
   if (await readRemoteHead(ref) !== sha) throw new Error('Branch head changed before deployment')
   let snapshot = await store.read(ref)
   if (!snapshot) {
@@ -14,6 +14,7 @@ export async function deployRelease({ ref, sha, store, readRemoteHead, prepare, 
   }
   if (snapshot.record.retirement) throw new Error('Retirement requires reconciliation before deployment')
   if (snapshot.record.abandonedCleanup) throw new Error('Abandoned resource cleanup requires reconciliation before deployment')
+  if (snapshot.record.retainedCleanup) throw new Error('Retained resource cleanup requires reconciliation before deployment')
   const candidate = snapshot.record.candidate
   if (candidate && (candidate.sha !== sha || candidate.phase !== 'preparing')) throw new Error('Candidate requires reconciliation before deployment')
   let record = candidate ? snapshot.record : nextGeneration(snapshot.record, sha)
@@ -40,7 +41,7 @@ export async function deployRelease({ ref, sha, store, readRemoteHead, prepare, 
   await activate({ ref, sha, generation, selector: record.selector, resources: record.candidate.resources, active: record.active, previous: record.previous })
   const active = { ...record.candidate }
   delete active.phase
-  const retained = [...(record.retained || []), ...(record.previous ? [record.previous] : [])]
+  const retained = [...(record.retained || []), ...(record.previous ? [{ ...record.previous, retainedAt: now() }] : [])]
   await save({ ...record, previous: record.active, active, candidate: null, retained })
   return record
 }
