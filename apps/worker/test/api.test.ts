@@ -419,6 +419,45 @@ test('keyed role changes replay the complete response and reject a missing actor
   } finally { await db.prepare("UPDATE users SET role='viewer',version=version+1 WHERE id=?").bind(viewer.id).run() }
 })
 
+test('BSP user management enforces authorization, versions and idempotent role changes', async () => {
+  const viewer = await db.prepare("SELECT id, role, version FROM users WHERE subject='viewer-id'").first<{id:string;role:string;version:number}>()
+  const admin = await db.prepare("SELECT id, version FROM users WHERE subject='admin-id'").first<{id:string;version:number}>()
+  assert.ok(viewer)
+  assert.ok(admin)
+  const list = '/api/v1/bsp/admin/users'
+  const path = `${list}/${viewer.id}`
+  const auditCount = async () => (await db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE entity_type='user' AND entity_id=?").bind(viewer.id).first<{count:number}>())!.count
+  const before = await auditCount()
+  const key = `${Date.now()}.${crypto.randomUUID()}`
+  const change = { role: 'operator', version: viewer.version }
+  try {
+    assert.equal((await request(list)).response.status, 401)
+    assert.equal((await request(list, viewerToken)).response.status, 403)
+    assert.equal((await request(list, operatorToken)).response.status, 403)
+    assert.equal((await request(list, adminToken)).response.status, 200)
+    assert.equal((await request(path, operatorToken, 'PATCH', change)).response.status, 403)
+    assert.equal((await request(`${list}/${admin.id}`, adminToken, 'PATCH', { role: 'viewer', version: admin.version })).response.status, 409)
+
+    const first = await request(path, adminToken, 'PATCH', change, 'https://status.example', key)
+    const replay = await request(path, adminToken, 'PATCH', change, 'https://status.example', key)
+    assert.equal(first.response.status, 200)
+    assert.deepEqual(replay.body, first.body)
+    const stored = await db.prepare('SELECT role, version FROM users WHERE id=?').bind(viewer.id).first<{role:string;version:number}>()
+    assert.equal(stored?.role, 'operator')
+    assert.equal(stored?.version, viewer.version + 1)
+    assert.equal(await auditCount(), before + 1)
+
+    const staleKey = `${Date.now()}.${crypto.randomUUID()}`
+    assert.equal((await request(path, adminToken, 'PATCH', { role: 'admin', version: viewer.version }, 'https://status.example', staleKey)).response.status, 409)
+    const afterConflict = await db.prepare('SELECT role, version FROM users WHERE id=?').bind(viewer.id).first<{role:string;version:number}>()
+    assert.equal(afterConflict?.role, 'operator')
+    assert.equal(afterConflict?.version, viewer.version + 1)
+    assert.equal(await auditCount(), before + 1)
+  } finally {
+    await db.prepare('UPDATE users SET role=?, version=version+1 WHERE id=?').bind(viewer.role, viewer.id).run()
+  }
+})
+
 test('viewer writes and operator role changes are denied without mutations or audit events', async () => {
   const viewer = await db.prepare("SELECT id, role, version FROM users WHERE subject='viewer-id'").first<{ id: string; role: string; version: number }>()
   assert.ok(viewer)

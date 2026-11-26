@@ -1,4 +1,5 @@
 import { act, render, screen, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
 import { api } from './api/client'
@@ -136,4 +137,33 @@ it.each([
   render(<App />)
   expect(await screen.findByText('This feature is unavailable.')).toBeInTheDocument()
   expect(api.get).not.toHaveBeenCalledWith('/admin/static-mirror')
+})
+
+it.each([
+  ['operator', ['/admin/', '/admin/users']],
+  ['admin', ['/admin/']],
+])('keeps Users unavailable for %s without its role and capability', async (role, supportedRoutes) => {
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path === '/auth/me') return { id: 'identity', email: 'test@example.com', role }
+    if (path === '/capabilities') return { supportedRoutes }
+    throw new Error(`Unexpected request ${path}`)
+  })
+  window.history.replaceState({}, '', '/admin/users')
+  render(<App />)
+  expect(await screen.findByText('This feature is unavailable.')).toBeInTheDocument()
+  expect(api.get).not.toHaveBeenCalledWith('/admin/users')
+})
+
+it('loads Users for an administrator when the route is supported', async () => {
+  vi.mocked(api.get).mockImplementation(async (path: string) => {
+    if (path === '/auth/me') return { id: 'identity', email: 'test@example.com', role: 'admin' }
+    if (path === '/capabilities') return { supportedRoutes: ['/admin/', '/admin/users'] }
+    if (path === '/admin/users') return [{ id: 'identity', email: 'test@example.com', role: 'admin', version: 1 }]
+    throw new Error(`Unexpected request ${path}`)
+  })
+  window.history.replaceState({}, '', '/admin/users')
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  render(<QueryClientProvider client={client}><App /></QueryClientProvider>)
+  expect(await screen.findByText('(you)')).toBeInTheDocument()
+  expect(api.get).toHaveBeenCalledWith('/admin/users')
 })
