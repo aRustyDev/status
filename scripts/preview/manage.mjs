@@ -43,13 +43,17 @@ const schedulerFiles = [
 function scopeFor(selector) { return createHash('sha256').update(selector).digest('hex') }
 function schedulerSupported(settings, release) {
   if (settings.subscriberSchedulingEnabled !== true) return false
-  const approved = settings.approvedSubscriberSchedulers?.[release]
-  if (!approved || typeof approved !== 'object' || Array.isArray(approved)) return false
-  const reviewed = schedulerFiles.every(name => {
+  const actual = {}
+  for (const name of schedulerFiles) {
     const file = path.join(branchDir, 'apps/worker/src', name)
-    if (!existsSync(file) || !/^[a-f0-9]{64}$/.test(approved[name] || '')) return false
-    return createHash('sha256').update(readFileSync(file)).digest('hex') === approved[name]
-  })
+    if (!existsSync(file)) return false
+    actual[name] = createHash('sha256').update(readFileSync(file)).digest('hex')
+  }
+  const reusable = settings.approvedSubscriberSchedulerSourceManifests
+  const manifests = [settings.approvedSubscriberSchedulers?.[release], ...(Array.isArray(reusable) ? reusable : [])]
+  const reviewed = manifests.some(manifest => manifest && typeof manifest === 'object' && !Array.isArray(manifest) &&
+    Object.keys(manifest).length === schedulerFiles.length &&
+    schedulerFiles.every(name => typeof manifest[name] === 'string' && /^[a-f0-9]{64}$/.test(manifest[name]) && manifest[name] === actual[name]))
   if (!reviewed) return false
   const entry = readFileSync(path.join(branchDir, 'apps/worker/src/preview-subscriber-scheduler.ts'), 'utf8')
   return /^export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT = 2\s*$/m.test(entry)

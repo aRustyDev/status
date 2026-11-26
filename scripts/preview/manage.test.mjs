@@ -111,6 +111,39 @@ test('a reviewed obsolete scheduler contract cannot enable subscriber scheduling
   assert.equal(h.config('status-preview-1-a-operations').vars.SUBSCRIBERS_READY, 'false')
 })
 
+test('reusable approved manifest permits unrelated commits and rejects every changed source', t => {
+  const h = harness(t)
+  const dir = path.join(h.directory, 'feature/apps/worker/src')
+  const files = ['preview-subscriber-scheduler.ts', 'subscriber-delivery.ts', 'subscribers.ts', 'email-channel.ts', 'idempotency.ts', 'index.ts']
+  mkdirSync(dir, { recursive: true })
+  const approved = {}
+  const original = {}
+  for (const name of files) {
+    original[name] = name === 'preview-subscriber-scheduler.ts' ? 'export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT = 2' : name
+    writeFileSync(path.join(dir, name), original[name])
+    approved[name] = createHash('sha256').update(original[name]).digest('hex')
+  }
+  h.settings.subscriberSchedulingEnabled = true
+  h.settings.approvedSubscriberSchedulerSourceManifests = [approved]
+  h.settings.resourceBindings.api.send_email = [{ name: 'SUBSCRIBER_EMAIL', allowed_sender_addresses: ['sender@example.com'], allowed_destination_addresses: ['recipient@example.com'] }]
+  assert.equal(h.run('deploy').status, 0)
+  assert.equal(h.state().subscriberScheduler, true)
+  writeFileSync(path.join(h.directory, 'feature/.preview-commit'), 'f'.repeat(40))
+  writeFileSync(path.join(h.directory, 'feature/unrelated.txt'), 'a new feature change')
+  assert.equal(h.run('deploy').status, 0)
+  assert.equal(h.state().subscriberScheduler, true)
+  for (const name of files) {
+    writeFileSync(path.join(dir, name), `${original[name]}\n// changed`)
+    const result = h.run('deploy')
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(h.state().subscriberScheduler, false, name)
+    writeFileSync(path.join(dir, name), original[name])
+  }
+  h.settings.approvedSubscriberSchedulerSourceManifests = [{ ...approved, extra: '0'.repeat(64) }, { ...approved, 'index.ts': undefined }]
+  assert.equal(h.run('deploy').status, 0)
+  assert.equal(h.state().subscriberScheduler, false)
+})
+
 function requireExists(file) { try { readFileSync(file); return true } catch { return false } }
 
 test('reviewed scheduler uses slot fence and restricted email; release revokes fence', t => {
