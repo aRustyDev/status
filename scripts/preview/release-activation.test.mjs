@@ -20,13 +20,14 @@ test('keeps other bindings and verifies candidate before publishing the flag', a
   other.active = { sha: other.desiredSha, generation: 1, resources: { gateway: workerName(other.selector, other.desiredSha) } }
   let flag = null
   let verified = false
+  let writes = 0
   const calls = []
   const adapter = createActivationAdapter({ store: { list: async () => [{ record }, { record: other }] }, appId: 'app', accountId: 'account', token: 'token', dispatcherName: 'dispatcher', dispatcherSource: '/trusted/dispatcher.ts', directory,
     run: async args => { calls.push(args); const config = JSON.parse(readFileSync(path.join(directory, 'preview-dispatcher.json'), 'utf8')); assert.equal(config.services.length, 2) },
     verificationSecret: 'x'.repeat(32), previewUrl: 'https://preview.example', accessTeamDomain: 'team.cloudflareaccess.com', accessAud: 'aud', serviceTokenId: 'client.access', wait: async () => {},
     fetchImpl: async (url, options) => {
       if (url === 'https://preview.example/__preview/verify') { if (options.headers['X-Status-Preview-Verify']) verified = true; return { ok: true, headers: new Headers({ 'X-Status-Preview-Commit': sha }) } }
-      if (options.method === 'POST') { assert.equal(verified, true); flag = JSON.parse(options.body); return { ok: true, status: 200, json: async () => ({ success: true, result: flag }) } }
+      if (options.method === 'POST' || options.method === 'PUT') { assert.equal(verified, true); writes++; flag = JSON.parse(options.body); return { ok: true, status: 200, json: async () => ({ success: true, result: flag }) } }
       if (!flag) return { status: 404 }
       return { ok: true, status: 200, json: async () => ({ success: true, result: flag }) }
     },
@@ -34,4 +35,6 @@ test('keeps other bindings and verifies candidate before publishing the flag', a
   await adapter({ ref, sha, generation: 1, selector: record.selector, resources: record.candidate.resources, active: null })
   assert.equal(calls.length, 2)
   assert.equal(flag.variations.current.release, sha)
+  await adapter({ ref, sha, generation: 1, selector: record.selector, resources: record.candidate.resources, active: null })
+  assert.equal(writes, 1, 'a retry must not write the already active flag again')
 })

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 /** Cloudflare D1 adapter. recordDatabase must durably save resources in the release inventory. */
-export function cloudflareDatabaseAdapter({ accountId, token, wrangler, recordDatabase, fetcher = fetch, run = execFileSync }) {
+export function cloudflareDatabaseAdapter({ accountId, token, wrangler, recordDatabase, recordIntent, recordProgress, fetcher = fetch, run = execFileSync }) {
   if (!accountId || !token || !wrangler || typeof recordDatabase !== 'function') throw new Error('Missing D1 adapter configuration')
   const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/d1/database`
   async function request(method, suffix = '', body) {
@@ -26,7 +26,16 @@ export function cloudflareDatabaseAdapter({ accountId, token, wrangler, recordDa
   }
   return {
     recordDatabase,
+    recordIntent,
+    recordProgress,
     async migrationLedger(database) { return (await query(database, 'SELECT name FROM d1_migrations')).map(row => row.name) },
+    async findDatabase(name) {
+      const result = await request('GET', `?name=${encodeURIComponent(name)}&per_page=10000`)
+      if (!Array.isArray(result)) throw new Error('Invalid D1 database list')
+      const matches = result.filter(item => item.name === name)
+      if (matches.length > 1 || matches.some(item => !item.uuid)) throw new Error('Ambiguous D1 database name')
+      return matches.length ? { id: matches[0].uuid, name } : null
+    },
     async createDatabase(name) {
       const result = await request('POST', '', { name })
       if (!result?.uuid || result.name !== name) throw new Error('Invalid D1 creation response')
@@ -41,7 +50,7 @@ export function cloudflareDatabaseAdapter({ accountId, token, wrangler, recordDa
       } finally { await rm(tmp, { recursive: true, force: true }) }
     },
     async seed(database) {
-      await query(database, 'INSERT INTO components (id, name, updated_at) VALUES (?, ?, ?)', ['preview-schema-fixture', 'Schema validation fixture', 1])
+      await query(database, 'INSERT OR IGNORE INTO components (id, name, updated_at) VALUES (?, ?, ?)', ['preview-schema-fixture', 'Schema validation fixture', 1])
     },
     async deleteDatabase(database) {
       const response = await fetcher(`${base}/${encodeURIComponent(database.id)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })

@@ -48,10 +48,10 @@ export function createActivationAdapter({ store, appId, accountId, token, dispat
     const flagKey = `status-preview-branch-${key}`
     const flagUrl = `${apiBase}/${flagKey}`
     const flag = await request(flagUrl)
-    if (flag && (flag.default_variation !== 'current' || flag.enabled !== true || flag.rules?.length || flag.variations?.current?.selector !== selector || flag.variations.current.release !== active?.sha)) throw new Error('Unexpected existing Flagship state')
+    if (flag && (flag.default_variation !== 'current' || flag.enabled !== true || flag.rules?.length || flag.variations?.current?.selector !== selector || (flag.variations.current.release !== sha && (!active || flag.variations.current.release !== active.sha)))) throw new Error('Unexpected existing Flagship state')
     if (!flag && active) throw new Error('Active inventory has no Flagship flag')
     const payload = { key: flagKey, enabled: true, default_variation: 'current', rules: [], variations: { current: { selector, release: sha } } }
-    await request(flag ? flagUrl : apiBase, { method: flag ? 'PUT' : 'POST', body: JSON.stringify(payload) })
+    if (flag?.variations?.current?.release !== sha) await request(flag ? flagUrl : apiBase, { method: flag ? 'PUT' : 'POST', body: JSON.stringify(payload) })
     const result = await request(flagUrl)
     if (result?.variations?.current?.selector !== selector || result.variations.current.release !== sha) throw new Error('Flagship write was not observed')
     // A management API read is not evidence of edge propagation. The caller

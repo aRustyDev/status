@@ -46,3 +46,16 @@ test('retirement blocks deployment even when the remote branch is recreated', as
   await inventory.compareAndSwap(ref, snapshot.revision, { ...snapshot.record, retirement: { phase: 'draining', disabledAt: 100 } })
   await assert.rejects(deployRelease({ ref, sha, store: inventory, readRemoteHead: async () => sha, prepare: async () => assert.fail('must not prepare'), activate: async () => assert.fail('must not activate') }), /Retirement requires reconciliation/)
 })
+
+test('a retry resumes a partially prepared candidate with its recorded resources', async () => {
+  const inventory = store()
+  await assert.rejects(deployRelease({ ref, sha, store: inventory, readRemoteHead: async () => sha,
+    prepare: async ({ recordResources }) => { await recordResources({ databaseIntent: { name: 'db' } }); throw new Error('interrupted') },
+    activate: async () => assert.fail(),
+  }), /interrupted/)
+  const result = await deployRelease({ ref, sha, store: inventory, readRemoteHead: async () => sha,
+    prepare: async ({ recordedResources }) => { assert.equal(recordedResources.databaseIntent.name, 'db'); return { gateway: 'worker' } },
+    activate: async () => {},
+  })
+  assert.equal(result.active.resources.databaseIntent.name, 'db')
+})

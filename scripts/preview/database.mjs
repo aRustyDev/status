@@ -31,7 +31,7 @@ function sharedDatabase(config, kind) {
  * seed(database), deleteDatabase(database), and recordDatabase(database, purpose).
  * recordDatabase must persist the returned resource before any subsequent operation.
  */
-export async function prepareDatabase({ kind, ref, sha, config, mainMigrations, candidateMigrations, adapter }) {
+export async function prepareDatabase({ kind, ref, sha, config, mainMigrations, candidateMigrations, adapter, recordedResources = {} }) {
   if (!['dev', 'stage', 'schema'].includes(kind)) throw new Error('Invalid preview database kind')
   if (typeof ref !== 'string' || !ref || !/^[a-f0-9]{40}$/.test(sha)) throw new Error('Invalid branch identity')
   const main = await migrations(mainMigrations)
@@ -68,7 +68,22 @@ export async function prepareDatabase({ kind, ref, sha, config, mainMigrations, 
   const prefix = `status-schema-${digest(ref).slice(0, 12)}-${sha.slice(0, 12)}`
   const create = async purpose => {
     const name = `${prefix}-${purpose}`
-    const resource = await adapter.createDatabase(name)
+    const intentKey = purpose === 'clean' ? 'validationDatabaseIntent' : 'databaseIntent'
+    const databaseKey = purpose === 'clean' ? 'validationDatabase' : 'database'
+    let resource
+    if (typeof adapter.findDatabase === 'function' && typeof adapter.recordIntent === 'function') {
+      const existing = await adapter.findDatabase(name)
+      const intent = recordedResources[intentKey]
+      const previous = recordedResources[databaseKey]
+      if (intent && intent.name !== name) throw new Error(`Invalid recorded database intent for ${purpose}`)
+      if (existing && !intent && (!previous || previous.id !== existing.id || previous.name !== name)) throw new Error(`Unowned database exists for ${purpose}`)
+      if (existing && previous && previous.id !== existing.id) throw new Error(`Database identity changed for ${purpose}`)
+      if (!existing && previous && purpose === 'upgrade') throw new Error('Recorded upgrade database is missing')
+      if (!intent) await adapter.recordIntent(name, purpose)
+      resource = existing || await adapter.createDatabase(name)
+    } else {
+      resource = await adapter.createDatabase(name)
+    }
     if (!resource || resource.name !== name || typeof resource.id !== 'string' || !resource.id || resource.id === config.prod?.id || resource.id === config.dev?.id || resource.id === config.stage?.id) {
       throw new Error(`Invalid newly created database for ${purpose}`)
     }
@@ -78,11 +93,17 @@ export async function prepareDatabase({ kind, ref, sha, config, mainMigrations, 
   }
   const upgrade = await create('upgrade')
   await adapter.applyMigrations(upgrade, mainMigrations)
-  await adapter.seed(upgrade)
+  if (!recordedResources.schemaSeeded) {
+    await adapter.seed(upgrade)
+    if (typeof adapter.recordProgress === 'function') await adapter.recordProgress({ schemaSeeded: true })
+  }
   await adapter.applyMigrations(upgrade, candidateMigrations)
-  const clean = await create('clean')
-  await adapter.applyMigrations(clean, candidateMigrations)
-  await adapter.deleteDatabase(clean)
+  if (!recordedResources.schemaCleanComplete) {
+    const clean = await create('clean')
+    await adapter.applyMigrations(clean, candidateMigrations)
+    await adapter.deleteDatabase(clean)
+    if (typeof adapter.recordProgress === 'function') await adapter.recordProgress({ schemaCleanComplete: true })
+  }
   return upgrade
 }
 

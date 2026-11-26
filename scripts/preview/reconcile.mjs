@@ -2,7 +2,7 @@ import { branchPolicy } from './release-contract.mjs'
 
 // Run under the same non-preemptive workflow concurrency group as deployments.
 // A failed or ambiguous candidate is reported instead of being overwritten.
-export async function reconcilePreviews({ branches, store, retire, ciStatus, dispatchCi, dispatchPreview }) {
+export async function reconcilePreviews({ branches, store, retire, recoverCandidate, ciStatus, dispatchCi, dispatchPreview }) {
   const [remote, inventory] = await Promise.all([branches.list(), store.list()])
   const records = new Map(inventory.map(({ record }) => [record.ref, record]))
   const remoteRefs = new Set(remote.map(branch => branch.ref))
@@ -30,11 +30,20 @@ export async function reconcilePreviews({ branches, store, retire, ciStatus, dis
       }
       record = { ...record, retirement: null }
     }
-    if (record?.candidate || record?.retirement) {
+    if (record?.candidate && ['ready', 'activating'].includes(record.candidate.phase) && record.candidate.sha === sha && typeof recoverCandidate === 'function') {
+      try {
+        await recoverCandidate(ref, sha)
+        result.scheduled.push({ ref, sha, action: 'activation-recovered' })
+      } catch (error) {
+        result.errors.push({ ref, message: error.message })
+      }
+      continue
+    }
+    if (record?.retirement || (record?.candidate && (record.candidate.phase !== 'preparing' || record.candidate.sha !== sha))) {
       result.pending.push({ ref, reason: 'release or retirement needs reconciliation' })
       continue
     }
-    if (record?.active?.sha === sha) continue
+    if (!record?.candidate && record?.active?.sha === sha) continue
     try {
       if (await branches.head(ref) !== sha) continue
       const status = await ciStatus(ref, sha)

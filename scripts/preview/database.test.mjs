@@ -54,3 +54,32 @@ test('schema rejects historical changes and cleanup protects shared resources', 
   assert.equal(h.calls.length, 0)
   await assert.rejects(deleteOwnedDatabase({ database: { id: 'prod', name: `status-schema-${'a'.repeat(12)}-${'b'.repeat(12)}-upgrade`, owned: true }, config: h.config, adapter: h.adapter }), /shared/)
 })
+
+test('schema preparation resumes a created database only after durable intent', async t => {
+  const h = await setup(t)
+  const databases = new Map()
+  const recorded = {}
+  let interrupt = true
+  h.adapter.findDatabase = async name => databases.get(name) || null
+  h.adapter.recordIntent = async (name, purpose) => { recorded[purpose === 'clean' ? 'validationDatabaseIntent' : 'databaseIntent'] = { name } }
+  h.adapter.createDatabase = async name => { const db = { id: name, name }; databases.set(name, db); return db }
+  h.adapter.recordDatabase = async (db, purpose) => {
+    if (interrupt) { interrupt = false; throw new Error('interrupted') }
+    recorded[purpose === 'clean' ? 'validationDatabase' : 'database'] = db
+  }
+  h.adapter.recordProgress = async value => Object.assign(recorded, value)
+  h.adapter.deleteDatabase = async db => databases.delete(db.name)
+  await assert.rejects(prepareDatabase({ ...args(h), kind: 'schema', recordedResources: recorded }), /interrupted/)
+  assert.ok(recorded.databaseIntent)
+  const result = await prepareDatabase({ ...args(h), kind: 'schema', recordedResources: recorded })
+  assert.equal(result.id, recorded.databaseIntent.name)
+  assert.equal(recorded.schemaSeeded, true)
+  assert.equal(recorded.schemaCleanComplete, true)
+})
+
+test('schema preparation rejects an unowned pre-existing database name', async t => {
+  const h = await setup(t)
+  h.adapter.findDatabase = async name => ({ id: 'foreign', name })
+  h.adapter.recordIntent = async () => assert.fail('collision must be checked first')
+  await assert.rejects(prepareDatabase({ ...args(h), kind: 'schema' }), /Unowned/)
+})

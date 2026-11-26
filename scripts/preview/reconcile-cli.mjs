@@ -8,6 +8,8 @@ import { createInventoryStore } from './release-inventory.mjs'
 import { retireDeletedBranch } from './release-lifecycle.mjs'
 import { createRetirementAdapter } from './retirement-cloudflare.mjs'
 import { reconcilePreviews } from './reconcile.mjs'
+import { createActivationAdapter } from './release-activation.mjs'
+import { recoverCandidate } from './recover-candidate.mjs'
 
 function object(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Missing ${name}`)
@@ -35,10 +37,14 @@ export async function reconcile(env = process.env) {
   const temp = await mkdtemp(path.join(tmpdir(), 'status-preview-reconcile-'))
   try {
     const databaseAdapter = cloudflareDatabaseAdapter({ accountId, token, wrangler, recordDatabase: async () => {} })
-    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName: text(config.dispatcherName, 'dispatcher name'), dispatcherSource: path.join(root, 'apps/gateway/preview-dispatcher.ts'), dispatcherVars, directory: temp, databaseConfig, databaseAdapter,
-      run: async args => execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' }) })
+    const run = async args => execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
+    const dispatcherName = text(config.dispatcherName, 'dispatcher name')
+    const dispatcherSource = path.join(root, 'apps/gateway/preview-dispatcher.ts')
+    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run })
+    const activate = createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory: temp, run, verificationSecret: text(secrets.verificationSecret, 'verification secret'), previewUrl: text(config.previewUrl, 'preview URL'), accessHeaders: object(secrets.accessHeaders, 'Access headers'), accessTeamDomain: dispatcherVars.ACCESS_TEAM_DOMAIN, accessAud: dispatcherVars.ACCESS_AUD, serviceTokenId: dispatcherVars.PREVIEW_SERVICE_TOKEN_ID })
     const result = await reconcilePreviews({ branches, store,
       retire: ref => retireDeletedBranch({ ref, store, readRemoteHead: branches.head, ...adapter }),
+      recoverCandidate: (ref, sha) => recoverCandidate({ ref, sha, store, readRemoteHead: branches.head, activate }),
       ciStatus: branches.ciStatus, dispatchCi: branches.dispatchCi, dispatchPreview: branches.dispatchPreview })
     console.log(JSON.stringify(result, null, 2))
     if (result.errors.length) throw new Error('Some branches need reconciliation')

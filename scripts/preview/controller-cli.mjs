@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { appendFile, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { githubBranches } from './branch-github.mjs'
@@ -87,10 +87,14 @@ export async function main(env = process.env) {
     })
     const record = await deployRelease({
       ref, sha, store, readRemoteHead: branches.head,
-      async prepare({ recordResources }) {
-        const adapter = cloudflareDatabaseAdapter({ accountId, token, wrangler, recordDatabase: async (database, purpose) => recordResources({ [purpose === 'clean' ? 'validationDatabase' : 'database']: database }) })
+      async prepare({ recordResources, recordedResources }) {
+        const adapter = cloudflareDatabaseAdapter({ accountId, token, wrangler,
+          recordDatabase: async (database, purpose) => recordResources({ [purpose === 'clean' ? 'validationDatabase' : 'database']: database }),
+          recordIntent: async (name, purpose) => recordResources({ [purpose === 'clean' ? 'validationDatabaseIntent' : 'databaseIntent']: { name } }),
+          recordProgress: recordResources,
+        })
         const database = await prepareDatabase({ kind: policy.environment, ref, sha, config: databaseConfig,
-          mainMigrations: path.join(root, 'apps/worker/migrations'), candidateMigrations: path.join(branchDir, 'apps/worker/migrations'), adapter })
+          mainMigrations: path.join(root, 'apps/worker/migrations'), candidateMigrations: path.join(branchDir, 'apps/worker/migrations'), adapter, recordedResources })
         await recordResources({ database })
         const workerSettings = { ...settings, d1DatabaseId: database.id, d1DatabaseName: database.name }
         const selector = selectorForBranch(ref)
@@ -105,7 +109,9 @@ export async function main(env = process.env) {
         await activate(candidate)
       },
     })
-    console.log(JSON.stringify({ url: config.previewUrl, selector: record.selector, sha: record.active.sha, environment: record.environment }))
+    const result = { url: config.previewUrl, selector: record.selector, sha: record.active.sha, environment: record.environment }
+    console.log(JSON.stringify(result))
+    if (env.GITHUB_STEP_SUMMARY) await appendFile(env.GITHUB_STEP_SUMMARY, `### Branch preview\n\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\`\n`)
   } finally { await rm(temp, { recursive: true, force: true }) }
 }
 
