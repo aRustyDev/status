@@ -61,14 +61,14 @@ export function createActivationAdapter({ store, appId, accountId, token, dispat
     // Flagship allows up to 30 seconds for global propagation. Leave room for
     // network delays and a retry after that window before failing the release.
     let lastProbe = 'not attempted'
-    for (let attempt = 0; attempt <= 90; attempt++) {
+    for (let attempt = 0; attempt <= 120; attempt++) {
       try {
         const response = await fetchImpl(probeUrl, { headers: { ...accessHeaders, 'X-Status-Preview': selector, 'X-Status-Preview-Verify': candidateVerificationHeader({ selector, sha, secret: verificationSecret, mode: 'active' }) }, redirect: 'manual', cache: 'no-store' })
         if (response.ok && response.headers.get('X-Status-Preview-Commit') === sha) return
         lastProbe = response.ok ? 'response did not identify the expected commit' : `HTTP ${response.status}`
       } catch { lastProbe = 'request failed' }
-      if (attempt < 90) await wait(1000)
+      if (attempt < 120) await wait(1000)
     }
-    throw new Error(`Preview route did not confirm the deployed commit after 90 seconds (${lastProbe})`)
+    throw new Error(`Preview route did not confirm the deployed commit after 120 seconds (${lastProbe})`)
   }
 }

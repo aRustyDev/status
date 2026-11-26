@@ -67,7 +67,7 @@ test('reports the last HTTP status after the full propagation window', async t =
       return flag ? { ok: true, status: 200, json: async () => ({ success: true, result: flag }) } : { status: 404 }
     },
   })
-  await assert.rejects(adapter({ ref, sha, generation: 1, selector: record.selector, resources: record.candidate.resources, active: null }), /after 90 seconds \(HTTP 503\)/)
-  assert.equal(attempts, 91)
-  assert.equal(waits, 90)
+  await assert.rejects(adapter({ ref, sha, generation: 1, selector: record.selector, resources: record.candidate.resources, active: null }), /after 120 seconds \(HTTP 503\)/)
+  assert.equal(attempts, 121)
+  assert.equal(waits, 120)
 })
