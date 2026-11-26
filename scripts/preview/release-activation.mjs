@@ -45,8 +45,21 @@ export function createActivationAdapter({ store, appId, accountId, token, dispat
     await run(['deploy', '--dry-run', '--config', configPath])
     await run(['deploy', '--config', configPath])
     const probeUrl = new URL('/__preview/verify', previewUrl).toString()
-    const probe = await fetchImpl(probeUrl, { headers: { ...accessHeaders, 'X-Status-Preview': selector, 'X-Status-Preview-Verify': candidateVerificationHeader({ selector, sha, secret: verificationSecret }) }, redirect: 'manual', cache: 'no-store' })
-    if (!probe.ok || probe.headers.get('X-Status-Preview-Commit') !== sha) throw new Error('Private candidate verification failed')
+    async function verifyPreview(mode, seconds) {
+      let lastProbe = 'not attempted'
+      for (let attempt = 0; attempt <= seconds; attempt++) {
+        try {
+          const response = await fetchImpl(probeUrl, { headers: { ...accessHeaders, 'X-Status-Preview': selector, 'X-Status-Preview-Verify': candidateVerificationHeader({ selector, sha, secret: verificationSecret, mode }) }, redirect: 'manual', cache: 'no-store' })
+          if (response.ok && response.headers.get('X-Status-Preview-Commit') === sha) return
+          lastProbe = response.ok ? 'response did not identify the expected commit' : `HTTP ${response.status}`
+        } catch { lastProbe = 'request failed' }
+        if (attempt < seconds) await wait(1000)
+      }
+      const description = mode === 'candidate' ? 'Private candidate verification failed' : 'Preview route did not confirm the deployed commit'
+      throw new Error(`${description} after ${seconds} seconds (${lastProbe})`)
+    }
+    // Worker deployments may still be propagating immediately after upload.
+    await verifyPreview('candidate', 60)
     const flagKey = `status-preview-branch-${key}`
     const flagUrl = `${apiBase}/${flagKey}`
     const flag = await request(flagUrl)
@@ -56,19 +69,8 @@ export function createActivationAdapter({ store, appId, accountId, token, dispat
     if (flag?.variations?.current?.release !== sha) await request(flag ? flagUrl : apiBase, { method: flag ? 'PUT' : 'POST', body: JSON.stringify(payload) })
     const result = await request(flagUrl)
     if (result?.variations?.current?.selector !== selector || result.variations.current.release !== sha) throw new Error('Flagship write was not observed')
-    // A management API read is not evidence of edge propagation. The caller
-    // supplies Access credentials for a request through the normal entry point.
-    // Flagship allows up to 30 seconds for global propagation. Leave room for
-    // network delays and a retry after that window before failing the release.
-    let lastProbe = 'not attempted'
-    for (let attempt = 0; attempt <= 120; attempt++) {
-      try {
-        const response = await fetchImpl(probeUrl, { headers: { ...accessHeaders, 'X-Status-Preview': selector, 'X-Status-Preview-Verify': candidateVerificationHeader({ selector, sha, secret: verificationSecret, mode: 'active' }) }, redirect: 'manual', cache: 'no-store' })
-        if (response.ok && response.headers.get('X-Status-Preview-Commit') === sha) return
-        lastProbe = response.ok ? 'response did not identify the expected commit' : `HTTP ${response.status}`
-      } catch { lastProbe = 'request failed' }
-      if (attempt < 120) await wait(1000)
-    }
-    throw new Error(`Preview route did not confirm the deployed commit after 120 seconds (${lastProbe})`)
+    // A management API read is not evidence of edge propagation. Flagship can
+    // take up to 30 seconds, so allow time beyond that documented window.
+    await verifyPreview('active', 120)
   }
 }
