@@ -10,6 +10,7 @@ import { createRetirementAdapter } from './retirement-cloudflare.mjs'
 import { reconcilePreviews } from './reconcile.mjs'
 import { createActivationAdapter } from './release-activation.mjs'
 import { recoverCandidate } from './recover-candidate.mjs'
+import { branchKey } from './release-contract.mjs'
 
 function object(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Missing ${name}`)
@@ -42,9 +43,19 @@ export async function reconcile(env = process.env) {
     const dispatcherSource = path.join(root, 'apps/gateway/preview-dispatcher.ts')
     const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run })
     const activate = createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory: temp, run, verificationSecret: text(secrets.verificationSecret, 'verification secret'), previewUrl: text(config.previewUrl, 'preview URL'), accessHeaders: object(secrets.accessHeaders, 'Access headers'), accessTeamDomain: dispatcherVars.ACCESS_TEAM_DOMAIN, accessAud: dispatcherVars.ACCESS_AUD, serviceTokenId: dispatcherVars.PREVIEW_SERVICE_TOKEN_ID })
+    async function isPublishedCandidate({ ref, sha, selector }) {
+      const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/flagship/apps/${encodeURIComponent(appId)}/flags/status-preview-branch-${branchKey(ref)}`
+      const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      if (response.status === 404) return false
+      if (!response.ok) throw new Error('Unable to inspect Flagship candidate')
+      const body = await response.json()
+      const flag = body.result
+      if (!body.success || !flag) throw new Error('Invalid Flagship candidate response')
+      return flag.enabled === true && flag.default_variation === 'current' && !flag.rules?.length && flag.variations?.current?.selector === selector && flag.variations.current.release === sha
+    }
     const result = await reconcilePreviews({ branches, store,
       retire: ref => retireDeletedBranch({ ref, store, readRemoteHead: branches.head, ...adapter }),
-      recoverCandidate: (ref, sha) => recoverCandidate({ ref, sha, store, readRemoteHead: branches.head, activate }),
+      recoverCandidate: (ref, sha, options) => recoverCandidate({ ref, sha, store, readRemoteHead: branches.head, activate, isPublishedCandidate, ...options }),
       ciStatus: branches.ciStatus, dispatchCi: branches.dispatchCi, dispatchPreview: branches.dispatchPreview })
     console.log(JSON.stringify(result, null, 2))
     if (result.errors.length) throw new Error('Some branches need reconciliation')

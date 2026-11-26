@@ -30,6 +30,26 @@ export async function reconcilePreviews({ branches, store, retire, recoverCandid
       }
       record = { ...record, retirement: null }
     }
+    if (record?.candidate && record.candidate.sha !== sha && ['preparing', 'ready'].includes(record.candidate.phase)) {
+      // Neither phase can have issued a Flagship write. Keep all recorded
+      // resources for later cleanup while freeing the branch for its new SHA.
+      const snapshot = inventory.find(item => item.record.ref === ref)
+      const updated = { ...record, candidate: null, abandoned: [...(record.abandoned || []), record.candidate] }
+      if (await branches.head(ref) !== sha || !await store.compareAndSwap(ref, snapshot.revision, updated)) {
+        result.pending.push({ ref, reason: 'branch changed during candidate abandonment' })
+        continue
+      }
+      record = updated
+    }
+    if (record?.candidate?.phase === 'activating' && record.candidate.sha !== sha && typeof recoverCandidate === 'function') {
+      try {
+        await recoverCandidate(ref, record.candidate.sha, { allowStaleIfPublished: true })
+        result.scheduled.push({ ref, sha: record.candidate.sha, action: 'published-activation-recovered' })
+      } catch (error) {
+        result.pending.push({ ref, reason: error.message })
+      }
+      continue
+    }
     if (record?.candidate && ['ready', 'activating'].includes(record.candidate.phase) && record.candidate.sha === sha && typeof recoverCandidate === 'function') {
       try {
         await recoverCandidate(ref, sha)

@@ -30,3 +30,18 @@ test('missing CI is dispatched once and failed CI is not retried by reconciliati
   assert.deepEqual(calls, [rows[0].ref])
   assert.equal(result.pending[0].reason, 'CI failure')
 })
+
+test('a stale preparation is abandoned without publishing and retains its resource record', async () => {
+  const sha = 'b'.repeat(40)
+  const ref = 'refs/heads/feat/one'
+  const old = { sha: 'a'.repeat(40), generation: 1, phase: 'preparing', resources: { database: { id: 'owned' } } }
+  let updated
+  const result = await reconcilePreviews({
+    branches: { list: async () => [{ ref, sha }], head: async () => sha },
+    store: { list: async () => [{ revision: 3, record: { ref, candidate: old, active: null } }], compareAndSwap: async (_ref, revision, record) => { assert.equal(revision, 3); updated = record; return true } },
+    retire: async () => {}, ciStatus: async () => 'success', dispatchCi: async () => assert.fail(), dispatchPreview: async () => {},
+  })
+  assert.equal(updated.candidate, null)
+  assert.equal(updated.abandoned[0].resources.database.id, 'owned')
+  assert.equal(result.scheduled[0].sha, sha)
+})
