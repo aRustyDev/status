@@ -1122,6 +1122,32 @@ test('saved OAuth2 and CAS checks share manual and scheduled execution and redac
     return new Response(null, { status: 201, headers: { location: 'https://attacker.example/v1/tickets/TGT-secret' } })
   }
   const casVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+  for (const field of ['secretId', 'nonce'] as const) {
+    const tampered = { ...connected, CAS_PROBE: { fetch: async (request: Request) => {
+      const body = await request.json() as { credential: Record<string, unknown> }
+      body.credential[field] = field === 'secretId' ? 99 : 'changed-nonce'
+      return casWorker.fetch(new Request(request.url, { method: 'POST', body: JSON.stringify(body) }), runtime as never)
+    } } }
+    const result = await worker.fetch(new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify({checkId:'check-0',checkVersion:casVersion}) }), tampered as never)
+    assert.match(await result.text(), /credential_unavailable/)
+    assert.equal(rejectedCalls, 0)
+  }
+  globalThis.fetch = async () => {
+    rejectedCalls++
+    sqlite.prepare('UPDATE vault_secrets SET nonce=? WHERE id=2').run('rotated-nonce')
+    return new Response(null, { status: 201, headers: { location: 'https://auth.example/v1/tickets/TGT-fixture' } })
+  }
+  const raced = await worker.fetch(new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify({checkId:'check-0',checkVersion:casVersion}) }), connected as never)
+  const racedBody = await raced.text()
+  assert.match(racedBody, /credential_unavailable/)
+  assert.doesNotMatch(racedBody, /fixture-secret|rotated-nonce|TGT-fixture/)
+  assert.equal(rejectedCalls, 1)
+  sqlite.prepare('UPDATE vault_secrets SET nonce=? WHERE id=2').run(b64(nonce))
+  rejectedCalls = 0
+  globalThis.fetch = async () => {
+    rejectedCalls++
+    return new Response(null, { status: 201, headers: { location: 'https://attacker.example/v1/tickets/TGT-secret' } })
+  }
   const rejected = await worker.fetch(new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify({checkId:'check-0',checkVersion:casVersion}) }), connected as never)
   assert.match(await rejected.text(), /HTTP check failed/)
   assert.equal(rejectedCalls, 1)

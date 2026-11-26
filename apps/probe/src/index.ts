@@ -209,7 +209,7 @@ async function evaluateConfigured(check: Check, config: HttpMonitorConfig, env: 
         if (!service || typeof service !== 'object' || !('fetch' in service) || typeof service.fetch !== 'function') { credentialFault = true; throw new Error('Check unavailable') }
         const callCas = () => (service as { fetch: (request: Request) => Promise<Response> }).fetch(new Request('https://cas-probe.internal/check', {
           method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ checkId: check.id, checkVersion: check.config_version }), signal: init.signal,
+          body: JSON.stringify({ checkId: check.id, checkVersion: check.config_version, credential }), signal: init.signal,
         }))
         const response = tracing ? await tracing.enterSpan('monitor.cas', async span => {
           const result = await callCas()

@@ -1,8 +1,8 @@
 import { endpointFingerprint, parseEndpoints, type Endpoint } from '../../worker/src/endpoint-config'
-import { resolveMonitorCredentialSnapshot } from '../../worker/src/vault-resolver'
+import type { MonitorCredentialSnapshot } from '../../worker/src/vault-resolver'
 import { parsePersistedHttpConfig } from './http-monitor'
 
-type Environment = { DB: D1Database; ENDPOINTS: string; VAULT_ENCRYPTION_KEY?: string; MONITOR_AUTH_READY?: string; MONITOR_CAS_READY?: string; [binding: string]: unknown }
+type Environment = { DB: D1Database; ENDPOINTS: string; MONITOR_AUTH_READY?: string; MONITOR_CAS_READY?: string; [binding: string]: unknown }
 class CredentialUnavailable extends Error {}
 
 type Stage = 'grant' | 'ticket' | 'callback' | 'target'
@@ -29,9 +29,9 @@ async function boundedText(response: Response): Promise<string> {
 
 async function handle(request: Request, env: Environment, timings: Timings): Promise<Response> {
   if (request.method !== 'POST' || new URL(request.url).pathname !== '/check' || env.MONITOR_AUTH_READY !== 'true' || env.MONITOR_CAS_READY !== 'true') throw new CredentialUnavailable()
-  let input: { checkId?: unknown; checkVersion?: unknown }
+  let input: { checkId?: unknown; checkVersion?: unknown; credential?: unknown }
   try { input = await request.json() as typeof input } catch { throw new CredentialUnavailable() }
-  if (!input || Object.keys(input).some(key => !['checkId', 'checkVersion'].includes(key)) || typeof input.checkId !== 'string' || !Number.isSafeInteger(input.checkVersion)) throw new CredentialUnavailable()
+  if (!input || Object.keys(input).some(key => !['checkId', 'checkVersion', 'credential'].includes(key)) || typeof input.checkId !== 'string' || !Number.isSafeInteger(input.checkVersion)) throw new CredentialUnavailable()
   const check = await env.DB.prepare('SELECT id, endpoint_id, expected_status, config_version, advanced_config FROM http_checks WHERE id=? AND config_version=?').bind(input.checkId, input.checkVersion).first<SavedCheck>()
   if (!check?.advanced_config) throw new CredentialUnavailable()
   const endpoints = parseEndpoints(env.ENDPOINTS)
@@ -42,8 +42,11 @@ async function handle(request: Request, env: Environment, timings: Timings): Pro
   if (!config || config.auth?.type !== 'cas' || (config.method ?? 'GET').toUpperCase() !== 'GET' || Object.keys(config.headers ?? {}).length || Object.keys(config.vaultHeaders ?? {}).length || config.body !== undefined) throw new CredentialUnavailable()
   const provider = endpoint.authProviders?.cas
   if (!provider || provider.id !== config.auth.cas.providerId) throw new CredentialUnavailable()
-  const credential = await resolveMonitorCredentialSnapshot(env.DB, env.VAULT_ENCRYPTION_KEY, check.id, check.config_version)
-  if (!credential) throw new CredentialUnavailable()
+  const credential = input.credential as MonitorCredentialSnapshot | undefined
+  if (!credential || typeof credential !== 'object' || Array.isArray(credential) || Object.keys(credential).some(key => !['username', 'password', 'vaultId', 'secretId', 'version', 'nonce'].includes(key)) ||
+      typeof credential.username !== 'string' || !credential.username || typeof credential.password !== 'string' || !credential.password ||
+      credential.vaultId !== config.auth.cas.vault.vaultId || credential.secretId !== config.auth.cas.vault.secretId ||
+      !Number.isSafeInteger(credential.version) || credential.version < 1 || typeof credential.nonce !== 'string' || !credential.nonce) throw new CredentialUnavailable()
   const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.timeoutMs ?? 10000)])
   const guard = async () => {
     const row = await env.DB.prepare(`SELECT c.advanced_config FROM http_checks c JOIN endpoint_registry r ON r.endpoint_id=c.endpoint_id
