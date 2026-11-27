@@ -42,6 +42,11 @@ test('fence only touches exact owned schema databases and revokes the old releas
   await fence.revoke({ref,selector,release:old}); await fence.activate({ref,selector,release:next})
   assert.deepEqual(calls.map(call => call.db),['old','new'])
   assert.match(calls[0].sql,/^DELETE/); assert.match(calls[1].sql,/^INSERT/)
+  const expired = {...next,resources:{...next.resources,subscriberExpiresAt:Date.now()-1}}
+  await fence.activate({ref,selector,release:expired})
+  assert.equal(calls.at(-1).db,'new')
+  assert.match(calls.at(-1).sql,/^DELETE/)
+  await assert.rejects(fence.activate({ref,selector,release:{...next,resources:{...next.resources,subscriberExpiresAt:Date.now()+49*3600_000}}}),/expiry/)
   for (const id of ['dev','stage','prod','inventory']) await assert.rejects(fence.activate({ref,selector,release:release(sha,id)}),/database/)
   await assert.rejects(fence.activate({ref:'refs/heads/stage/other',selector,release:next}),/database/)
   actual[next.resources.database.name] = 'unexpected'

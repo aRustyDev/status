@@ -6,6 +6,8 @@ import path from 'node:path'
 import { test } from 'node:test'
 import { newRelease } from './release-contract.mjs'
 import { createActivationAdapter } from './release-activation.mjs'
+import { createSchemaFence } from './schema-subscriber.mjs'
+import { installation } from './installation.mjs'
 
 const ref = 'refs/heads/feat/test'
 const sha = 'a'.repeat(40)
@@ -35,6 +37,23 @@ test('schema scheduler fence revokes old release before activating and publishin
   flag = {enabled:true,default_variation:'current',rules:[],variations:{current:{selector:record.selector,release:oldSha}}}
   await adapter({ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active})
   assert.deepEqual(events,['revoke','activate','publish'])
+})
+
+test('published schema candidate recovers after approval expires without enabling mail', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(),'schema-expired-activation-'))
+  t.after(() => rmSync(directory,{recursive:true,force:true}))
+  const ref='refs/heads/schema/expired', sha='a'.repeat(40), record=newRelease({ref,sha})
+  const stem=`status-p-${createHash('sha256').update(`${record.selector}:${sha}`).digest('hex').slice(0,24)}`
+  const database={id:'schema-id',name:installation().schemaStem(ref,sha)+'-upgrade',owned:true}
+  record.candidate={sha,generation:1,phase:'activating',resources:{gateway:stem+'-gateway',workers:{subscriber:stem+'-subscriber'},database,subscriberExpiresAt:Date.now()-1000}}
+  const queries=[]
+  const subscriberFence=createSchemaFence({config:{dev:{id:'dev'},stage:{id:'stage'},prod:{id:'prod'},inventoryDatabaseId:'inventory'},findDatabase:async()=>database,query:async (_db,sql)=>queries.push(sql)})
+  const flag={enabled:true,default_variation:'current',rules:[],variations:{current:{selector:record.selector,release:sha}}}
+  const adapter=createActivationAdapter({store:{list:async()=>[{record}]},appId:'app',accountId:'account',token:'token',dispatcherName:'dispatcher',dispatcherSource:'/trusted.ts',directory,run:async()=>{},verificationSecret:'x'.repeat(32),previewUrl:'https://preview.example',accessTeamDomain:'team',accessAud:'aud',serviceTokenId:'service',wait:async()=>{},subscriberFence,
+    fetchImpl:async url=>url === 'https://preview.example/__preview/verify' ? {ok:true,headers:new Headers({'X-Status-Preview-Commit':sha})} : {ok:true,json:async()=>({success:true,result:flag})}})
+  await adapter({ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active:null})
+  assert.equal(queries.length,1)
+  assert.match(queries[0],/^DELETE/)
 })
 
 test('keeps other bindings and verifies candidate before publishing the flag', async t => {

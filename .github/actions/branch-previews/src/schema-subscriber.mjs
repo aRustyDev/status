@@ -67,7 +67,13 @@ export function createSchemaFence({ query, findDatabase, config }) {
       const database = await verified(ref, release)
       if (database) {
         const expiresAt = release.resources.subscriberExpiresAt
-        if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now() || expiresAt > Date.now() + 48 * 3600_000) throw new Error('Invalid schema subscriber lease expiry')
+        if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0 || expiresAt > Date.now() + 48 * 3600_000) throw new Error('Invalid schema subscriber lease expiry')
+        if (expiresAt <= Date.now()) {
+          // A published activation may be recovered after approval expires.
+          // Revoke the candidate and allow routing recovery, without mail.
+          await query(database, "DELETE FROM preview_subscriber_leases WHERE scope=? AND slot=1 AND target='a' AND release=?", [subscriberScope(selector), release.sha])
+          return
+        }
         await query(database, "INSERT INTO preview_subscriber_leases (scope,slot,target,release,expires_at) VALUES (?,1,'a',?,?) ON CONFLICT(slot) DO UPDATE SET scope=excluded.scope,target=excluded.target,release=excluded.release,expires_at=excluded.expires_at", [subscriberScope(selector), release.sha, expiresAt])
       }
     },
