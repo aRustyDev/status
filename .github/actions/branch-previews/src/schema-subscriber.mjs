@@ -11,24 +11,27 @@ const digest = value => createHash('sha256').update(value).digest('hex')
 export function schemaSubscriberSettings({ value, environment, branch, sha, branchDir, previewUrl, now = Date.now() }) {
   if (!value?.enabled || environment !== 'schema' || value.branch !== branch) return null
   if (!installation().legacy || value.enabled !== true || !/^schema\/[A-Za-z0-9._/-]+$/.test(branch) ||
-      !/^[a-f0-9]{40}$/.test(sha || '') || value.release !== sha ||
-      !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= now || value.expiresAt > now + 48 * 3600_000 ||
+      !/^[a-f0-9]{40}$/.test(sha || '') || !/^[a-f0-9]{40}$/.test(value.release || '') ||
+      !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= 0 || value.expiresAt > now + 48 * 3600_000 ||
       typeof value.sender !== 'string' || typeof value.recipient !== 'string' ||
       !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.sender) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.recipient)) throw new Error('Invalid schema subscriber email restrictions')
   const url = new URL(value.publicUrl)
   const expected = new URL(previewUrl)
   if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash || url.origin !== expected.origin) throw new Error('Invalid schema subscriber URL')
   const manifest = value.approvedSourceManifest
+  const artifactHashes = value.approvedArtifactHashes
+  const approved = value.approvedMigrationHashes
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || Object.keys(manifest).length !== files.length || !files.every(name => /^[a-f0-9]{64}$/.test(manifest[name] || '')) ||
+      !artifactHashes || typeof artifactHashes !== 'object' || Array.isArray(artifactHashes) || Object.keys(artifactHashes).sort().join(',') !== 'api,subscriber' || !['api','subscriber'].every(name => /^[a-f0-9]{64}$/.test(artifactHashes[name] || '')) ||
+      !approved || typeof approved !== 'object' || Array.isArray(approved) || !Object.keys(approved).length || !Object.entries(approved).every(([name,hash]) => /^[a-zA-Z0-9_-]+\.sql$/.test(name) && /^[a-f0-9]{64}$/.test(hash || ''))) throw new Error('Invalid schema subscriber approval')
+  if (value.release !== sha || value.expiresAt <= now) return null
   const artifactManifest = JSON.parse(readFileSync(path.join(branchDir, 'workers/subscriber-source.json'), 'utf8'))
-  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || Object.keys(manifest).length !== files.length ||
-      Object.keys(artifactManifest).length !== files.length || !files.every(name => /^[a-f0-9]{64}$/.test(manifest[name] || '') && manifest[name] === artifactManifest[name])) throw new Error('Schema subscriber source is not approved')
+  if (Object.keys(artifactManifest).length !== files.length || !files.every(name => manifest[name] === artifactManifest[name])) throw new Error('Schema subscriber source is not approved')
   for (const name of ['api', 'subscriber']) {
     if (!/^[a-f0-9]{64}$/.test(value.approvedArtifactHashes?.[name] || '') || value.approvedArtifactHashes[name] !== digest(readFileSync(path.join(branchDir, `workers/${name}.mjs`)))) throw new Error('Schema subscriber artifact is not approved')
   }
   const migrationNames = readdirSync(path.join(branchDir, 'migrations')).sort()
-  const approved = value.approvedMigrationHashes
-  if (!approved || typeof approved !== 'object' || Array.isArray(approved) ||
-      Object.keys(approved).sort().join('\n') !== migrationNames.join('\n') ||
+  if (Object.keys(approved).sort().join('\n') !== migrationNames.join('\n') ||
       !migrationNames.every(name => /^[a-zA-Z0-9_-]+\.sql$/.test(name) && /^[a-f0-9]{64}$/.test(approved[name] || '') && approved[name] === digest(readFileSync(path.join(branchDir, 'migrations', name))))) throw new Error('Schema subscriber migrations are not approved')
   return { sender: value.sender, recipient: value.recipient, publicUrl: url.href, expiresAt: value.expiresAt }
 }

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { installation } from './installation.mjs'
@@ -25,7 +25,8 @@ test('approval requires the exact schema branch, release, bounded expiry and rev
   assert.equal(schemaSubscriberSettings(input).recipient,'recipient@example.com')
   assert.equal(schemaSubscriberSettings({...input,environment:'stage'}),null)
   assert.equal(schemaSubscriberSettings({...input,branch:'schema/other'}),null)
-  assert.throws(() => schemaSubscriberSettings({...input,sha:'c'.repeat(40)}),/restrictions/)
+  assert.equal(schemaSubscriberSettings({...input,sha:'c'.repeat(40)}),null)
+  assert.equal(schemaSubscriberSettings({...input,value:{...approval,expiresAt:now-1}}),null)
   assert.throws(() => schemaSubscriberSettings({...input,value:{...approval,expiresAt:now+49*3600_000}}),/restrictions/)
   assert.throws(() => schemaSubscriberSettings({...input,value:{...approval,publicUrl:'https://other.example/'}}),/URL/)
   writeFileSync(path.join(dir,'migrations/0002_extra.sql'),'SELECT 2')
@@ -56,7 +57,7 @@ test('only opted-in release receives a restricted sender, isolated database and 
   const subscriber = {sender:'sender@example.com',recipient:'recipient@example.com',publicUrl:'https://preview.example/'}
   const {order} = createBranchConfigs({settings,selector,sha,branchDir:'/artifact',dir,subscriber,appId:'app'})
   assert.equal(order.at(-1),'subscriber')
-  const api = JSON.parse(requireFile(path.join(dir,'api.json'))), cron = JSON.parse(requireFile(path.join(dir,'subscriber.json')))
+  const api = JSON.parse(readFileSync(path.join(dir,'api.json'))), cron = JSON.parse(readFileSync(path.join(dir,'subscriber.json')))
   assert.equal(api.vars.SUBSCRIBERS_READY,'true')
   assert.deepEqual(api.send_email,[{name:'SUBSCRIBER_EMAIL',allowed_sender_addresses:[subscriber.sender],allowed_destination_addresses:[subscriber.recipient]}])
   assert.deepEqual(cron.send_email,api.send_email)
@@ -64,4 +65,14 @@ test('only opted-in release receives a restricted sender, isolated database and 
   assert.equal(cron.d1_databases[0].database_id,'id')
 })
 
-import { readFileSync as requireFile } from 'node:fs'
+test('unapproved schema releases strip subscriber-specific variables and binding', t => {
+  const dir = mkdtempSync(path.join(tmpdir(),'schema-disabled-'))
+  t.after(() => rmSync(dir,{recursive:true,force:true}))
+  const settings = {previewEnvironment:'schema',d1DatabaseId:'id',d1DatabaseName:'db',accessTeamDomain:'access',accessAud:'aud',endpoints:'[]', apiVars:{SUBSCRIBER_EMAIL_FROM:'private@example.com',SUBSCRIBER_EMAIL_DESTINATIONS:'private'}, resourceBindings:{api:{send_email:[{name:'SUBSCRIBER_EMAIL'},{name:'EMAIL'}]}}}
+  createBranchConfigs({settings,selector,sha,branchDir:'/artifact',dir})
+  const api = JSON.parse(readFileSync(path.join(dir,'api.json')))
+  assert.equal(api.vars.SUBSCRIBER_EMAIL_FROM,undefined)
+  assert.equal(api.vars.SUBSCRIBER_EMAIL_DESTINATIONS,undefined)
+  assert.equal(api.vars.SUBSCRIBERS_READY,'false')
+  assert.deepEqual(api.send_email,[{name:'EMAIL'}])
+})

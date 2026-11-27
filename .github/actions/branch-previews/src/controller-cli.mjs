@@ -144,7 +144,7 @@ export async function main(env = process.env) {
         const database = await prepareDatabase({ kind: policy.environment, ref, sha, config: databaseConfig,
           mainMigrations: ownedPath(control, manifest.database.migrations), candidateMigrations: path.join(branchDir, 'migrations'), adapter, recordedResources })
         await recordResources({ database })
-        const workerSettings = { ...settings, d1DatabaseId: database.id, d1DatabaseName: database.name }
+        const workerSettings = { ...settings, d1DatabaseId: database.id, d1DatabaseName: database.name, previewEnvironment:policy.environment }
         const selector = selectorForBranch(ref)
         const { names } = createBranchConfigs({ settings: workerSettings, selector, sha, branchDir, dir: temp, subscriber, appId })
         await recordResources({ workers: names, gateway: names.gateway, ...(subscriber ? {subscriberExpiresAt:subscriber.expiresAt} : {}) })

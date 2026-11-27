@@ -20,6 +20,9 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir, s
       else if (!(key in vars)) throw new Error('Missing environment setting ' + source)
     }
     if (component.subscriberScope) vars.PREVIEW_SUBSCRIBER_SCOPE = createHash('sha256').update(selector).digest('hex')
+    if (settings.previewEnvironment === 'schema' && (!subscriber || id !== 'api')) {
+      for (const key of Object.keys(vars)) if (key.startsWith('SUBSCRIBER_')) delete vars[key]
+    }
     if (subscriber && id === 'api') Object.assign(vars, { PREVIEW_BRANCH_MODE:'schema', PREVIEW_SELECTOR:selector, PREVIEW_SLOT:'1', PREVIEW_TARGET:'a', SUBSCRIBERS_READY:'true', SUBSCRIBER_EMAIL_READY:'true', SUBSCRIBER_EMAIL_FROM:subscriber.sender, SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'preview-test',name:'Preview test',address:subscriber.recipient}]), SUBSCRIBER_PUBLIC_URL:subscriber.publicUrl })
     if (component.releaseVar || id === 'gateway') vars.PREVIEW_RELEASE = sha
     if (id === 'gateway') vars.PREVIEW_SELECTOR = selector
@@ -34,6 +37,10 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir, s
     for (const [key,value] of Object.entries(settings.resourceBindings?.[id] || {})) {
       if (!allowedBindings.has(key) || (key === 'queues' && (!value || Object.keys(value).some(k => k !== 'producers')))) throw new Error('Unsupported resource binding ' + key)
       config[key] = value
+    }
+    if (settings.previewEnvironment === 'schema' && (!subscriber || id !== 'api') && Array.isArray(config.send_email)) {
+      config.send_email = config.send_email.filter(binding => binding?.name !== 'SUBSCRIBER_EMAIL')
+      if (!config.send_email.length) delete config.send_email
     }
     if (subscriber && id === 'api') {
       if (!appId) throw new Error('Missing schema authorization service')

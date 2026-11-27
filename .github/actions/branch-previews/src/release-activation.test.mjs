@@ -29,6 +29,12 @@ test('schema scheduler fence revokes old release before activating and publishin
     }})
   await adapter({ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active})
   assert.deepEqual(events,['revoke','activate','publish'])
+  // A new release without approval still revokes its opted-in predecessor.
+  events.length = 0
+  record.candidate.resources.workers = {}
+  flag = {enabled:true,default_variation:'current',rules:[],variations:{current:{selector:record.selector,release:oldSha}}}
+  await adapter({ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active})
+  assert.deepEqual(events,['revoke','activate','publish'])
 })
 
 test('keeps other bindings and verifies candidate before publishing the flag', async t => {

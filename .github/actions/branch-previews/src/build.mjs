@@ -7,6 +7,10 @@ import { build } from 'esbuild'
 import { installation } from './installation.mjs'
 import { ownedPath } from './manifest.mjs'
 
+// Approval applies to final module bytes. Remove path-bearing source comments
+// so identical reviewed source produces the same artifact in different runners.
+export const schemaBuildOptions = options => ({ ...options, minify:true, legalComments:'none' })
+
 // This runs only in the credential-free feature build job.
 export async function buildArtifact(feature, output) {
   const {manifest, header} = installation()
@@ -32,7 +36,7 @@ export async function buildArtifact(feature, output) {
     } else if (id === 'api' && manifest.schemaSubscriber) {
       const wrapper = fileURLToPath(new URL('../runtime/schema-subscriber-api.mjs', import.meta.url))
       const contents = `import app from ${JSON.stringify(entry)}\nimport { wrapSchemaSubscriberApi } from ${JSON.stringify(wrapper)}\nexport default wrapSchemaSubscriberApi(app)\n`
-      await build({...options,stdin:{contents,resolveDir:feature,sourcefile:'schema-preview-api.mjs'}})
+      await build({...schemaBuildOptions(options),stdin:{contents,resolveDir:feature,sourcefile:'schema-preview-api.mjs'}})
     } else await build({...options,entryPoints:[entry]})
     if (c.assets) cpSync(ownedPath(feature,c.assets),path.join(output,'assets',id),{recursive:true})
   }
@@ -43,7 +47,7 @@ export async function buildArtifact(feature, output) {
     const source = ownedPath(feature, manifest.schemaSubscriber.entry)
     const wrapper = fileURLToPath(new URL('../runtime/branch-subscriber-scheduler.mjs', import.meta.url))
     const contents = `import { runBranchSubscriberScheduler } from ${JSON.stringify(wrapper)}\nimport { PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT, flushPreviewSubscriberDeliveries } from ${JSON.stringify(source)}\nexport default { async scheduled(_event, env) { if (PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT === 2) await runBranchSubscriberScheduler(env, flushPreviewSubscriberDeliveries) } }\n`
-    await build({bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers','subscriber.mjs'), stdin:{contents,resolveDir:feature,sourcefile:'schema-subscriber.mjs'}})
+    await build(schemaBuildOptions({bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers','subscriber.mjs'), stdin:{contents,resolveDir:feature,sourcefile:'schema-subscriber.mjs'}}))
     const files = ['preview-subscriber-scheduler.ts', 'subscriber-delivery.ts', 'subscribers.ts', 'email-channel.ts', 'idempotency.ts', 'index.ts']
     const hashes = Object.fromEntries(files.map(name => [name, createHash('sha256').update(readFileSync(ownedPath(feature, `apps/worker/src/${name}`))).digest('hex')]))
     writeFileSync(path.join(output,'workers','subscriber-source.json'), JSON.stringify(hashes))
