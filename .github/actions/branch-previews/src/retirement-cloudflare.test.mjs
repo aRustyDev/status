@@ -18,7 +18,7 @@ test('retirement drains the flag, preserves other bindings and removes only owne
   const workers = Object.fromEntries(Object.entries({ gateway: 'gateway', api: 'operations', statusApi: 'status-api', monitoring: 'monitoring-api', status: 'status-ui', admin: 'admin-ui', probe: 'probe' }).map(([key, suffix]) => [key, `${targetStem}-${suffix}`]))
   const release = { sha: target.desiredSha, resources: { gateway: workers.gateway, workers, database: { id: 'dev', owned: false } } }
   let flag = { enabled: true, default_variation: 'current', rules: [], variations: { current: { selector: target.selector, release: release.sha } } }
-  const adapter = createRetirementAdapter({ accountId: 'account', appId: 'app', token: 'token', store: { list: async () => [{ record: target }, { record: other }] }, dispatcherName: 'dispatcher', dispatcherSource: '/dispatcher.ts', dispatcherVars: { ACCESS_AUD: 'aud' }, directory, databaseConfig: {}, databaseAdapter: {}, now: () => 3_600_000,
+  const adapter = createRetirementAdapter({ accountId: 'account', appId: 'app', token: 'token', store: { read: async () => ({record:target}), list: async () => [{ record: target }, { record: other }] }, dispatcherName: 'dispatcher', dispatcherSource: '/dispatcher.ts', dispatcherVars: { ACCESS_AUD: 'aud' }, directory, databaseConfig: {}, databaseAdapter: {}, now: () => 3_600_000,
     run: async args => calls.push(args), fetcher: async (url, options) => {
       if (url.includes('/flagship/')) {
         if (options.method === 'PUT') flag = JSON.parse(options.body)

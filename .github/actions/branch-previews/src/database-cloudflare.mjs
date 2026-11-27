@@ -25,6 +25,7 @@ export function cloudflareDatabaseAdapter({ accountId, token, wrangler, seedSql,
     return results[0].results
   }
   return {
+    query,
     recordDatabase,
     recordIntent,
     recordProgress,
