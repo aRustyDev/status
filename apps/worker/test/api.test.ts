@@ -5,12 +5,15 @@ import { DatabaseSync } from 'node:sqlite'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 import worker from '../src/index.ts'
+import gatewayModule from '../../gateway/index.ts'
 import { getSystemHealthReport } from '../src/system-health.ts'
 import { vaultApi, vaultKeyReady } from '../src/vault.ts'
 import probeWorker from '../../probe/src/index.ts'
 import { endpointFingerprint } from '../src/endpoint-config.ts'
 import { syncGatusCatalog } from '../src/gatus-catalog.ts'
 import { gatusSourceId, type GatusCatalogEntry } from '../src/gatus.ts'
+
+const gateway = 'default' in gatewayModule ? gatewayModule.default as typeof gatewayModule : gatewayModule
 
 // This adapter executes actual SQLite statements, including atomic batches, to
 // exercise the API independently of a running Cloudflare account.
@@ -159,6 +162,44 @@ test('Access identity, roles and same-origin mutations are enforced', async () =
   assert.equal((await request('/api/v1/admin/users', operatorToken)).response.status, 403)
   assert.equal((await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'API' }, 'https://evil.example')).response.status, 403)
   assert.equal((await request('/api/v1/admin/users', adminToken)).response.status, 200)
+})
+
+test('preview identity verification authenticates without reading or writing users', async () => {
+  const verify = (token?: string, method = 'GET') => worker.fetch(new Request('https://status.example/api/v1/auth/preview-verify', {
+    method, headers: token ? { 'Cf-Access-Jwt-Assertion': token } : {},
+  }), { ...env, DB: { prepare: () => { throw new Error('Preview verification must not use D1') } } } as never)
+  const newIdentity = await sign('preview-only-id', 'preview-only@example.com')
+  const changedEmail = await sign('admin-id', 'changed@example.com')
+  assert.equal((await verify(newIdentity)).status, 200)
+  assert.equal((await verify(changedEmail)).status, 200)
+  assert.equal((await db.prepare('SELECT id FROM users WHERE subject=?').bind('preview-only-id').first()), null)
+  assert.equal((await db.prepare('SELECT email FROM users WHERE subject=?').bind('admin-id').first<{ email: string }>())?.email, 'admin@example.com')
+  assert.equal((await verify()).status, 401)
+  assert.equal((await verify(await sign('invalid', 'invalid@example.com', 'other-audience'))).status, 401)
+  assert.equal((await verify(await sign('expired', 'expired@example.com', audience, '-1m'))).status, 401)
+  assert.equal((await verify(await sign('missing-email', ''))).status, 401)
+  assert.equal((await verify(newIdentity, 'POST')).status, 405)
+})
+
+test('gateway checks authenticated preview navigation and API requests without touching baseline D1', async () => {
+  const isolatedEnv = { ...env, DB: { prepare: () => { throw new Error('Baseline D1 was accessed') } } }
+  let dispatches = 0
+  const gatewayEnv = {
+    API: { fetch: (req: Request) => worker.fetch(req, isolatedEnv as never) },
+    PREVIEW_DISPATCHER: { fetch: async () => { dispatches++; return new Response('preview') } },
+  }
+  const token = await sign('preview-gateway-id', 'preview-gateway@example.com')
+  const headers = { 'Cf-Access-Jwt-Assertion': token, 'X-Status-Preview': `branch-${'a'.repeat(24)}` }
+  for (const path of ['/', '/assets/app.js', '/api/v1/auth/me']) {
+    const response = await gateway.fetch(new Request(`https://status.example${path}`, { headers }), gatewayEnv as never)
+    assert.equal(response.status, 200)
+    assert.equal(await response.text(), 'preview')
+  }
+  assert.equal(dispatches, 3)
+  const invalid = await gateway.fetch(new Request('https://status.example/', { headers: { ...headers, 'Cf-Access-Jwt-Assertion': 'invalid' } }), gatewayEnv as never)
+  assert.equal(invalid.status, 401)
+  assert.equal(dispatches, 3)
+  assert.equal(await db.prepare('SELECT id FROM users WHERE subject=?').bind('preview-gateway-id').first(), null)
 })
 
 test('system health is administrator-only and reports observed dependency state', async () => {
