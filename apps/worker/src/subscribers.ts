@@ -8,6 +8,8 @@ export interface SubscriberEnv {
   PREVIEW_SLOT?: string
   PREVIEW_TARGET?: string
   PREVIEW_RELEASE?: string
+  PREVIEW_BRANCH_MODE?: string
+  PREVIEW_SUBSCRIBER_AUTHORIZE?: () => Promise<boolean>
   SUBSCRIBER_EMAIL_READY?: string
   SUBSCRIBER_EMAIL_FROM?: string
   SUBSCRIBER_EMAIL_DESTINATIONS?: string
@@ -47,6 +49,29 @@ export function subscriberEmailReady(env: SubscriberEnv): boolean {
 }
 export function subscriberAddressApproved(env: SubscriberEnv, address: string): boolean {
   return [...emailDestinations(env.SUBSCRIBER_EMAIL_DESTINATIONS).values()].some(item => item.address.toLowerCase() === address.toLowerCase())
+}
+/** Schema previews must retain their trusted branch route and release-local lease. */
+async function schemaConfirmationAuthorized(env: SubscriberEnv, scope: string | null, confirmation?: { user: User; hash: string }): Promise<boolean> {
+  if (env.PREVIEW_BRANCH_MODE === undefined) return true
+  if (env.PREVIEW_BRANCH_MODE !== 'schema' || env.PREVIEW_SUBSCRIBER_REQUIRED !== 'true' || !scope ||
+      env.PREVIEW_SLOT !== '1' || env.PREVIEW_TARGET !== 'a' || !/^[0-9a-f]{40}$/.test(env.PREVIEW_RELEASE ?? '') ||
+      typeof env.PREVIEW_SUBSCRIBER_AUTHORIZE !== 'function') return false
+  try {
+    if (!await env.PREVIEW_SUBSCRIBER_AUTHORIZE()) return false
+    const now = Date.now()
+    const lease = confirmation
+      ? await query(env, `SELECT l.expires_at,s.confirmation_expires_at FROM preview_subscriber_leases l
+          JOIN preview_subscribers s ON s.scope=l.scope JOIN users u ON u.id=s.user_id
+          JOIN preview_subscription_settings cfg ON cfg.scope=s.scope
+          WHERE l.scope=? AND l.slot=1 AND l.target='a' AND l.release=? AND l.expires_at>?
+          AND s.user_id=? AND s.status='pending' AND s.confirmation_hash=? AND s.confirmation_expires_at>?
+          AND lower(s.email)=lower(u.email) AND lower(s.email)=lower(?) AND cfg.enabled=1 AND cfg.allow_email=1`,
+        scope, env.PREVIEW_RELEASE, now, confirmation.user.id, confirmation.hash, now, confirmation.user.email).first<{expires_at:number;confirmation_expires_at:number}>()
+      : await query(env, "SELECT expires_at FROM preview_subscriber_leases WHERE scope=? AND slot=1 AND target='a' AND release=? AND expires_at>?", scope, env.PREVIEW_RELEASE, now).first<{expires_at:number;confirmation_expires_at?:number}>()
+    const checkedAt = Date.now()
+    return !!lease && Number.isSafeInteger(lease.expires_at) && lease.expires_at > checkedAt &&
+      (!confirmation || (Number.isSafeInteger(lease.confirmation_expires_at) && lease.confirmation_expires_at! > checkedAt && subscriberAddressApproved(env, confirmation.user.email) && subscriberEmailReady(env)))
+  } catch { return false }
 }
 async function body(request: Request): Promise<Body> {
   let parsed: unknown
@@ -147,6 +172,7 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
     if (!current.enabled || !current.allow_email || !subscriberEmailReady(env)) return fail(503, 'Subscriptions unavailable')
     if (input.type !== 'email' || typeof input.email !== 'string' || input.email.toLowerCase() !== user.email.toLowerCase() || !subscriberAddressApproved(env, user.email) || input.website) return fail(400, 'Invalid subscription')
     const selection = await validateScope(env, input, current)
+    if (!await schemaConfirmationAuthorized(env, scope)) return fail(503, 'Subscriptions unavailable')
     const now = Date.now()
     const bytes = crypto.getRandomValues(new Uint8Array(32))
     const token = [...bytes].map(n => n.toString(16).padStart(2, '0')).join('')
@@ -157,6 +183,12 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
       WHERE ${table}.status <> 'active' AND (${table}.confirmation_sent_at IS NULL OR ${table}.confirmation_sent_at < ?)`, ...scoped(user.id, user.email, JSON.stringify(selection.events), JSON.stringify(selection.ids), now, now, hash, now + 48 * 3600000, now, now - 600000)).run()
     if (!saved.meta.changes) return fail(429, 'A subscription is active or confirmation was recently requested. Try again in 10 minutes.')
     const link = `${publicUrl(env)}/#subscription=confirm&token=${token}`
+    if (!await schemaConfirmationAuthorized(env, scope, {user, hash})) {
+      // No mail was sent. Only clear this request's token; a concurrent update
+      // or a different confirmation must remain untouched.
+      await query(env, `UPDATE ${table} SET confirmation_hash=NULL,confirmation_expires_at=NULL,confirmation_sent_at=NULL WHERE ${inScope}user_id=? AND status='pending' AND confirmation_hash=?`, ...scoped(user.id, hash)).run()
+      return fail(503, 'Subscriptions unavailable')
+    }
     try {
       await env.SUBSCRIBER_EMAIL!.send({ from: env.SUBSCRIBER_EMAIL_FROM!, to: user.email, subject: 'Confirm your status subscription', text: `Confirm your subscription: ${link}` })
     } catch { return fail(503, 'Confirmation could not be sent. Try again in 10 minutes.') }
