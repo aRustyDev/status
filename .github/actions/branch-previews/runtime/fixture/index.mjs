@@ -1,4 +1,3 @@
-/* global TextDecoder, TextEncoder, URL, URLSearchParams, Response, crypto */
 // This Worker must only be deployed without routes or workers.dev and reached
 // through preview-owned service bindings. All fixture data is synthetic.
 const host = 'preview-fixture.invalid'
