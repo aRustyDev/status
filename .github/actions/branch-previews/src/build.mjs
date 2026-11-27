@@ -49,7 +49,8 @@ export async function buildArtifact(feature, output) {
     const contents = `import { runBranchSubscriberScheduler } from ${JSON.stringify(wrapper)}\nimport { PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT, flushPreviewSubscriberDeliveries } from ${JSON.stringify(source)}\nexport default { async scheduled(_event, env) { if (PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT === 2) await runBranchSubscriberScheduler(env, flushPreviewSubscriberDeliveries) } }\n`
     await build(schemaBuildOptions({absWorkingDir:feature, bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers','subscriber.mjs'), stdin:{contents,resolveDir:feature,sourcefile:'schema-subscriber.mjs'}}))
     const files = ['preview-subscriber-scheduler.ts', 'subscriber-delivery.ts', 'subscribers.ts', 'email-channel.ts', 'idempotency.ts', 'index.ts']
-    const hashes = Object.fromEntries(files.map(name => [name, createHash('sha256').update(readFileSync(ownedPath(feature, `apps/worker/src/${name}`))).digest('hex')]))
+    const sourceDirectory = path.dirname(manifest.schemaSubscriber.entry)
+    const hashes = Object.fromEntries(files.map(name => [name, createHash('sha256').update(readFileSync(ownedPath(feature, path.join(sourceDirectory, name)))).digest('hex')]))
     writeFileSync(path.join(output,'workers','subscriber-source.json'), JSON.stringify(hashes))
   }
   // The optional fixture target is still built from the CI-tested feature
