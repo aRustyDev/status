@@ -135,6 +135,75 @@ test('preview leases isolate settings, enrollments, confirmations and admin oper
   await assert.rejects(() => subscriberApi(request('GET'),{...first,PREVIEW_SUBSCRIBER_SCOPE:'bad'},operator,'/admin/subscribers/settings'), /Invalid preview subscriber scope/)
 })
 
+test('schema confirmation requires a live trusted authorization and release-local lease', async () => {
+  for (const reason of ['missing-callback', 'denied', 'missing-lease', 'expired-lease', 'wrong-release'] as const) {
+    const {env, local, messages} = fixture()
+    const scope = 'a'.repeat(64), release = 'b'.repeat(40)
+    const schema = {...env, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:scope, PREVIEW_BRANCH_MODE:'schema', PREVIEW_SLOT:'1', PREVIEW_TARGET:'a', PREVIEW_RELEASE:release, PREVIEW_SUBSCRIBER_AUTHORIZE:async () => reason !== 'denied'}
+    await subscriberApi(request('PUT',{enabled:true,allowEmail:true,allowComponentScope:true,allowedEvents:['incident.created']}),schema,operator,'/admin/subscribers/settings')
+    if (reason !== 'missing-lease') local.db.prepare("INSERT INTO preview_subscriber_leases VALUES (?,1,'a',?,?)").run(scope,reason === 'wrong-release' ? 'c'.repeat(40) : release,reason === 'expired-lease' ? Date.now()-1 : Date.now()+60_000)
+    const tested = reason === 'missing-callback' ? {...schema, PREVIEW_SUBSCRIBER_AUTHORIZE:undefined} : schema
+    await assert.rejects(() => subscriberApi(request('POST',enrollment),tested,owner,'/public/subscriptions'), (error:unknown) => error instanceof SubscriberError && error.status === 503, reason)
+    assert.equal(messages.length,0,reason)
+    assert.equal((local.db.prepare('SELECT count(*) AS n FROM preview_subscribers').get() as {n:number}).n,0,reason)
+  }
+})
+
+test('schema confirmation rechecks authorization and lease immediately before sending', async () => {
+  for (const reason of ['revoke','expire','switch','denied','unavailable'] as const) {
+    const {env, local, messages} = fixture()
+    const scope = 'a'.repeat(64), release = 'b'.repeat(40)
+    local.db.prepare("INSERT INTO preview_subscriber_leases VALUES (?,1,'a',?,?)").run(scope,release,Date.now()+60_000)
+    let calls = 0
+    const schema = {...env, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:scope, PREVIEW_BRANCH_MODE:'schema', PREVIEW_SLOT:'1', PREVIEW_TARGET:'a', PREVIEW_RELEASE:release, PREVIEW_SUBSCRIBER_AUTHORIZE:async () => {
+      if (++calls === 2) {
+        if (reason === 'revoke') local.db.prepare('DELETE FROM preview_subscriber_leases WHERE scope=?').run(scope)
+        if (reason === 'expire') local.db.prepare('UPDATE preview_subscriber_leases SET expires_at=? WHERE scope=?').run(Date.now()-1,scope)
+        if (reason === 'switch') local.db.prepare('UPDATE preview_subscriber_leases SET release=? WHERE scope=?').run('c'.repeat(40),scope)
+        if (reason === 'denied') return false
+        if (reason === 'unavailable') throw new Error('authorization unavailable')
+      }
+      return true
+    }}
+    await subscriberApi(request('PUT',{enabled:true,allowEmail:true,allowComponentScope:true,allowedEvents:['incident.created']}),schema,operator,'/admin/subscribers/settings')
+    await assert.rejects(() => subscriberApi(request('POST',enrollment),schema,owner,'/public/subscriptions'), (error:unknown) => error instanceof SubscriberError && error.status === 503, reason)
+    assert.equal(calls,2,reason)
+    assert.equal(messages.length,0,reason)
+    const row = local.db.prepare('SELECT confirmation_hash,confirmation_sent_at FROM preview_subscribers WHERE scope=?').get(scope)
+    assert.deepEqual({...row},{confirmation_hash:null,confirmation_sent_at:null},reason)
+  }
+  const {env, local, messages} = fixture()
+  const scope = 'a'.repeat(64), release = 'b'.repeat(40)
+  local.db.prepare("INSERT INTO preview_subscriber_leases VALUES (?,1,'a',?,?)").run(scope,release,Date.now()+60_000)
+  const schema = {...env,PREVIEW_SUBSCRIBER_REQUIRED:'true',PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_BRANCH_MODE:'schema',PREVIEW_SLOT:'1',PREVIEW_TARGET:'a',PREVIEW_RELEASE:release,PREVIEW_SUBSCRIBER_AUTHORIZE:async () => true}
+  await subscriberApi(request('PUT',{enabled:true,allowEmail:true,allowComponentScope:true,allowedEvents:['incident.created']}),schema,operator,'/admin/subscribers/settings')
+  assert.equal((await subscriberApi(request('POST',enrollment),schema,owner,'/public/subscriptions')).status,202)
+  assert.equal(messages.length,1)
+})
+
+test('schema confirmation will not send a stale token or to a changed identity', async () => {
+  for (const reason of ['unsubscribe','delete','new-token','identity','disabled'] as const) {
+    const {env, local, messages} = fixture()
+    const scope = 'a'.repeat(64), release = 'b'.repeat(40)
+    local.db.prepare("INSERT INTO preview_subscriber_leases VALUES (?,1,'a',?,?)").run(scope,release,Date.now()+60_000)
+    let calls = 0
+    const schema = {...env, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:scope, PREVIEW_BRANCH_MODE:'schema', PREVIEW_SLOT:'1', PREVIEW_TARGET:'a', PREVIEW_RELEASE:release, PREVIEW_SUBSCRIBER_AUTHORIZE:async () => {
+      if (++calls === 2) {
+        if (reason === 'unsubscribe') local.db.prepare("UPDATE preview_subscribers SET status='unsubscribed' WHERE scope=? AND user_id='a'").run(scope)
+        if (reason === 'delete') local.db.prepare("DELETE FROM preview_subscribers WHERE scope=? AND user_id='a'").run(scope)
+        if (reason === 'new-token') local.db.prepare("UPDATE preview_subscribers SET confirmation_hash='newer-token' WHERE scope=? AND user_id='a'").run(scope)
+        if (reason === 'identity') local.db.prepare("UPDATE users SET email='changed@example.test' WHERE id='a'").run()
+        if (reason === 'disabled') local.db.prepare('UPDATE preview_subscription_settings SET enabled=0 WHERE scope=?').run(scope)
+      }
+      return true
+    }}
+    await subscriberApi(request('PUT',{enabled:true,allowEmail:true,allowComponentScope:true,allowedEvents:['incident.created']}),schema,operator,'/admin/subscribers/settings')
+    await assert.rejects(() => subscriberApi(request('POST',enrollment),schema,owner,'/public/subscriptions'), (error:unknown) => error instanceof SubscriberError && error.status === 503, reason)
+    assert.equal(messages.length,0,reason)
+    if (reason === 'new-token') assert.equal((local.db.prepare("SELECT confirmation_hash FROM preview_subscribers WHERE scope=? AND user_id='a'").get(scope) as {confirmation_hash:string}).confirmation_hash,'newer-token')
+  }
+})
+
 test('shared preview mutations retain an explicit unknown label if their lease is absent', () => {
   const {local} = fixture()
   const scope = 'd'.repeat(64)
