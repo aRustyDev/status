@@ -6,7 +6,7 @@ import { candidateVerificationHeader } from './verify-candidate.mjs'
 
 // The caller must serialize all dispatcher and Flagship writers. Candidate
 // verification must reach the private candidate before the Flagship switch.
-export function createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory, run, verificationSecret, previewUrl, accessTeamDomain, accessAud, serviceTokenId, accessHeaders = {}, fetchImpl = globalThis.fetch, wait = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
+export function createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory, run, verificationSecret, previewUrl, accessTeamDomain, accessAud, serviceTokenId, accessHeaders = {}, fetchImpl = globalThis.fetch, wait = ms => new Promise(resolve => setTimeout(resolve, ms)), subscriberFence, executionFenceFor }) {
   if (!store || !appId || !accountId || !token || !dispatcherName || !dispatcherSource || !directory || typeof run !== 'function' || typeof verificationSecret !== 'string' || verificationSecret.length < 32 || !previewUrl || !accessTeamDomain || !accessAud || !serviceTokenId) throw new Error('Missing activation configuration or private candidate verifier')
   const apiBase = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/flagship/apps/${encodeURIComponent(appId)}/flags`
   async function request(url, options = {}) {
@@ -60,6 +60,20 @@ export function createActivationAdapter({ store, appId, accountId, token, dispat
     }
     // Worker deployments may still be propagating immediately after upload.
     await verifyPreview('candidate', 60)
+    // Revoke before publishing the new route. If activation fails or times
+    // out, the old scheduler remains fenced until explicit reconciliation.
+    if (active?.resources?.workers?.subscriber || resources?.workers?.subscriber) {
+      if (!subscriberFence) throw new Error('Missing schema subscriber fence')
+      if (active) await subscriberFence.revoke({ ref, selector, release: active })
+      await subscriberFence.activate({ ref, selector, release: { sha, resources } })
+    }
+    const recorded = [active, current.previous, ...(current.retained || []), { resources }].filter(Boolean)
+    if (!executionFenceFor && recorded.some(release => release.resources?.workers && Object.hasOwn(release.resources.workers, 'fence'))) throw new Error('Missing execution fence for recorded fixture release')
+    // Close the authoritative lease before switching Flagship. A crashed or
+    // ambiguous holder keeps the branch drained, rather than allowing overlap.
+    const fence = executionFenceFor ? await executionFenceFor({ ref, selector, sha, resources, active, previous: current.previous, retained: current.retained || [] }) : null
+    const fenceArgs = fence ? { selector, previousRelease: fence.previousRelease, release: sha } : null
+    if (fence) await fence.controller.beginActivation(fenceArgs)
     const flagKey = installation().flagPrefix + 'branch-' + key
     const flagUrl = `${apiBase}/${flagKey}`
     const flag = await request(flagUrl)
@@ -80,5 +94,6 @@ export function createActivationAdapter({ store, appId, accountId, token, dispat
     // A management API read is not evidence of edge propagation. Flagship can
     // take up to 30 seconds, so allow time beyond that documented window.
     await verifyPreview('active', 120)
+    if (fence) await fence.controller.finishActivation(fenceArgs)
   }
 }

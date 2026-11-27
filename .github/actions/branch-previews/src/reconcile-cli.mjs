@@ -18,6 +18,8 @@ import { recoverCandidate } from './recover-candidate.mjs'
 import { branchKey } from './release-contract.mjs'
 import { cleanupAbandoned } from './cleanup-abandoned.mjs'
 import { cleanupRetained } from './cleanup-retained.mjs'
+import { createSchemaFence } from './schema-subscriber.mjs'
+import { createCloudflareExecutionFence, executionFenceFor, initializeExecutionFenceIfNeeded } from './execution-fence.mjs'
 
 function object(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Missing ${name}`)
@@ -40,6 +42,7 @@ export async function reconcile(env = process.env) {
   const access = new Headers(object(secrets.accessHeaders, 'Access headers'))
   const dispatcherVars = { ACCESS_TEAM_DOMAIN: text(stage.accessTeamDomain, 'Access team domain'), ACCESS_AUD: text(stage.accessAud, 'Access audience'), PREVIEW_SERVICE_TOKEN_ID: text(access.get('CF-Access-Client-Id'), 'Access service token ID') }
   const store = createInventoryStore({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token })
+  const executionFence = await initializeExecutionFenceIfNeeded({ store, createFence:() => createCloudflareExecutionFence({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token }) })
   const branches = githubBranches({ repository: text(env.PREVIEW_SOURCE_REPOSITORY || env.GITHUB_REPOSITORY, 'GitHub repository'), defaultBranch: env.PREVIEW_DEFAULT_BRANCH || 'main', dispatchRepository: env.GITHUB_REPOSITORY, dispatchToken: env.GH_TOKEN, dispatchBranch: env.PREVIEW_HOST_BRANCH || 'main', token: text(env.PREVIEW_SOURCE_TOKEN || env.GH_TOKEN, 'GitHub token'), apiUrl: env.GITHUB_API_URL })
   const root = fileURLToPath(new URL('../', import.meta.url))
   const control = env.PREVIEW_CONTROL_DIR
@@ -48,11 +51,12 @@ export async function reconcile(env = process.env) {
   const temp = await mkdtemp(path.join(tmpdir(), 'status-preview-reconcile-'))
   try {
     const databaseAdapter = cloudflareDatabaseAdapter({ accountId, token, wrangler, seedSql: readFileSync(ownedPath(control,manifest.database.seed),'utf8'), recordDatabase: async () => {} })
+    const subscriberFence = createSchemaFence({ query:databaseAdapter.query, findDatabase:databaseAdapter.findDatabase, config:{...databaseConfig, inventoryDatabaseId:config.inventoryDatabaseId} })
     const run = async args => execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
     const dispatcherName = text(config.dispatcherName, 'dispatcher name')
     const dispatcherSource = path.join(root, 'runtime/dispatcher.ts')
-    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run })
-    const activate = createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory: temp, run, verificationSecret: text(secrets.verificationSecret, 'verification secret'), previewUrl: text(config.previewUrl, 'preview URL'), accessHeaders: object(secrets.accessHeaders, 'Access headers'), accessTeamDomain: dispatcherVars.ACCESS_TEAM_DOMAIN, accessAud: dispatcherVars.ACCESS_AUD, serviceTokenId: dispatcherVars.PREVIEW_SERVICE_TOKEN_ID })
+    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run, subscriberFence, executionFence })
+    const activate = createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory: temp, run, verificationSecret: text(secrets.verificationSecret, 'verification secret'), previewUrl: text(config.previewUrl, 'preview URL'), accessHeaders: object(secrets.accessHeaders, 'Access headers'), accessTeamDomain: dispatcherVars.ACCESS_TEAM_DOMAIN, accessAud: dispatcherVars.ACCESS_AUD, serviceTokenId: dispatcherVars.PREVIEW_SERVICE_TOKEN_ID, subscriberFence, executionFenceFor: executionFence ? executionFenceFor(executionFence) : undefined })
     async function isPublishedCandidate({ ref, sha, selector }) {
       const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/flagship/apps/${encodeURIComponent(appId)}/flags/${installation().flagPrefix}branch-${branchKey(ref)}`
       const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
@@ -64,6 +68,12 @@ export async function reconcile(env = process.env) {
       return flag.enabled === true && flag.default_variation === 'current' && !flag.rules?.length && flag.variations?.current?.selector === selector && flag.variations.current.release === sha
     }
     const result = await reconcilePreviews({ branches, store,
+      revokeAmbiguousSubscribers: async (record, releases) => {
+        for (const release of releases) await subscriberFence.revoke({ref:record.ref, selector:record.selector, release})
+      },
+      // Leave active_release intact so an operator can later recover the
+      // already-published candidate without making execution live again.
+      drainAmbiguousExecution: executionFence ? async record => { await executionFence.beginRetirement(record.selector) } : undefined,
       retire: ref => retireDeletedBranch({ ref, store, readRemoteHead: branches.head, ...adapter }),
       recoverCandidate: (ref, sha, options) => recoverCandidate({ ref, sha, store, readRemoteHead: branches.head, activate, isPublishedCandidate, ...options }),
       cleanupAbandoned: ref => cleanupAbandoned({ ref, store, deleteResources: input => adapter.deleteAbandonedResources(input) }),
