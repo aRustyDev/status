@@ -10,8 +10,8 @@ export function previewRule(url, selector) {
   if (target.protocol !== 'https:' || target.username || target.password || !/^[a-z0-9.-]+$/i.test(target.hostname)) {
     throw new Error('The staging URL must be an HTTPS URL with a DNS hostname and no credentials')
   }
-  if (!/^[1-6]\.[a-f0-9]{32}$/.test(selector)) {
-    throw new Error('The preview selector must contain a slot number and 32 lowercase hexadecimal characters')
+  if (!/^(?:[1-6]\.[a-f0-9]{32}|branch-[a-f0-9]{24})$/.test(selector)) {
+    throw new Error('The preview selector must be a slot or branch selector from the deployment workflow')
   }
   const origin = target.origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   return {

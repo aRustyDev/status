@@ -42,6 +42,25 @@ try {
   result = await fallback.fetch(request('/'), env)
   assert.match(await result.text(), /bsp-snapshot/)
   assert.equal(result.headers.get('cache-control'), 'no-store')
+  for (const selector of ['', 'invalid', 'branch-0123456789abcdef01234567', '1.0123456789abcdef0123456789abcdef']) {
+    const previewRequest = (path: string) => new Request(`https://status.example${path}`, {
+      headers: { accept: 'text/html', 'Cf-Access-Jwt-Assertion': token, 'X-Status-Preview': selector },
+    })
+    const previousAssets = assetPaths.length
+    calls.length = 0
+    liveStatus = 503
+    result = await fallback.fetch(previewRequest('/'), env)
+    assert.equal(result.status, 503)
+    assert.equal(await result.text(), 'live')
+    assert.deepEqual(calls, ['/'])
+    assert.equal(assetPaths.length, previousAssets)
+    calls.length = 0
+    result = await fallback.fetch(previewRequest('/__fallback/snapshot.json'), env)
+    assert.equal(await result.text(), 'live')
+    assert.deepEqual(calls, ['/__fallback/snapshot.json'])
+    assert.equal(assetPaths.length, previousAssets)
+  }
+  liveStatus = 200
   result = await fallback.fetch(request('/__fallback/logo_dark.png'), env)
   assert.equal(await result.text(), 'asset')
   assert.equal(assetPaths.at(-1), '/logo_dark.png')
