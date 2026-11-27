@@ -15,7 +15,11 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
   const shared = { workers_dev: false, preview_urls: false, observability: { enabled: true }, compatibility_date: '2026-11-23' }
   const database = [{ binding: 'DB', database_id: settings.d1DatabaseId, database_name: settings.d1DatabaseName }]
   const scope = scopeFor(selector)
-  const vars = { ACCESS_TEAM_DOMAIN: settings.accessTeamDomain, ACCESS_AUD: settings.accessAud, ENDPOINTS: settings.endpoints, PREVIEW_SUBSCRIBER_REQUIRED: 'true', PREVIEW_SUBSCRIBER_SCOPE: scope, PREVIEW_RELEASE: sha, SUBSCRIBERS_READY: 'false', SUBSCRIBER_EMAIL_READY: 'false' }
+  const vars = {
+    DEPLOYMENT_ENVIRONMENT: 'staging',
+    PREVIEW_BROWSER_ORIGIN: settings.previewBrowserOrigin ?? '',
+    PREVIEW_BROWSER_CLIENT_ID: settings.previewBrowserClientId ?? '',
+    ACCESS_TEAM_DOMAIN: settings.accessTeamDomain, ACCESS_AUD: settings.accessAud, ENDPOINTS: settings.endpoints, PREVIEW_SUBSCRIBER_REQUIRED: 'true', PREVIEW_SUBSCRIBER_SCOPE: scope, PREVIEW_RELEASE: sha, SUBSCRIBERS_READY: 'false', SUBSCRIBER_EMAIL_READY: 'false' }
   const assets = directory => ({ directory: path.join(branchDir, directory), binding: 'ASSETS', run_worker_first: true })
   const source = name => path.join(branchDir, name)
   const extra = settings.extraServices || {}

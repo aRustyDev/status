@@ -5,7 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { createBranchConfigs, deployBranchWorkers } from './branch-workers.mjs'
 
-const settings = { d1DatabaseId: 'id', d1DatabaseName: 'db', accessTeamDomain: 'access', accessAud: 'aud', endpoints: '[]', apiVars: { SUBSCRIBERS_READY: 'true' } }
+const settings = { d1DatabaseId: 'id', d1DatabaseName: 'db', accessTeamDomain: 'access', accessAud: 'aud', previewBrowserOrigin: 'https://stage.example', previewBrowserClientId: 'browser.access', endpoints: '[]', apiVars: { SUBSCRIBERS_READY: 'true' } }
 const selector = 'branch-' + 'a'.repeat(24)
 const sha = 'b'.repeat(40)
 
@@ -17,6 +17,11 @@ test('creates a private release stack with the selected database and disabled sc
     assert.equal(new Set(Object.values(names)).size, order.length)
     for (const name of order) {
       const config = JSON.parse(readFileSync(path.join(dir, `${name}.json`)))
+      if (['api', 'statusApi', 'monitoring'].includes(name)) {
+        assert.equal(config.vars.DEPLOYMENT_ENVIRONMENT, 'staging')
+        assert.equal(config.vars.PREVIEW_BROWSER_ORIGIN, 'https://stage.example')
+        assert.equal(config.vars.PREVIEW_BROWSER_CLIENT_ID, 'browser.access')
+      }
       assert.equal(config.workers_dev, false)
       assert.equal(config.preview_urls, false)
       assert.ok(names[name].length <= 63)
