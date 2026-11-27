@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { enqueueSubscriberDeliveries, flushSubscriberDeliveries } from '../src/subscriber-delivery.ts'
 import { flushPreviewSubscriberDeliveries } from '../src/preview-subscriber-scheduler.ts'
 
@@ -137,6 +138,34 @@ test('preview dispatch and maintenance isolate leases and baseline deliveries', 
   await assert.rejects(() => flushPreviewSubscriberDeliveries({...first, PREVIEW_SUBSCRIBER_SCOPE:undefined},async () => true), /Missing preview subscriber scope/)
   await assert.rejects(() => flushPreviewSubscriberDeliveries(first), /Missing preview send authorization/)
   await assert.rejects(() => flushSubscriberDeliveries(first), /fenced preview scheduler/)
+})
+
+test('branch schema dispatch uses an isolated release fence and stops after revocation', async () => {
+  const selector = 'branch-1234567890abcdef12345678'
+  const scope = createHash('sha256').update(selector).digest('hex')
+  const now = Date.now()
+  const setup = async (release: string) => {
+    const x = fixture()
+    x.local.sqlite.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email,allowed_events,updated_at) VALUES (?,1,1,'[\"incident.created\"]',0)").run(scope)
+    x.local.sqlite.prepare("INSERT INTO preview_subscribers(scope,user_id,email,status,events,monitor_ids,created_at,updated_at) VALUES (?,'owner','test@example.test','active','[\"incident.created\"]','[]',0,0)").run(scope)
+    // Each release has its own database, so the slot and target are local
+    // sentinels; the trusted branch wrapper authorizes the actual route.
+    x.local.sqlite.prepare("INSERT INTO preview_subscriber_leases(scope,slot,target,release,expires_at) VALUES (?,1,'a',?,?)").run(scope,release,now+60_000)
+    const env = {...x.env,PREVIEW_SUBSCRIBER_REQUIRED:'true',PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_SLOT:'1',PREVIEW_TARGET:'a',PREVIEW_RELEASE:release,SUBSCRIBERS_READY:'true'}
+    await enqueueSubscriberDeliveries(env.DB,'branch-event','incident.created',[],now,undefined,env).run()
+    return {x,env}
+  }
+  const previous = await setup('b'.repeat(40))
+  const active = await setup('c'.repeat(40))
+  // Switching releases must revoke the previous release's own database fence;
+  // creating the new release's fence does not affect that separate database.
+  previous.x.local.sqlite.prepare('DELETE FROM preview_subscriber_leases WHERE scope=?').run(scope)
+  await flushPreviewSubscriberDeliveries(previous.env,async () => true)
+  await flushPreviewSubscriberDeliveries(active.env,async () => true)
+  assert.equal(previous.x.calls,0)
+  assert.equal((previous.x.local.sqlite.prepare('SELECT state FROM preview_subscriber_deliveries').get() as {state:string}).state,'pending')
+  assert.equal(active.x.calls,1)
+  assert.equal((active.x.local.sqlite.prepare('SELECT state FROM preview_subscriber_deliveries').get() as {state:string}).state,'delivered')
 })
 
 test('a lease revoked after claim is fenced before the provider call', async () => {
