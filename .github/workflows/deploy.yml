@@ -47,6 +47,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: "!inputs.fixture && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (!inputs.fixture || github.repository_id == '1468279539')"
+    outputs:
+      artifact_name: ${{ format('preview-{0}-{1}', github.run_id, github.run_attempt) }}
     steps:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
@@ -129,9 +131,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PREVIEW_SOURCE_TOKEN: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
+      - name: Validate the build artifact identity
+        if: "!inputs.fixture"
+        shell: bash
+        env:
+          BUILD_ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
+        run: '[[ "$BUILD_ARTIFACT_NAME" =~ ^preview-${GITHUB_RUN_ID}-[1-9][0-9]*$ ]]'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: ${{ format('preview-{0}-{1}', github.run_id, github.run_attempt) }}
+          name: ${{ needs.build.outputs.artifact_name }}
           path: ${{ format('{0}/download', runner.temp) }}
         if: "!inputs.fixture"
       - name: Download artifact from the verified fixture CI run
