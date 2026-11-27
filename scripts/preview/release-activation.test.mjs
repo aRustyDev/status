@@ -96,3 +96,49 @@ test('reports the last HTTP status after the full propagation window', async t =
   assert.equal(attempts, 121)
   assert.equal(waits, 120)
 })
+
+test('reuses only a cleared tombstone for a branch with no active release', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'preview-activation-'))
+  t.after(() => rmSync(directory, { force: true, recursive: true }))
+  const record = newRelease({ ref, sha })
+  const stem = createHash('sha256').update(`${record.selector}:${sha}`).digest('hex').slice(0, 24)
+  record.candidate = { sha, generation: 1, phase: 'activating', resources: { gateway: `status-p-${stem}-gateway` } }
+  const tombstone = { type: 'json', enabled: true, default_variation: 'current', rules: [], variations: { current: {} } }
+
+  async function attempt(initial, active = null) {
+    let flag = structuredClone(initial)
+    let writes = 0
+    const adapter = createActivationAdapter({ store: { list: async () => [{ record }] }, appId: 'app', accountId: 'account', token: 'token', dispatcherName: 'dispatcher', dispatcherSource: '/trusted/dispatcher.ts', directory,
+      run: async () => {}, verificationSecret: 'x'.repeat(32), previewUrl: 'https://preview.example', accessTeamDomain: 'team.cloudflareaccess.com', accessAud: 'aud', serviceTokenId: 'client.access', wait: async () => {},
+      fetchImpl: async (url, options) => {
+        if (url === 'https://preview.example/__preview/verify') return { ok: true, status: 204, headers: new Headers({ 'X-Status-Preview-Commit': sha }) }
+        if (options.method === 'PUT') { writes++; flag = JSON.parse(options.body) }
+        return { ok: true, status: 200, json: async () => ({ success: true, result: flag }) }
+      },
+    })
+    try {
+      await adapter({ ref, sha, generation: 1, selector: record.selector, resources: record.candidate.resources, active })
+      return { writes, flag }
+    } catch (error) {
+      return { writes, error }
+    }
+  }
+
+  const reused = await attempt(tombstone)
+  assert.equal(reused.writes, 1)
+  assert.deepEqual(reused.flag.variations.current, { selector: record.selector, release: sha })
+  const incompatible = [
+    { flag: tombstone, active: { sha: 'b'.repeat(40) } },
+    { flag: { ...tombstone, enabled: false } },
+    { flag: { ...tombstone, type: 'string' } },
+    { flag: { ...tombstone, rules: [{ priority: 1 }] } },
+    { flag: { ...tombstone, variations: { current: {}, other: {} } } },
+    { flag: { ...tombstone, variations: { current: [] } } },
+    { flag: { ...tombstone, variations: { current: { selector: 'branch-other', release: sha } } } },
+  ]
+  for (const { flag, active } of incompatible) {
+    const result = await attempt(flag, active)
+    assert.equal(result.writes, 0)
+    assert.match(result.error?.message || '', /Unexpected existing Flagship state/)
+  }
+})
