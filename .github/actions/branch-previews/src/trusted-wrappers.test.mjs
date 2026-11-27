@@ -22,8 +22,9 @@ test('builds trusted wrappers without executing feature code and hides privilege
   writeFileSync(path.join(h.workers,'api-feature.mjs'), `globalThis.__fixtureExecuted = true; export default { fetch(_request, env) { return new Response(JSON.stringify({keys:Object.keys(env),send:typeof env.SUBSCRIBER_EMAIL?.send})) } }`)
   writeFileSync(path.join(h.workers,'probe.mjs'), `export default { fetch(_r,env) { return new Response(JSON.stringify(Object.keys(env))) }, async scheduled(_e,env) { globalThis.__scheduledBindings=Object.keys(env) } }`)
   writeFileSync(path.join(h.workers,'subscriber-feature.mjs'), `export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT=2; export const PREVIEW_BRANCH_DELIVERY_CONTEXT_CONTRACT=1; export async function flushPreviewSubscriberDeliveries() {}`)
-  const fixtureSource=path.join(control,'apps/preview-fixture/index.mjs')
-  const files = await buildTrustedPreviewWrappers({ control, branchDir:h.branchDir, dir:h.output, fixtureSource, probe:true, subscriber:true })
+  const fixtureSource=fileURLToPath(new URL('../runtime/fixture/index.mjs', import.meta.url))
+  // The consumer checkout need not contain any of the trusted fixture code.
+  const files = await buildTrustedPreviewWrappers({ control:h.dir, branchDir:h.branchDir, dir:h.output, fixtureSource, probe:true, subscriber:true })
   assert.equal(globalThis.__fixtureExecuted, undefined)
   assert.deepEqual(Object.keys(files).sort(), ['api','authorization','fixture','mailer','probe','probeScheduler','subscriberFeature','subscriberScheduler'])
   const app = (await import(pathToFileURL(files.api).href)).default
