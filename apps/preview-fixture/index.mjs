@@ -1,3 +1,4 @@
+/* global TextDecoder, TextEncoder, URL, URLSearchParams, Response, crypto */
 // This Worker must only be deployed without routes or workers.dev and reached
 // through preview-owned service bindings. All fixture data is synthetic.
 const host = 'preview-fixture.invalid'
@@ -50,7 +51,7 @@ export default {
     if (['/actions/success', '/actions/failure'].includes(url.pathname) && request.method === 'POST') {
       const key = request.headers.get('idempotency-key')
       const authorization = request.headers.get('authorization') ?? ''
-      if (!/^Bearer [A-Za-z0-9._~+\/-]+=*$/.test(authorization) || !key || key.length > 200) return new Response(null, { status: 401 })
+      if (!/^Bearer [A-Za-z0-9._~+/-]+=*$/.test(authorization) || !key || key.length > 200) return new Response(null, { status: 401 })
       const body = await boundedJson(request)
       if (!body || !['up', 'down', 'degraded'].includes(body.status) || !Number.isSafeInteger(body.scheduledAt)) return new Response(null, { status: 400 })
       const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key))

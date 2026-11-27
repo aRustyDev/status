@@ -11,6 +11,7 @@ export function wrapPreviewFixture(app) {
         await withActiveBranchExecution(env, async isCurrent => {
           if (!await isCurrent()) return
           const { PREVIEW_FENCE, INVENTORY, FLAGS, ...safe } = env
+          void [PREVIEW_FENCE, INVENTORY, FLAGS] // Omit privileged bindings from feature code.
           response = await app.fetch(request, safe, ctx)
         })
       } catch { return new Response(null, {status:503}) }
