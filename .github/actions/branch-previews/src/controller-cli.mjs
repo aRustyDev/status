@@ -111,6 +111,8 @@ export async function main(env = process.env) {
       return execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: ['ignore','pipe','pipe'], maxBuffer:16*1024*1024 })
     } catch (error) {
       const detail = redactSubscriberAddresses(error.stderr || '', subscriber).slice(0, 4000)
+      // The original error may contain raw Wrangler output with private addresses.
+      // eslint-disable-next-line preserve-caught-error
       throw new Error(`Wrangler ${args[0]} failed (exit ${error.status ?? 'unknown'})${detail ? ': ' + detail : ''}`)
     }
   }
