@@ -1,0 +1,160 @@
+name: Deploy branch preview
+on:
+  workflow_call:
+    inputs:
+      config:
+        type: string
+        default: .github/previews.yml
+      fixture:
+        description: Status-hosted private fixture integration
+        type: boolean
+        default: false
+      branch:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+    outputs:
+      url:
+        description: Preview url
+        value: ${{ jobs.deploy.outputs.url }}
+      header_name:
+        description: Preview header_name
+        value: ${{ jobs.deploy.outputs.header_name }}
+      selector:
+        description: Preview selector
+        value: ${{ jobs.deploy.outputs.selector }}
+      sha:
+        description: Preview sha
+        value: ${{ jobs.deploy.outputs.sha }}
+      environment:
+        description: Preview environment
+        value: ${{ jobs.deploy.outputs.environment }}
+permissions:
+  contents: read
+  actions: read
+env:
+  PREVIEW_CONTROL_DIR: ${{ format('{0}/control', github.workspace) }}
+  PREVIEW_SOURCE_REPOSITORY: ${{ inputs.fixture && 'aRustyDev/branch-previews-fixture' || github.repository }}
+  PREVIEW_REPOSITORY_ID: ${{ inputs.fixture && '1474000552' || github.repository_id }}
+  PREVIEW_DEFAULT_BRANCH: ${{ inputs.fixture && 'main' || github.event.repository.default_branch }}
+  PREVIEW_HOST_BRANCH: ${{ github.event.repository.default_branch }}
+  PREVIEW_BRANCH: ${{ inputs.branch }}
+  PREVIEW_SHA: ${{ inputs.sha }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: "!inputs.fixture && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (!inputs.fixture || github.repository_id == '1468279539')"
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 26.10.0
+      - name: Check out the source repository's default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ inputs.fixture && 'aRustyDev/branch-previews-fixture' || github.repository }}
+          ref: ${{ inputs.fixture && 'main' || github.event.repository.default_branch }}
+          path: control
+          persist-credentials: false
+      - uses: aRustyDev/status/.github/actions/branch-previews@2e0b576c214569465daef8c3e3adb87c5f6301f5
+        with:
+          operation: check
+          config: ${{ inputs.config }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Check out tested feature commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.sha }}
+          path: feature
+          persist-credentials: false
+      - uses: aRustyDev/status/.github/actions/branch-previews@2e0b576c214569465daef8c3e3adb87c5f6301f5
+        with:
+          operation: build
+          config: ${{ inputs.config }}
+        env:
+          PREVIEW_FEATURE_DIR: ${{ format('{0}/feature', github.workspace) }}
+          PREVIEW_ARTIFACT_DIR: ${{ format('{0}/artifact', runner.temp) }}
+      - name: Package Worker modules, static assets and migrations
+        shell: bash
+        run: tar -C "$RUNNER_TEMP/artifact" -czf "$RUNNER_TEMP/feature.tar.gz" workers migrations $(if test -d "$RUNNER_TEMP/artifact/assets"; then echo assets; fi)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ format('preview-{0}-{1}', github.run_id, github.run_attempt) }}
+          path: ${{ format('{0}/feature.tar.gz', runner.temp) }}
+          retention-days: 1
+          if-no-files-found: error
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build
+    if: always() && !cancelled() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (!inputs.fixture || github.repository_id == '1468279539') && ((inputs.fixture && needs.build.result == 'skipped') || (!inputs.fixture && needs.build.result == 'success'))
+    environment: staging-preview
+    concurrency:
+      group: ${{ inputs.fixture && 'branch-preview-fixture-controller' || format('{0}-branch-preview-controller', github.event.repository.name) }}
+      queue: max
+    outputs:
+      url: ${{ steps.publish.outputs.url }}
+      header_name: ${{ steps.publish.outputs.header_name }}
+      selector: ${{ steps.publish.outputs.selector }}
+      sha: ${{ steps.publish.outputs.sha }}
+      environment: ${{ steps.publish.outputs.environment }}
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 26.10.0
+      - name: Verify fixture repository identity and credential
+        if: inputs.fixture
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FIXTURE_SOURCE_READ_TOKEN }}
+        run: |-
+          test -n "$GH_TOKEN"
+          test "$(gh api "repos/$PREVIEW_SOURCE_REPOSITORY" --jq .id)" = "$PREVIEW_REPOSITORY_ID"
+      - name: Check out the source repository's default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ inputs.fixture && 'aRustyDev/branch-previews-fixture' || github.repository }}
+          ref: ${{ inputs.fixture && 'main' || github.event.repository.default_branch }}
+          path: control
+          persist-credentials: false
+          token: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
+      - uses: aRustyDev/status/.github/actions/branch-previews@2e0b576c214569465daef8c3e3adb87c5f6301f5
+        with:
+          operation: check
+          config: ${{ inputs.config }}
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_SOURCE_TOKEN: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: ${{ format('preview-{0}-{1}', github.run_id, github.run_attempt) }}
+          path: ${{ format('{0}/download', runner.temp) }}
+        if: "!inputs.fixture"
+      - name: Download artifact from the verified fixture CI run
+        if: inputs.fixture
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          repository: ${{ inputs.fixture && 'aRustyDev/branch-previews-fixture' || github.repository }}
+          github-token: ${{ secrets.FIXTURE_SOURCE_READ_TOKEN }}
+          run-id: ${{ steps.verify.outputs.ci_run_id }}
+          name: ${{ format('preview-{0}', inputs.sha) }}
+          path: ${{ format('{0}/download', runner.temp) }}
+      - uses: aRustyDev/status/.github/actions/branch-previews@2e0b576c214569465daef8c3e3adb87c5f6301f5
+        with:
+          operation: deploy
+          config: ${{ inputs.config }}
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_SOURCE_TOKEN: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
+          PREVIEW_BRANCH_CONFIG: ${{ secrets[inputs.fixture && 'FIXTURE_BRANCH_CONFIG' || 'PREVIEW_BRANCH_CONFIG'] }}
+          PREVIEW_WORKER_SECRETS: ${{ secrets[inputs.fixture && 'FIXTURE_WORKER_SECRETS' || 'PREVIEW_WORKER_SECRETS'] }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets[inputs.fixture && 'FIXTURE_CLOUDFLARE_API_TOKEN' || 'CLOUDFLARE_BRANCH_PREVIEW_API_TOKEN'] }}
+          FLAGSHIP_APP_ID: ${{ vars[inputs.fixture && 'FIXTURE_FLAGSHIP_APP_ID' || 'FLAGSHIP_APP_ID'] }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars[inputs.fixture && 'FIXTURE_CLOUDFLARE_ACCOUNT_ID' || 'CLOUDFLARE_ACCOUNT_ID'] }}
+          PREVIEW_ARTIFACT_DIR: ${{ format('{0}/verified-artifact', runner.temp) }}
+          PREVIEW_ARCHIVE: ${{ format('{0}/download/feature.tar.gz', runner.temp) }}
