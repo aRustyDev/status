@@ -72,8 +72,14 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
     await statement(db, `INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details)
       VALUES (?,?,?,?,?,?,CASE WHEN EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?) THEN '{}' ELSE NULL END)`,crypto.randomUUID(),actor.email,'test','notification_channel',channelId,Date.now(),actor.id,actor.version).run()
     const result=await sendChannel(env,channelId,version,{},false)
-    await statement(db, `INSERT INTO notification_test_deliveries (id,channel_id,channel_version,result,created_at)
-      SELECT ?,id,?,?,? FROM notification_channels WHERE id=?`, crypto.randomUUID(),version,result==='deferred' ? 'unavailable' : result,Date.now(),channelId).run()
+    try {
+      const history = await statement(db, `INSERT INTO notification_test_deliveries (id,channel_id,channel_version,result,created_at)
+        SELECT ?,id,?,?,? FROM notification_channels WHERE id=?`, crypto.randomUUID(),version,result==='deferred' ? 'unavailable' : result,Date.now(),channelId).run()
+      if (!history.meta.changes) console.error(JSON.stringify({event:'notification_test_history_record_failed'}))
+    } catch {
+      // The provider has already been called; report its result even if history is unavailable.
+      console.error(JSON.stringify({event:'notification_test_history_record_failed'}))
+    }
     if (result==='unavailable') return fail(409,'Channel credential or destination is unavailable')
     if (result!=='sent') return fail(502,'Channel test failed')
     return json({ok:true})
@@ -155,7 +161,7 @@ export async function channelApi(request:Request, env:ChannelEnvironment, actor:
       input.name.trim(),endpointId,fingerprint,vaultId,secretId,input.enabled?1:0,recipientId,emailFingerprint,token,now,recipientId,emailFingerprint,id,version,type,expectedAssociation,checkSnapshots,expected,expected)
   const operations:D1PreparedStatement[]=[mutation]
   if (carryQueued) {
-    operations.push(statement(db,`UPDATE notification_outbox SET channel_version=? WHERE channel_id=? AND channel_version=? AND state IN ('pending','sending') AND check_id IN (SELECT value FROM json_each(?))
+    operations.push(statement(db,`UPDATE notification_outbox SET channel_version=? WHERE channel_id=? AND channel_version=? AND (state IN ('pending','sending') OR (state='failed' AND error_code GLOB 'retry_queued:*')) AND check_id IN (SELECT value FROM json_each(?))
       AND EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND version=? AND mutation_key=?)`,version+1,id,version,JSON.stringify(checks),id,version+1,token))
     operations.push(statement(db,`UPDATE notification_delivery_state SET channel_version=? WHERE channel_id=? AND channel_version=? AND check_id IN (SELECT value FROM json_each(?))
       AND EXISTS (SELECT 1 FROM notification_channels WHERE id=? AND version=? AND mutation_key=?)`,version+1,id,version,JSON.stringify(checks),id,version+1,token))

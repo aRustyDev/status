@@ -6,7 +6,7 @@ import { emailReady, sendApprovedEmail, type EmailChannelEnv } from './email-cha
 /** Only the in-process scheduler and the authenticated channel-test route call this module. */
 export type ChannelEnvironment = EmailChannelEnv & { DB: D1Database; CHANNEL_ENDPOINTS?: string; CHANNELS_READY?: string; VAULT_ENCRYPTION_KEY?: string; [key: string]: unknown }
 type Channel = { id: string; endpoint_id: string; endpoint_fingerprint: string; enabled: number; version: number; channel_type: 'webhook' | 'email'; recipient_id: string | null; email_fingerprint: string | null }
-type Job = { id: string; channel_id: string; channel_version: number; check_id: string; check_version: number; scheduled_at: number; status: 'up' | 'degraded' | 'down'; attempts: number; manual_retry: number; transition_generation: number; channel_type: 'webhook' | 'email' }
+type Job = { id: string; channel_id: string; channel_version: number; check_id: string; check_version: number; scheduled_at: number; status: 'up' | 'degraded' | 'down'; attempts: number; manual_retry: number; transition_generation: number; channel_type: 'webhook' | 'email'; association_version: number }
 export type ChannelResult = 'sent' | 'unavailable' | 'delivery_failed' | 'deferred'
 
 export function channelEndpoints(value: string | undefined): Map<string, Endpoint> {
@@ -103,35 +103,44 @@ export async function flushChannelDeliveries(env: ChannelEnvironment): Promise<v
   const now = Date.now()
   let jobs: Job[]
   try {
+    // The legacy-inert retry marker retains the association revision, so an
+    // unlink/relink cannot revive work that was cancelled while it was queued.
+    await env.DB.prepare(`UPDATE notification_outbox AS o SET error_code='unavailable',updated_at=?
+      WHERE o.state='failed' AND o.error_code GLOB 'retry_queued:*' AND NOT EXISTS (
+        SELECT 1 FROM notification_channels c JOIN http_checks h ON h.id=o.check_id
+        JOIN notification_channel_checks cc ON cc.channel_id=c.id AND cc.check_id=h.id
+        WHERE c.id=o.channel_id AND c.enabled=1 AND c.version=o.channel_version
+          AND c.association_version=CAST(substr(o.error_code,14) AS INTEGER)
+          AND h.enabled=1 AND h.config_version=o.check_version)`).bind(now).run()
     // Supersede older transitions, including down→up→down cycles.
     await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='unavailable',updated_at=?
-      WHERE o.state='pending' AND EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND h.transition_suppressed=0 AND ${maintenanceBarrier}
+      WHERE (o.state='pending' OR (o.state='failed' AND o.error_code GLOB 'retry_queued:*')) AND EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND h.transition_suppressed=0 AND ${maintenanceBarrier}
         AND NOT EXISTS (SELECT 1 FROM notification_transition_state ns WHERE ns.check_id=h.id AND ns.check_version=o.check_version AND ns.generation=o.transition_generation))`)
       .bind(now,now,now).run()
     // Do not repeat the last acknowledged status; defer the decision while an earlier send is in flight.
-    await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='unavailable',updated_at=? WHERE o.state='pending'
+    await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='unavailable',updated_at=? WHERE (o.state='pending' OR (o.state='failed' AND o.error_code GLOB 'retry_queued:*'))
       AND EXISTS (SELECT 1 FROM notification_delivery_state d WHERE d.channel_id=o.channel_id AND d.check_id=o.check_id AND d.check_version=o.check_version AND d.channel_version=o.channel_version AND d.status=o.status)
       AND NOT EXISTS (SELECT 1 FROM notification_outbox earlier WHERE earlier.channel_id=o.channel_id AND earlier.check_id=o.check_id AND earlier.state='sending' AND earlier.scheduled_at<o.scheduled_at)`)
       .bind(now).run()
     // A recovery is meaningful only after this channel acknowledged an unhealthy event.
-    await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='unavailable',updated_at=? WHERE o.state='pending' AND o.status='up'
+    await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='unavailable',updated_at=? WHERE (o.state='pending' OR (o.state='failed' AND o.error_code GLOB 'retry_queued:*')) AND o.status='up'
       AND NOT EXISTS (SELECT 1 FROM notification_delivery_state d WHERE d.channel_id=o.channel_id AND d.check_id=o.check_id AND d.check_version=o.check_version AND d.channel_version=o.channel_version AND d.status IN ('down','degraded'))
       AND NOT EXISTS (SELECT 1 FROM notification_outbox earlier WHERE earlier.channel_id=o.channel_id AND earlier.check_id=o.check_id AND earlier.check_version=o.check_version AND earlier.state='sending' AND earlier.status IN ('down','degraded') AND earlier.scheduled_at<o.scheduled_at)`)
       .bind(now).run()
     // An email send may have succeeded before a crash; never retry an expired claim.
     await env.DB.prepare("UPDATE notification_outbox SET state='failed',error_code='delivery_failed',lease_token=NULL,lease_until=NULL,updated_at=? WHERE state='sending' AND lease_until<? AND channel_id IN (SELECT id FROM notification_channels WHERE channel_type='email')").bind(now,now).run()
     await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='delivery_failed',lease_token=NULL,lease_until=NULL,updated_at=?
-      WHERE (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND (o.attempts>=3+o.manual_retry OR (o.created_at<?
+      WHERE (o.state='pending' OR (o.state='failed' AND o.error_code GLOB 'retry_queued:*') OR (o.state='sending' AND o.lease_until<?)) AND (o.attempts>=3+o.manual_retry OR (o.created_at<?
         AND NOT EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance})))`)
       .bind(now,now,now - 3_600_000,now).run()
     await env.DB.prepare("DELETE FROM notification_outbox WHERE id IN (SELECT id FROM notification_outbox WHERE state IN ('sent','failed') AND updated_at<? LIMIT 500)").bind(now - 86_400_000).run()
     await env.DB.prepare('DELETE FROM notification_test_deliveries WHERE id IN (SELECT id FROM notification_test_deliveries WHERE created_at<? LIMIT 500)').bind(now - 86_400_000).run()
-    jobs = (await env.DB.prepare(`SELECT o.id,o.channel_id,o.channel_version,o.check_id,o.check_version,o.scheduled_at,o.status,o.attempts,o.manual_retry,o.transition_generation,c.channel_type FROM notification_outbox o
+    jobs = (await env.DB.prepare(`SELECT o.id,o.channel_id,o.channel_version,o.check_id,o.check_version,o.scheduled_at,o.status,o.attempts,o.manual_retry,o.transition_generation,c.channel_type,c.association_version FROM notification_outbox o
       JOIN http_checks h ON h.id=o.check_id JOIN notification_channels c ON c.id=o.channel_id
-      WHERE h.transition_suppressed=0 AND ${maintenanceBarrier} AND attempts<3+o.manual_retry AND (state='pending' OR (state='sending' AND lease_until<?))
+      WHERE h.transition_suppressed=0 AND ${maintenanceBarrier} AND attempts<3+o.manual_retry AND (state='pending' OR (state='failed' AND o.error_code GLOB 'retry_queued:*') OR (state='sending' AND lease_until<?))
       AND (c.channel_type<>'email' OR ?=1)
       AND NOT EXISTS (SELECT 1 FROM notification_outbox earlier WHERE earlier.channel_id=o.channel_id
-        AND earlier.check_id=o.check_id AND earlier.state IN ('pending','sending')
+        AND earlier.check_id=o.check_id AND (earlier.state IN ('pending','sending') OR (earlier.state='failed' AND earlier.error_code GLOB 'retry_queued:*'))
         AND (earlier.scheduled_at<o.scheduled_at OR (earlier.scheduled_at=o.scheduled_at AND earlier.id<o.id)))
       ORDER BY o.scheduled_at,o.created_at LIMIT 20`).bind(now,now,now,emailReady(env)?1:0).all<Job>()).results
   } catch { return }
@@ -139,9 +148,11 @@ export async function flushChannelDeliveries(env: ChannelEnvironment): Promise<v
     if (job.channel_type === 'email' && !emailReady(env)) continue
     const lease = crypto.randomUUID(), claimedAt = Date.now()
     await env.DB.prepare(`UPDATE notification_outbox AS o SET state='failed',error_code='delivery_failed',lease_token=NULL,lease_until=NULL,updated_at=?
-      WHERE o.id=? AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?
+      WHERE o.id=? AND (o.state='pending' OR (o.state='failed' AND o.error_code GLOB 'retry_queued:*') OR (o.state='sending' AND o.lease_until<?)) AND o.created_at<?
         AND NOT EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance})`).bind(claimedAt,job.id,claimedAt,claimedAt-3_600_000,claimedAt).run()
-    const claim = await env.DB.prepare(`UPDATE notification_outbox AS o SET state='sending',lease_token=?,lease_until=?,attempts=attempts+1,updated_at=? WHERE o.id=? AND o.attempts<3+o.manual_retry AND (o.state='pending' OR (o.state='sending' AND o.lease_until<?))
+    const claim = await env.DB.prepare(`UPDATE notification_outbox AS o SET state='sending',error_code=NULL,lease_token=?,lease_until=?,attempts=attempts+1,updated_at=? WHERE o.id=? AND o.attempts<3+o.manual_retry AND (o.state='pending' OR (o.state='failed' AND o.error_code GLOB 'retry_queued:*' AND EXISTS (
+      SELECT 1 FROM notification_channels c JOIN http_checks h ON h.id=o.check_id JOIN notification_channel_checks cc ON cc.channel_id=c.id AND cc.check_id=h.id
+      WHERE c.id=o.channel_id AND c.enabled=1 AND c.version=o.channel_version AND c.association_version=CAST(substr(o.error_code,14) AS INTEGER) AND h.enabled=1 AND h.config_version=o.check_version)) OR (o.state='sending' AND o.lease_until<?))
       AND (? <> 'email' OR o.attempts=0) AND (o.created_at>=? OR EXISTS (SELECT 1 FROM http_checks h WHERE h.id=o.check_id AND ${overlappedMaintenance}))`)
       .bind(lease,claimedAt+15_000,claimedAt,job.id,claimedAt,job.channel_type,claimedAt-3_600_000,claimedAt).run()
     if (!claim.meta.changes) continue
@@ -170,7 +181,8 @@ export async function flushChannelDeliveries(env: ChannelEnvironment): Promise<v
         .bind(job.id,lease,blockedAt,blockedAt).first()
       if (blocked) result = 'deferred'
     }
-    const state = result === 'sent' ? 'sent' : result === 'unavailable' || (result !== 'deferred' && (job.channel_type === 'email' || job.attempts + 1 >= 3 + job.manual_retry)) ? 'failed' : 'pending'
+    // A deferred manual retry remains invisible to legacy probe versions.
+    const state = result === 'sent' ? 'sent' : result === 'deferred' && job.manual_retry ? 'failed' : result === 'unavailable' || (result !== 'deferred' && (job.channel_type === 'email' || job.attempts + 1 >= 3 + job.manual_retry)) ? 'failed' : 'pending'
     const attempt = env.DB.prepare(`INSERT INTO notification_attempts (delivery_id,attempt_number,completed_at,result)
       SELECT id,attempts,?,? FROM notification_outbox WHERE id=? AND state='sending' AND lease_token=?`)
       .bind(Date.now(),result,job.id,lease)
@@ -184,7 +196,7 @@ export async function flushChannelDeliveries(env: ChannelEnvironment): Promise<v
       ])
     } else {
       const update = env.DB.prepare('UPDATE notification_outbox SET state=?,error_code=?,attempts=attempts-?,lease_token=NULL,lease_until=NULL,updated_at=? WHERE id=? AND lease_token=?')
-        .bind(state,result === 'deferred' ? null : result,result === 'deferred' ? 1 : 0,Date.now(),job.id,lease)
+        .bind(state,result === 'deferred' ? (job.manual_retry ? `retry_queued:${job.association_version}` : null) : result,result === 'deferred' ? 1 : 0,Date.now(),job.id,lease)
       if (result === 'deferred') await update.run()
       else await env.DB.batch([attempt, update])
     }

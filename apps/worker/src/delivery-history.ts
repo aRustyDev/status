@@ -14,7 +14,7 @@ export async function deliveryHistoryAvailable(db: D1Database): Promise<boolean>
 
 const notificationRows = `
   SELECT o.id, o.created_at AS createdAt, o.updated_at AS updatedAt, m.name AS monitorName,
-    o.status AS monitorStatus, o.state, o.channel_id AS channelId, c.name AS channelName,
+    o.status AS monitorStatus, CASE WHEN o.state='failed' AND o.error_code GLOB 'retry_queued:*' THEN 'pending' ELSE o.state END AS state, o.channel_id AS channelId, c.name AS channelName,
     c.channel_type AS channelType, CASE WHEN o.status='up' THEN 'recovery' ELSE 'alert' END AS event,
     o.attempts AS attemptCount, CASE WHEN o.error_code IN ('unavailable','delivery_failed') THEN o.error_code ELSE NULL END AS errorCode,
     CASE WHEN o.state='failed' AND o.attempts=3 AND o.manual_retry=0 AND o.error_code='delivery_failed'
@@ -112,7 +112,9 @@ async function retryNotification(db: D1Database, env: HistoryEnvironment, actor:
     db.prepare(`INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details)
       SELECT ?,?,'retry','notification_delivery',?,?, '{}' WHERE EXISTS (SELECT 1 FROM notification_outbox WHERE ${eligibility})`)
       .bind(crypto.randomUUID(),actor.email,id,now,...args),
-    db.prepare(`UPDATE notification_outbox SET state='pending',manual_retry=1,error_code=NULL,updated_at=? WHERE ${eligibility}`).bind(now,...args),
+    // Keep the queued retry invisible to older probe versions until a compatible
+    // probe claims it. Legacy probes treat pending rows with three attempts as failed.
+    db.prepare(`UPDATE notification_outbox SET manual_retry=1,error_code='retry_queued:' || (SELECT association_version FROM notification_channels WHERE id=notification_outbox.channel_id),updated_at=? WHERE ${eligibility}`).bind(now,...args),
   ])
   if (!result[1]?.meta.changes) return json({error:'Delivery is no longer eligible for retry'},409)
   return json({ok:true})

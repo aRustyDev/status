@@ -1,5 +1,5 @@
 // Adapts the incorporated upstream Delivery History page for Workers delivery records.
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import { Alert, DataTable, DataTh, EmptyTableRow, ErrorState, LoadingState, PageContainer, PageHeader, Pagination, formatDateTime } from '@better-forge/ui'
@@ -36,11 +36,17 @@ function HistoryTab({ tab }: { tab: Tab }) {
   if (event) params.set('event', event)
   const path = `/admin/delivery-history/${tab}`
   const list = useQuery<List>({ queryKey: ['delivery-history', tab, page, status, source, event], queryFn: () => api.get(`${path}?${params}`), refetchInterval: 30_000 })
-  const detail = useQuery<Delivery>({ queryKey: ['delivery-history-detail', tab, expanded], queryFn: () => api.get(`${path}/${encodeURIComponent(expanded!)}`), enabled: expanded !== null })
+  const detail = useQuery<Delivery>({ queryKey: ['delivery-history-detail', tab, expanded], queryFn: () => api.get(`${path}/${encodeURIComponent(expanded!)}`), enabled: expanded !== null, refetchInterval: 30_000 })
+  useEffect(() => {
+    if (list.data && page > list.data.pages) {
+      setPage(list.data.pages)
+      setExpanded(null)
+    }
+  }, [list.data, page])
   const retry = useMutation({
     mutationFn: (id: string) => api.post(`${path}/${encodeURIComponent(id)}/retry`, {}),
     onSuccess: async () => { setRetryError(false); await Promise.all([qc.invalidateQueries({ queryKey: ['delivery-history', tab] }), qc.invalidateQueries({ queryKey: ['delivery-history-detail', tab] })]) },
-    onError: () => setRetryError(true),
+    onError: async () => { setRetryError(true); await Promise.all([qc.invalidateQueries({ queryKey: ['delivery-history', tab] }), qc.invalidateQueries({ queryKey: ['delivery-history-detail', tab] })]) },
   })
   function changeFilter(setter: (value: string) => void, value: string) {
     setter(value)
@@ -61,11 +67,11 @@ function HistoryTab({ tab }: { tab: Tab }) {
         <option value="">All events</option>{['alert', 'recovery', 'test'].map(value => <option key={value} value={value}>{label(value)}</option>)}
       </select>}
     </div>
-    {retryError && <Alert tone="error">Could not queue the retry. Refresh the delivery and check that it is still eligible.</Alert>}
+    {retryError && <Alert tone="error">Could not queue the retry. Check that the delivery is still eligible.</Alert>}
     <div className="rounded-2xl overflow-hidden" style={{ background: 'var(--m3-surface-container-low)', border: '1px solid var(--m3-outline-variant)' }}>
       {list.isLoading ? <LoadingState label="Loading delivery history…" /> : list.isError ? <ErrorState message="Could not load delivery history." onRetry={() => void list.refetch()} /> : <div className="overflow-x-auto"><DataTable className="w-full text-sm min-w-[700px]">
         <thead><tr>{['Time', 'Monitor', notification ? 'Channel' : 'Action', notification ? 'Event' : 'Monitor status', ...(notification ? ['Attempts'] : []), 'Status', ''].map((heading, index) => <DataTh key={heading || index} className="px-4 py-3 text-left">{heading || <span className="sr-only">Details</span>}</DataTh>)}</tr></thead>
-        <tbody>{list.data?.items.map(item => <DeliveryRows key={item.id} item={item} notification={notification} expanded={expanded === item.id} detail={expanded === item.id ? detail : null} retrying={retry.isPending} onToggle={() => { setExpanded(expanded === item.id ? null : item.id); setRetryError(false) }} onRetry={() => retry.mutate(item.id)} />)}
+        <tbody>{list.data?.items.map(item => <DeliveryRows key={item.id} item={item} notification={notification} expanded={expanded === item.id} detail={expanded === item.id ? detail : null} retrying={retry.isPending || detail.isFetching} onToggle={() => { setExpanded(expanded === item.id ? null : item.id); setRetryError(false) }} onRetry={() => retry.mutate(item.id)} />)}
           {!list.data?.items.length && <EmptyTableRow colSpan={notification ? 7 : 6} icon="outbox" title="No deliveries found" />}
         </tbody>
       </DataTable></div>}
