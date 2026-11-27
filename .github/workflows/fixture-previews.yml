@@ -18,6 +18,7 @@ permissions:
 jobs:
   deploy:
     if: vars.FIXTURE_PREVIEW_ENABLED == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.branch != '' && inputs.sha != ''))
+    secrets: inherit
     uses: aRustyDev/status/.github/workflows/deploy.yml@3e08bf162be6b1c6b5371df91c4886da83de1afc
     with:
       fixture: true
@@ -28,6 +29,7 @@ jobs:
     permissions:
       contents: read
       actions: write
+    secrets: inherit
     uses: aRustyDev/status/.github/workflows/reconcile.yml@3e08bf162be6b1c6b5371df91c4886da83de1afc
     with:
       fixture: true
