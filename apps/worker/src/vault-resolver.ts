@@ -41,7 +41,7 @@ async function decrypt(db: D1Database, key: string | undefined, ref: Reference, 
   }
 }
 
-/** Resolve only the Basic credential configured on this exact saved check version. */
+/** Resolve only the authentication credential configured on this exact saved check version. */
 export async function resolveMonitorCredentialSnapshot(db: D1Database, key: string | undefined, checkId: string, configVersion: number): Promise<MonitorCredentialSnapshot | null> {
   if (!checkId || !Number.isSafeInteger(configVersion) || configVersion < 1) return null
   try {
@@ -52,9 +52,12 @@ export async function resolveMonitorCredentialSnapshot(db: D1Database, key: stri
     if (!config || typeof config !== 'object' || Array.isArray(config)) return null
     const auth = (config as Record<string, unknown>).auth
     if (!auth || typeof auth !== 'object' || Array.isArray(auth)) return null
-    const { type, basic } = auth as Record<string, unknown>
-    if (type !== 'basic' || !basic || typeof basic !== 'object' || Array.isArray(basic)) return null
-    const ref = reference((basic as Record<string, unknown>).vault)
+    const record = auth as Record<string, unknown>
+    const type = record.type
+    if (type !== 'basic' && type !== 'oauth2' && type !== 'cas') return null
+    const section = record[type]
+    if (!section || typeof section !== 'object' || Array.isArray(section)) return null
+    const ref = reference((section as Record<string, unknown>).vault)
     if (!ref) return null
     const decrypted = await decrypt(db, key, ref, 'userpass')
     const result = decrypted?.data

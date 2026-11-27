@@ -1,0 +1,19 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "status-cas-probe",
+  "main": "src/cas-worker.ts",
+  "compatibility_date": "2026-11-23",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": false, "logs": { "enabled": false }, "traces": { "enabled": false } },
+  "env": {
+    "staging": {
+      "name": "status-cas-probe-staging",
+      "workers_dev": false,
+      "preview_urls": false,
+      "vars": { "ENDPOINTS": "[]" },
+      "d1_databases": [{ "binding": "DB", "database_name": "status-board-staging", "database_id": "REPLACE_STAGING_D1_ID", "migrations_dir": "../worker/migrations" }],
+      "vpc_services": []
+    }
+  }
+}
