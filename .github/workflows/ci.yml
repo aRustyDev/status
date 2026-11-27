@@ -171,7 +171,7 @@ jobs:
         run: node --import tsx --test apps/gateway/test/*.test.mts
 
       - name: Staging preview tests
-        run: node --test scripts/preview-browser.test.mjs scripts/preview/*.test.mjs
+        run: node --test scripts/preview-browser.test.mjs scripts/preview/*.test.mjs apps/gateway/preview-subscriber-scheduler.test.mjs
 
       - name: Fallback routing tests
         run: node --import tsx --test apps/fallback/test/*.test.mts
