@@ -1,0 +1,15 @@
+{
+  "name": "@arustydev/branch-previews",
+  "version": "1.0.0-rc.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --import ./test/setup.mjs --test src/*.test.mjs test/*.test.mjs"
+  },
+  "dependencies": {
+    "esbuild": "0.25.12",
+    "jose": "6.2.12",
+    "wrangler": "4.166.0",
+    "yaml": "2.9.1"
+  }
+}

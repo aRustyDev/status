@@ -1,0 +1,45 @@
+name: Branch preview controller
+description: Build, verify, deploy or reconcile private branch previews
+inputs:
+  operation:
+    description: 'check, build, deploy, or reconcile'
+    required: true
+  config:
+    description: Path relative to the trusted consumer checkout
+    default: .github/previews.yml
+outputs:
+  ci_run_id:
+    value: ${{ steps.controller.outputs.ci_run_id }}
+    description: Verified source CI run ID
+  url:
+    value: ${{ steps.controller.outputs.url }}
+    description: Authenticated preview URL
+  header_name:
+    value: ${{ steps.controller.outputs.header_name }}
+    description: Request header selecting the branch
+  selector:
+    value: ${{ steps.controller.outputs.selector }}
+    description: Preview header value
+  sha:
+    value: ${{ steps.controller.outputs.sha }}
+    description: Verified commit
+  environment:
+    value: ${{ steps.controller.outputs.environment }}
+    description: Selected database environment
+runs:
+  using: composite
+  steps:
+    - name: Install pinned controller dependencies
+      shell: bash
+      run: npm ci --ignore-scripts --no-audit --no-fund --prefix "$GITHUB_ACTION_PATH"
+    - name: Extract the verified run's deploy artifact
+      if: inputs.operation == 'deploy'
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/src/unpack.py" "$PREVIEW_ARCHIVE" "$PREVIEW_ARTIFACT_DIR"
+    - name: Run preview controller
+      id: controller
+      shell: bash
+      env:
+        PREVIEW_ACTION: ${{ inputs.operation }}
+        PREVIEW_MANIFEST: ${{ inputs.config }}
+      run: node "$GITHUB_ACTION_PATH/src/cli.mjs"
