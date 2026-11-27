@@ -13,8 +13,14 @@ import { actionApi, ActionError } from './actions'
 import { actionEndpoints, type ActionEnvironment } from './actions-runtime'
 import { checkFallback, FallbackConflictError, getFallback, publishFallback, saveFallback } from './static-fallback'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
+import { bootstrapPreviewUser } from './issue14-preview-user'
+import { ensureIssue14VaultFixture } from '../../gateway/issue14-vault-fixture'
 
 interface Env extends EmailChannelEnv {
+  API_SCOPE?: string
+  PREVIEW_SUBSCRIBER_REQUIRED?: string
+  PREVIEW_SUBSCRIBER_SCOPE?: string
+  PREVIEW_RELEASE?: string
   DB: D1Database
   VAULT_ENCRYPTION_KEY?: string
   MONITOR_AUTH_READY?: string
@@ -155,8 +161,13 @@ async function authenticate(request: Request, env: Env): Promise<User> {
     email = payload.email
   } catch { throw new HttpError(401, 'Invalid Access identity') }
   await env.DB.prepare('INSERT INTO users (id, issuer, subject, email) VALUES (?, ?, ?, ?) ON CONFLICT(issuer, subject) DO UPDATE SET email=excluded.email').bind(id(), issuer, subject, email).run()
-  const user = await env.DB.prepare('SELECT * FROM users WHERE issuer=? AND subject=?').bind(issuer, subject).first<User>()
+  let user = await env.DB.prepare('SELECT * FROM users WHERE issuer=? AND subject=?').bind(issuer, subject).first<User>()
   if (!user) throw new Error('User lookup failed')
+  if (await bootstrapPreviewUser(env, user)) {
+    user = await env.DB.prepare('SELECT * FROM users WHERE issuer=? AND subject=?').bind(issuer, subject).first<User>()
+    if (!user) throw new Error('User lookup failed')
+    await ensureIssue14VaultFixture(env, user)
+  }
   return user
 }
 function requireRole(user: User, role: Role) {

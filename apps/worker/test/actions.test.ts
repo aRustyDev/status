@@ -5,6 +5,7 @@ import {readFileSync} from 'node:fs'
 import {vaultApi} from '../src/vault.ts'
 import {actionApi,ActionError} from '../src/actions.ts'
 import {enqueueActionTransition,flushActions,type ActionEnvironment} from '../src/actions-runtime.ts'
+import {issue14PreviewEnvironment} from '../../gateway/issue14-preview.ts'
 class Statement {
   private values:unknown[]=[]
   constructor(private sql:string,private db:DatabaseSync) {}
@@ -67,6 +68,20 @@ test('actions use saved scoped credentials at an approved HTTPS target',async()=
  assert.equal(job.state,'completed')
  const audit=x.local.db.prepare("SELECT details FROM audit_events WHERE entity_type='action'").all()
  assert.doesNotMatch(JSON.stringify(audit),/fixture-token|private response/)
+})
+
+test('isolated preview action fails closed without any outbound request',async()=>{
+ const x=await setup()
+ const env=issue14PreviewEnvironment({...x.env, API_SCOPE:'operations',PREVIEW_SUBSCRIBER_REQUIRED:'true',PREVIEW_SUBSCRIBER_SCOPE:'737597c9ba1d3cc17826ea2f2b48a9d259e03dbf1acd241dc62d886da5c20511',PREVIEW_RELEASE:'a'.repeat(40)}) as ActionEnvironment
+ await actionApi(request('PATCH',{...x.actionBody,endpointId:'issue14-isolated-sink',version:x.action.version}),env,actor,`/admin/actions/${x.action.id}`)
+ await queue(x)
+ let externalCalls=0
+ const originalFetch=globalThis.fetch
+ globalThis.fetch=(async()=>{externalCalls++;throw new Error('network request forbidden')}) as typeof fetch
+ try { await flushActions(env) } finally { globalThis.fetch=originalFetch }
+ assert.equal(externalCalls,0)
+ assert.equal(x.calls.length,0)
+ assert.equal((x.local.db.prepare('SELECT state FROM worker_action_outbox').get() as {state:string}).state,'unavailable')
 })
 
 test('action saves atomically fence the selected monitor identity and check version',async()=>{

@@ -35,7 +35,9 @@ export default function CloudflareActions() {
       <Link to={deliveryHistoryUrl('actions')} className="btn btn-secondary"><span className="material-symbols-outlined" aria-hidden="true">history</span> Run history</Link>
       <button type="button" className="btn btn-primary" onClick={() => setEditing('new')}><span className="material-symbols-outlined" aria-hidden="true">add</span> Add Action</button>
     </>} />
-    <Alert tone="info">Actions send approved HTTPS requests using Vault credentials. Link actions to monitors and configure delays and cooldowns in the monitor editor. Each event is attempted at most once.</Alert>
+    {destinations.data?.some(destination => destination.id === 'issue14-isolated-sink')
+      ? <Alert tone="warning">Isolated preview for editor testing only. Actions do not execute here. Use only synthetic Vault values; do not enter real secrets.</Alert>
+      : <Alert tone="info">Actions send approved HTTPS requests using Vault credentials. Link actions to monitors and configure delays and cooldowns in the monitor editor. Each event is attempted at most once.</Alert>}
     {message && !removing && <p role="alert">{message}</p>}
     {actions.isLoading ? <LoadingState label="Loading actions…" /> : actions.isError ? <ErrorState message="Could not load actions." onRetry={() => void actions.refetch()} /> :
       <div className="rounded-2xl overflow-x-auto" style={{background:'var(--m3-surface-container-low)',border:'1px solid var(--m3-outline-variant)'}}>
