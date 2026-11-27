@@ -71,6 +71,12 @@ export function isolatedFallbackSettings(settings) {
     apiVars:{}, statusApiVars:{}, monitoringVars:{}, probeVars:{} }
 }
 
+// Both enabled fixtures and their fallback releases must discard inherited
+// integrations before trusted release-local bindings are added by the controller.
+export function settingsForFixture(settings, fixture) {
+  return fixture.enabled || fixture.isolatedFallback ? isolatedFallbackSettings(settings) : settings
+}
+
 // The derivation root remains in the controller. Feature Workers receive only
 // their own release key, never a staging key or another release's key.
 function derive(root, selector, sha, purpose) {

@@ -6,7 +6,7 @@ import test from 'node:test'
 import { createBranchConfigs, deployBranchWorkers } from './branch-workers.mjs'
 import { installation } from './installation.mjs'
 import { createFixtureSchedulingConfigs } from './fixture-scheduling-config.mjs'
-import { isolatedFallbackSettings } from './fixture-policy.mjs'
+import { isolatedFallbackSettings, settingsForFixture } from './fixture-policy.mjs'
 
 const settings = { d1DatabaseId: 'id', d1DatabaseName: 'db', accessTeamDomain: 'access', accessAud: 'aud', endpoints: '[]', apiVars: { SUBSCRIBERS_READY: 'true' } }
 const selector = 'branch-' + 'a'.repeat(24)
@@ -70,8 +70,18 @@ test('isolated fixtures use only release-owned Workers and the owned database', 
   try {
     const app=installation(),ref='refs/heads/schema/fixture', select=`branch-${app.branchKey(ref)}`,stem=app.workerStem(select,sha)
     const scheduling=createFixtureSchedulingConfigs({ref,selector:select,sha,database:{id:'id',name:app.schemaStem(ref,sha)+'-upgrade',owned:true},inventoryDatabase:{id:'inventory',name:'inventory'},sharedDatabaseIds:['dev','stage','prod'],flagshipAppId:'flagship',runtimeDir:'/trusted/runtime',probeName:`${stem}-probe`,dir,expiresAt:Date.now()+60000})
-    const fixtureSettings = { ...settings, databaseOwned: true, isolatedFixture: { source: '/trusted/fixture.mjs', casSource: '/feature/workers/cas.mjs',expiresAt:Number(scheduling.configs.fence.vars.PREVIEW_FIXTURE_EXPIRES_AT),wrappers:{fixture:path.join(dir,'trusted-fixture.mjs')} },internalScheduling:scheduling }
+    // Schema snapshots may inherit shared service and resource bindings. The
+    // fixture controller must strip these before adding its trusted bindings.
+    const snapshotSettings = { ...settings, endpoints:'shared', extraServices:{probe:[{binding:'GATUS',service:'shared'}]}, resourceBindings:{api:{send_email:[{name:'EMAIL'}]},probe:{r2_buckets:[{binding:'SHARED',bucket_name:'shared'}]}}, vpcServices:[{binding:'SHARED',service_id:'shared'}], apiVars:{ACTIONS_READY:'true',EMAIL_READY:'true'}, statusApiVars:{EMAIL_READY:'true'},monitoringVars:{MONITOR_AUTH_READY:'true'},probeVars:{ACTIONS_READY:'true'} }
+    const fixtureSettings = { ...settingsForFixture(snapshotSettings,{enabled:true}), databaseOwned: true, isolatedFixture: { source: '/trusted/fixture.mjs', casSource: '/feature/workers/cas.mjs',expiresAt:Number(scheduling.configs.fence.vars.PREVIEW_FIXTURE_EXPIRES_AT),wrappers:{fixture:path.join(dir,'trusted-fixture.mjs')} },internalScheduling:scheduling }
     const { names, order } = createBranchConfigs({ settings: fixtureSettings, selector:select, sha, branchDir: '/feature', dir })
+    for (const id of order) {
+      const config=JSON.parse(readFileSync(path.join(dir,`${id}.json`)))
+      assert.equal(config.send_email,undefined)
+      assert.equal(config.r2_buckets,undefined)
+      assert.ok(!(config.vpc_services||[]).length)
+      assert.ok((config.services||[]).every(service=>Object.values(names).includes(service.service)))
+    }
     assert.deepEqual(order.slice(0, 4), ['fence', 'fixture', 'cas', 'probe'])
     for (const id of ['fixture', 'cas']) {
       const config = JSON.parse(readFileSync(path.join(dir, `${id}.json`)))
@@ -86,6 +96,8 @@ test('isolated fixtures use only release-owned Workers and the owned database', 
     const api = JSON.parse(readFileSync(path.join(dir, 'api.json')))
     assert.deepEqual(probe.services.filter(s => ['PREVIEW_FIXTURE', 'CAS_PROBE'].includes(s.binding)), [{ binding: 'PREVIEW_FIXTURE', service: names.fixture }, { binding: 'CAS_PROBE', service: names.cas }])
     assert.equal(api.vars.ACTIONS_READY, 'true')
+    assert.equal(api.vars.ACCESS_TEAM_DOMAIN,'access')
+    assert.equal(api.vars.ACCESS_AUD,'aud')
     assert.equal(JSON.parse(api.vars.ACTION_ENDPOINTS)[0].serviceId, names.fixture)
     assert.equal(JSON.parse(api.vars.ENDPOINTS)[1].authProviders.cas.url, 'https://preview-fixture.invalid/cas/v1/tickets')
     assert.deepEqual(JSON.parse(readFileSync(path.join(dir,'fixture.json'))).services,[{binding:'PREVIEW_FENCE',service:names.fence}])
