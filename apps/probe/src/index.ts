@@ -276,6 +276,9 @@ export async function runChecks(scheduledTime: number, env: Environment): Promis
 
 export default {
   async fetch(request: Request, env: Environment): Promise<Response> {
+    // Branch-only isolated Actions preview: on-demand monitor tests must not
+    // become an Action dispatch path even if preview settings drift.
+    env = { ...env, ACTIONS_READY: 'false', ACTION_ENDPOINTS: undefined }
     if (request.method !== 'POST' || new URL(request.url).pathname !== '/test') return new Response('Not found', { status: 404 })
     const reader = request.body?.getReader()
     if (!reader) return Response.json({ error: 'Invalid test request' }, { status: 400 })
@@ -325,6 +328,8 @@ export default {
     return Response.json({ overall: result.status === 'up' ? 'ok' : 'error', steps, totalMs: Date.now() - startedAt })
   },
   async scheduled(controller: ScheduledController, env: Environment): Promise<void> {
-    await runChecks(controller.scheduledTime, env)
+    // The isolated preview's editor is available for CRUD only. Never queue or
+    // dispatch Actions from the preview probe, even with a misconfigured flag.
+    await runChecks(controller.scheduledTime, { ...env, ACTIONS_READY: 'false', ACTION_ENDPOINTS: undefined })
   },
 }

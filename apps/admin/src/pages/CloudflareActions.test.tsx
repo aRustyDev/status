@@ -22,6 +22,12 @@ beforeEach(()=>{
  })
 })
 describe('Cloudflare actions',()=>{
+ it('warns when the isolated fixture destination is configured',async()=>{
+  vi.mocked(api.get).mockImplementation(async path=>path==='/admin/actions/destinations'?[{id:'issue14-isolated-sink',name:'Issue 14 isolated sink'}]:[])
+  setup()
+  expect(await screen.findByText(/Isolated preview for editor testing only/)).toHaveTextContent('Actions do not execute here')
+  expect(screen.getByText(/Isolated preview for editor testing only/)).toHaveTextContent('do not enter real secrets')
+ })
  it('saves only a Vault reference, approved target and monitor trigger',async()=>{
   const user=setup();await user.click(await screen.findByRole('button',{name:'Add Action'}));const form=screen.getByRole('dialog')
   await user.type(within(form).getByLabelText('Action name'),'Recover service')

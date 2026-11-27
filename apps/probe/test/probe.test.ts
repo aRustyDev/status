@@ -60,6 +60,26 @@ function fixture(count = 1, withAutomation = true) {
   return { sqlite, now, sync, env: { DB: db, ENDPOINTS: JSON.stringify(endpoints) } }
 }
 
+test('isolated preview probe never enqueues or dispatches Actions even if configured ready', async () => {
+  const { sqlite, now, env } = fixture()
+  sqlite.prepare("INSERT INTO worker_actions (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,trigger_status,created_at,updated_at) VALUES ('a','Preview action','sink','fingerprint',1,1,'down',0,0)").run()
+  sqlite.prepare("INSERT INTO worker_action_checks (action_id,check_id) VALUES ('a','check-0')").run()
+  sqlite.prepare("INSERT INTO automation_transition_state (check_id,check_version,status) VALUES ('check-0',1,'up')").run()
+  sqlite.prepare("INSERT INTO worker_action_outbox (id,action_id,action_version,check_id,check_version,scheduled_at,status,created_at,updated_at) VALUES ('pending','a',1,'check-0',1,?,'down',?,?)").run(now-60_000,Date.now(),Date.now())
+  const destinations = JSON.stringify([{id:'sink',name:'Sink',url:'https://sink.invalid/',binding:'SINK',serviceId:'sink'}])
+  let actionCalls = 0
+  const runtime = {...env,ACTIONS_READY:'true',ACTION_ENDPOINTS:destinations,SINK:{fetch:async()=>{actionCalls++;return new Response(null,{status:204})}}}
+  globalThis.fetch = async () => new Response(null,{status:500})
+  const request = new Request('https://probe.internal/test',{method:'POST',body:JSON.stringify({endpointId:'endpoint-0',expectedStatus:200,advancedConfig:null})})
+  assert.equal((await worker.fetch(request,runtime as never)).status,200)
+  assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM http_check_results').get()?.n,0)
+  await worker.scheduled({scheduledTime:now} as never,runtime as never)
+  assert.equal(sqlite.prepare('SELECT effective_status FROM http_check_results').get()?.effective_status,'down')
+  assert.deepEqual(sqlite.prepare('SELECT id,state FROM worker_action_outbox').all().map(row=>({...row})),[{id:'pending',state:'pending'}])
+  assert.equal(actionCalls,0)
+  sqlite.close()
+})
+
 test('draft tests use the approved endpoint and do not record a check result', async () => {
   const { sqlite, env } = fixture()
   let calls = 0
