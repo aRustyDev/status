@@ -4,13 +4,7 @@ Install the repository dependencies and Playwright's Chromium browser. Obtain th
 
 ```sh
 npx playwright install chromium
-node scripts/preview-browser.mjs https://status.sow.foo/ 1.0123456789abcdef0123456789abcdef
-```
-
-For an automatically deployed branch preview, use its branch selector instead:
-
-```sh
-node scripts/preview-browser.mjs https://status.sow.foo/ branch-0123456789abcdef01234567
+node .github/actions/branch-previews/preview-browser.mjs https://status.sow.foo/ branch-0123456789abcdef01234567
 ```
 
 Replace the example URL and selector with the values returned by the deployment workflow. Sign in through Cloudflare Access in the browser window. The launcher sends the selector to the specified HTTPS origin on navigation, asset, and API requests. Each invocation opens a separate browser profile, so two previews can be used side by side. Closing the browser removes its temporary profile and extension.

@@ -171,7 +171,7 @@ jobs:
         run: node --import tsx --test apps/gateway/test/*.test.mts
 
       - name: Staging preview tests
-        run: node --test scripts/preview-browser.test.mjs scripts/preview/*.test.mjs apps/gateway/preview-subscriber-scheduler.test.mjs
+        run: node --test .github/actions/branch-previews/preview-browser.test.mjs
 
       - name: Branch preview controller tests
         run: |

@@ -40,61 +40,11 @@
           "service": "status-monitoring-api-staging"
         },
         {
-          "binding": "PREVIEW_1_A",
-          "service": "status-preview-1-a-gateway"
-        },
-        {
-          "binding": "PREVIEW_1_B",
-          "service": "status-preview-1-b-gateway"
-        },
-        {
-          "binding": "PREVIEW_2_A",
-          "service": "status-preview-2-a-gateway"
-        },
-        {
-          "binding": "PREVIEW_2_B",
-          "service": "status-preview-2-b-gateway"
-        },
-        {
-          "binding": "PREVIEW_3_A",
-          "service": "status-preview-3-a-gateway"
-        },
-        {
-          "binding": "PREVIEW_3_B",
-          "service": "status-preview-3-b-gateway"
-        },
-        {
-          "binding": "PREVIEW_4_A",
-          "service": "status-preview-4-a-gateway"
-        },
-        {
-          "binding": "PREVIEW_4_B",
-          "service": "status-preview-4-b-gateway"
-        },
-        {
-          "binding": "PREVIEW_5_A",
-          "service": "status-preview-5-a-gateway"
-        },
-        {
-          "binding": "PREVIEW_5_B",
-          "service": "status-preview-5-b-gateway"
-        },
-        {
-          "binding": "PREVIEW_6_A",
-          "service": "status-preview-6-a-gateway"
-        },
-        {
-          "binding": "PREVIEW_6_B",
-          "service": "status-preview-6-b-gateway"
+          "binding": "PREVIEW_DISPATCHER",
+          "service": "status-preview-dispatcher"
         }
       ],
-      "routes": [],
-      "flagship": [
-        {
-          "binding": "FLAGS",
-          "app_id": "REPLACE_STAGING_FLAGSHIP_APP_ID"
-        }
-      ]
+      "routes": []
     }
   }
 }

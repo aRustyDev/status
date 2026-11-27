@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { previewRule } from './preview-browser.mjs'
 
-const selector = '1.0123456789abcdef0123456789abcdef'
+const selector = 'branch-0123456789abcdef01234567'
 const branchSelector = 'branch-0123456789abcdef01234567'
 
 test('preview header matches only the configured HTTPS origin', () => {
