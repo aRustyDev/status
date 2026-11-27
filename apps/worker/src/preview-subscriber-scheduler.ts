@@ -1,7 +1,8 @@
-import { subscriberAddressApproved, subscriberEmailReady, subscriberScope, type SubscriberEnv } from './subscribers'
+import { subscriberAddressApproved, subscriberEmailReady, subscriberScope, type SubscriberEnv, type PreviewDeliveryContext } from './subscribers'
 
 // Trusted preview deployment tooling enables a cron only for this contract.
 export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT = 2
+export const PREVIEW_BRANCH_DELIVERY_CONTEXT_CONTRACT = 1
 
 /** Dispatch only this live slot lease; never invoke the shared fallback scheduler. */
 export async function flushPreviewSubscriberDeliveries(env: SubscriberEnv & { SUBSCRIBERS_READY?: string }, authorize?: () => Promise<boolean>): Promise<void> {
@@ -70,7 +71,8 @@ export async function flushPreviewSubscriberDeliveries(env: SubscriberEnv & { SU
     let sent = false
     try {
       const text = `A status update has been published. Visit ${env.SUBSCRIBER_PUBLIC_URL!} to view it or manage your subscription.`
-      await env.SUBSCRIBER_EMAIL!.send({from:env.SUBSCRIBER_EMAIL_FROM!,to:final.email,subject:'Status page update',text})
+      await env.SUBSCRIBER_EMAIL!.send({from:env.SUBSCRIBER_EMAIL_FROM!,to:final.email,subject:'Status page update',text,
+        ...(env.PREVIEW_BRANCH_DELIVERY_CONTEXT === 'true' ? {previewDelivery:{id:job.id,scope,leaseToken:lease} satisfies PreviewDeliveryContext} : {})})
       sent = true
     } catch { /* Record only a generic failure code. */ }
     const finishedAt = Date.now()
