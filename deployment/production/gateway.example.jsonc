@@ -1,0 +1,40 @@
+{
+  "account_id": "REPLACE_ACCOUNT_ID",
+  "compatibility_date": "2026-11-23",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": false
+    }
+  },
+  "name": "REPLACE_GATEWAY_WORKER_NAME",
+  "main": "../../apps/gateway/index.ts",
+  "vars": {
+    "UI_MODE": "upstream"
+  },
+  "services": [
+    {
+      "binding": "API",
+      "service": "REPLACE_OPERATIONS_WORKER_NAME"
+    },
+    {
+      "binding": "STATUS_UI",
+      "service": "REPLACE_STATUS_UI_WORKER_NAME"
+    },
+    {
+      "binding": "ADMIN_UI",
+      "service": "REPLACE_ADMIN_UI_WORKER_NAME"
+    },
+    {
+      "binding": "STATUS_API",
+      "service": "REPLACE_STATUS_API_WORKER_NAME"
+    },
+    {
+      "binding": "MONITORING_API",
+      "service": "REPLACE_MONITORING_API_WORKER_NAME"
+    }
+  ],
+  "routes": []
+}

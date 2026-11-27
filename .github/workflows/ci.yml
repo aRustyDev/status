@@ -158,6 +158,7 @@ jobs:
           npm run typecheck -w @status/worker
           npm run typecheck -w @status/probe
           npx tsc --noEmit -p apps/fallback
+          npx tsc --noEmit -p apps/gateway/private-bridge
 
       - name: Worker API and signing-key tests using local D1 and workerd
         env:
@@ -175,6 +176,9 @@ jobs:
 
       - name: Fallback routing tests
         run: node --import tsx --test apps/fallback/test/*.test.mts
+
+      - name: Private bridge and Gatus catalog tests
+        run: node --import tsx --test apps/gateway/private-bridge/*.test.mts scripts/gatus-catalog/*.test.mts
 
       - name: Install Playwright browser
         run: npx playwright install --with-deps chromium
