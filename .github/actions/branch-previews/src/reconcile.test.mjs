@@ -72,3 +72,56 @@ test('deleted branch leaves an ambiguous activation and active route untouched',
   assert.match(result.errors[0].message, /operator reconciliation/)
   assert.equal(record.active.sha, 'b'.repeat(40))
 })
+
+test('deleted branch with an ambiguous subscriber activation revokes both releases before reporting it', async () => {
+  const ref = 'refs/heads/schema/deleted'
+  const active = {sha:'b'.repeat(40),resources:{workers:{subscriber:'old'}}}
+  const candidate = {sha:'a'.repeat(40),phase:'activating',resources:{workers:{subscriber:'new'}}}
+  const record = {ref,selector:'branch-'+'f'.repeat(24),candidate,active}
+  let revoked = []
+  const result = await reconcilePreviews({
+    branches:{list:async()=>[],head:async()=>null},store:{list:async()=>[{record}]},
+    revokeAmbiguousSubscribers:async (_record,releases)=>{revoked = releases.map(release => release.sha)},
+    retire:async()=>assert.fail('routing remains ambiguous'),ciStatus:async()=>assert.fail(),dispatchCi:async()=>assert.fail(),dispatchPreview:async()=>assert.fail(),
+  })
+  assert.deepEqual(revoked,[active.sha,candidate.sha])
+  assert.match(result.errors[0].message,/operator reconciliation/)
+})
+
+test('deleted branch with ambiguous fixture activation drains execution without changing the route', async () => {
+  const ref='refs/heads/schema/deleted', selector='branch-'+'f'.repeat(24)
+  const active={sha:'b'.repeat(40),resources:{workers:{subscriber:'legacy',fence:'old-fence'}}}
+  const candidate={sha:'a'.repeat(40),phase:'activating',resources:{workers:{fence:'new-fence'}}}
+  const record={ref,selector,active,candidate}
+  const events=[]
+  const result=await reconcilePreviews({
+    branches:{list:async()=>[],head:async()=>null},store:{list:async()=>[{record}]},
+    revokeAmbiguousSubscribers:async()=>events.push('revoke-legacy'),
+    drainAmbiguousExecution:async(r,releases)=>{assert.equal(r,record);assert.deepEqual(releases,[active,candidate]);events.push('drain-central')},
+    retire:async()=>assert.fail('ambiguous route must stay untouched'),ciStatus:async()=>assert.fail(),dispatchCi:async()=>assert.fail(),dispatchPreview:async()=>assert.fail(),
+  })
+  assert.deepEqual(events,['drain-central','revoke-legacy'])
+  assert.match(result.errors[0].message,/operator reconciliation/)
+})
+
+test('ambiguous deletion attempts both independent fences even if one fails', async () => {
+  const ref='refs/heads/schema/deleted', record={ref,selector:'branch-'+'e'.repeat(24),active:{sha:'b'.repeat(40),resources:{workers:{subscriber:'legacy'}}},candidate:{sha:'a'.repeat(40),phase:'activating',resources:{workers:{fence:'owned'}}}}
+  const events=[]
+  const result=await reconcilePreviews({branches:{list:async()=>[],head:async()=>null},store:{list:async()=>[{record}]},
+    drainAmbiguousExecution:async()=>{events.push('central');throw new Error('central still leased')},
+    revokeAmbiguousSubscribers:async()=>{events.push('legacy');throw new Error('legacy unavailable')},
+    retire:async()=>assert.fail(),ciStatus:async()=>assert.fail(),dispatchCi:async()=>assert.fail(),dispatchPreview:async()=>assert.fail()})
+  assert.deepEqual(events,['central','legacy'])
+  assert.match(result.errors[0].message,/central still leased; legacy unavailable/)
+})
+
+test('ambiguous fixture drain fails closed when missing or branch is recreated', async () => {
+  const ref='refs/heads/feat/deleted', record={ref,selector:'branch-'+'e'.repeat(24),candidate:{sha:'a'.repeat(40),phase:'activating',resources:{workers:{fence:'owned'}}}}
+  const common={store:{list:async()=>[{record}]},retire:async()=>assert.fail(),ciStatus:async()=>assert.fail(),dispatchCi:async()=>assert.fail(),dispatchPreview:async()=>assert.fail()}
+  const missing=await reconcilePreviews({...common,branches:{list:async()=>[],head:async()=>null}})
+  assert.match(missing.errors[0].message,/fence drain requires operator/)
+  let reads=0,drained=false
+  const recreated=await reconcilePreviews({...common,branches:{list:async()=>[],head:async()=>++reads===1?null:'b'.repeat(40)},drainAmbiguousExecution:async()=>{drained=true}})
+  assert.equal(drained,false)
+  assert.match(recreated.errors[0].message,/recreated/)
+})

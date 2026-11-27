@@ -25,6 +25,8 @@ export function validateManifest(m) {
   if (!branches.length || branches.some(([key,value]) => !/^[a-z][a-z0-9-]*$/.test(key) || !['dev','stage','schema'].includes(value))) throw new Error('Invalid branch policy')
   relativePath(m.database?.migrations)
   relativePath(m.database?.seed)
+  if (m.fixtures?.casEntry) relativePath(m.fixtures.casEntry)
+  if (m.fixtures?.subscriberEntry) relativePath(m.fixtures.subscriberEntry)
   if (!Array.isArray(m.build) || m.build.some(cmd => !Array.isArray(cmd) || !cmd.length || cmd.some(arg => typeof arg !== 'string' || !arg))) throw new Error('Invalid build commands')
   if (!/^\d{4}-\d{2}-\d{2}$/.test(m.compatibilityDate || '')) throw new Error('Invalid compatibility date')
   const seen = new Set(), suffixes = new Set()
@@ -41,6 +43,7 @@ export function validateManifest(m) {
   if (Array.from(seen).at(-1) !== 'gateway' || m.components.gateway.suffix !== 'gateway') throw new Error('The gateway must be the last component')
   if (!/^\/(?!\/)[A-Za-z0-9_/.~-]*$/.test(m.smokePath || '')) throw new Error('Invalid application smoke path')
   if (m.launcher) relativePath(m.launcher)
+  if (m.schemaSubscriber) relativePath(m.schemaSubscriber.entry)
   return m
 }
 export function loadManifest(root, filename) {

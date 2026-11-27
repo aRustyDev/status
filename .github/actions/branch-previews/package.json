@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --import ./test/setup.mjs --test src/*.test.mjs test/*.test.mjs"
+    "test": "node --import ./test/setup.mjs --test src/*.test.mjs runtime/*.test.mjs test/*.test.mjs"
   },
   "dependencies": {
     "esbuild": "0.25.12",
