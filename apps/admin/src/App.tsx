@@ -141,6 +141,7 @@ export default function App() {
             <Route path="monitors/:id" element={capabilities.supportedRoutes.includes("/admin/monitors") ? <MonitorDetails /> : <Unavailable />} />
             <Route path="incidents" element={capabilities.supportedRoutes.includes("/admin/incidents") ? <Incidents /> : <Unavailable />} />
             <Route path="maintenance" element={capabilities.supportedRoutes.includes("/admin/maintenance") ? <Maintenance /> : <Unavailable />} />
+            <Route path="delivery-history" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/delivery-history') ? <DeliveryHistory /> : <Unavailable />} />
             <Route path="actions" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/actions') ? <Actions /> : <Unavailable />} />
             <Route path="delivery-history" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/actions') ? <DeliveryHistory /> : <Unavailable />} />
             <Route path="notifications" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/notifications') ? <Notifications /> : <Unavailable />} />

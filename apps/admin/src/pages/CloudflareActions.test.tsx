@@ -4,12 +4,13 @@ import userEvent from '@testing-library/user-event'
 import {ApiError} from '@better-forge/ui'
 import {beforeEach,describe,expect,it,vi} from 'vitest'
 import {api} from '../api/client'
+import {CapabilitiesContext} from '../capabilities'
 import CloudflareActions from './CloudflareActions'
 import { MemoryRouter } from 'react-router-dom'
 vi.mock('../api/client',()=>({api:{get:vi.fn(),post:vi.fn(),patch:vi.fn(),delete:vi.fn()}}))
 const checkId='00000000-0000-4000-8000-000000000001'
 const action={id:'00000000-0000-4000-8000-000000000002',name:'Recover',endpointId:'approved',vaultId:1,secretId:2,enabled:1,version:3,checkIds:[checkId],triggerStatus:'down'}
-function setup(client=new QueryClient({defaultOptions:{queries:{retry:false}}})){render(<MemoryRouter><QueryClientProvider client={client}><CloudflareActions /></QueryClientProvider></MemoryRouter>);return userEvent.setup()}
+function setup(client=new QueryClient({defaultOptions:{queries:{retry:false}}}),supportedRoutes=['/admin/delivery-history']){render(<MemoryRouter><QueryClientProvider client={client}><CapabilitiesContext.Provider value={{supportedRoutes}}><CloudflareActions /></CapabilitiesContext.Provider></QueryClientProvider></MemoryRouter>);return userEvent.setup()}
 beforeEach(()=>{
  vi.resetAllMocks()
  vi.mocked(api.get).mockImplementation(async path=>{
@@ -53,6 +54,11 @@ describe('Cloudflare actions',()=>{
   setup()
   expect(await screen.findByText('HTTP POST · Approved action')).toBeInTheDocument()
   expect(screen.getByRole('link', {name:'Run history'})).toHaveAttribute('href', '/admin/delivery-history?tab=actions')
+ })
+ it('hides action history when the capability is unavailable', async () => {
+  setup(undefined,[])
+  expect(await screen.findByText('HTTP POST · Approved action')).toBeInTheDocument()
+  expect(screen.queryByRole('link',{name:'Run history'})).not.toBeInTheDocument()
  })
  it('prevents edits and closing while an action save is pending', async () => {
   const user=setup()

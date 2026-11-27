@@ -16,6 +16,7 @@ import { deployRelease } from './release-coordinator.mjs'
 import { createInventoryStore } from './release-inventory.mjs'
 import { createActivationAdapter } from './release-activation.mjs'
 import { reconcile } from './reconcile-cli.mjs'
+import { createSchemaFence, schemaSubscriberSettings } from './schema-subscriber.mjs'
 
 function object(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Missing or invalid ${name}`)
@@ -27,6 +28,15 @@ function parse(value, name) {
 function text(value, name) {
   if (typeof value !== 'string' || !value) throw new Error(`Missing ${name}`)
   return value
+}
+
+export function redactSubscriberAddresses(value, subscriber) {
+  let text = String(value || '')
+  for (const address of [subscriber?.sender, subscriber?.recipient].filter(Boolean)) {
+    const escaped = address.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    text = text.replace(new RegExp(escaped, 'gi'), '[redacted]')
+  }
+  return text
 }
 
 
@@ -90,9 +100,22 @@ export async function main(env = process.env) {
   const control = env.PREVIEW_CONTROL_DIR
   const manifest = installation().manifest
   const branchDir = env.PREVIEW_ARTIFACT_DIR
+  const approval = env.PREVIEW_SCHEMA_SUBSCRIBER_CONFIG ? parse(env.PREVIEW_SCHEMA_SUBSCRIBER_CONFIG, 'PREVIEW_SCHEMA_SUBSCRIBER_CONFIG') : null
+  const subscriber = schemaSubscriberSettings({ value:approval, environment:policy.environment, branch:policy.name, sha, branchDir, previewUrl:previewUrl.href })
   const wrangler = path.join(root, 'node_modules', '.bin', 'wrangler')
   const temp = await mkdtemp(path.join(tmpdir(), 'status-branch-release-'))
-  const run = async args => execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
+  const run = async args => {
+    if (!subscriber) return execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
+    try {
+      // Wrangler displays binding values and addresses on successful deployment.
+      return execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: ['ignore','pipe','pipe'], maxBuffer:16*1024*1024 })
+    } catch (error) {
+      const detail = redactSubscriberAddresses(error.stderr || '', subscriber).slice(0, 4000)
+      // The original error may contain raw Wrangler output with private addresses.
+      // eslint-disable-next-line preserve-caught-error
+      throw new Error(`Wrangler ${args[0]} failed (exit ${error.status ?? 'unknown'})${detail ? ': ' + detail : ''}`)
+    }
+  }
   function install(name, values) {
     const selected = object(values, `${name} secrets`)
     if (Object.entries(selected).some(([key, value]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== 'string' || !value)) throw new Error(`Invalid ${name} secrets`)
@@ -103,11 +126,14 @@ export async function main(env = process.env) {
     }
   }
   try {
+    const fenceAdapter = cloudflareDatabaseAdapter({ accountId, token, wrangler, seedSql: '', recordDatabase: async () => {} })
+    const subscriberFence = createSchemaFence({ query:fenceAdapter.query, findDatabase:fenceAdapter.findDatabase, config:{...databaseConfig, inventoryDatabaseId:config.inventoryDatabaseId} })
     const activate = createActivationAdapter({
       store, appId, accountId, token, dispatcherName: text(config.dispatcherName, 'dispatcher name'),
       dispatcherSource: path.join(root, 'runtime/dispatcher.ts'), directory: temp, run,
       verificationSecret: verifySecret, previewUrl: previewUrl.href, accessHeaders: access,
       ...activationIdentity(config, access),
+      subscriberFence,
     })
     const record = await deployRelease({
       ref, sha, store, readRemoteHead: branches.head,
@@ -120,13 +146,13 @@ export async function main(env = process.env) {
         const database = await prepareDatabase({ kind: policy.environment, ref, sha, config: databaseConfig,
           mainMigrations: ownedPath(control, manifest.database.migrations), candidateMigrations: path.join(branchDir, 'migrations'), adapter, recordedResources })
         await recordResources({ database })
-        const workerSettings = { ...settings, d1DatabaseId: database.id, d1DatabaseName: database.name }
+        const workerSettings = { ...settings, d1DatabaseId: database.id, d1DatabaseName: database.name, previewEnvironment:policy.environment }
         const selector = selectorForBranch(ref)
-        const { names } = createBranchConfigs({ settings: workerSettings, selector, sha, branchDir, dir: temp })
-        await recordResources({ workers: names, gateway: names.gateway })
-        await deployBranchWorkers({ settings: workerSettings, selector, sha, branchDir, dir: temp, run,
-          installSecrets: async (component, name) => install(name, workerSecrets[component]) })
-        return { database, workers: names, gateway: names.gateway }
+        const { names } = createBranchConfigs({ settings: workerSettings, selector, sha, branchDir, dir: temp, subscriber, appId })
+        await recordResources({ workers: names, gateway: names.gateway, ...(subscriber ? {subscriberExpiresAt:subscriber.expiresAt} : {}) })
+        await deployBranchWorkers({ settings: workerSettings, selector, sha, branchDir, dir: temp, run, subscriber, appId,
+          installSecrets: async (component, name) => install(name, component === 'subscriber' ? {} : workerSecrets[component]) })
+        return { database, workers: names, gateway: names.gateway, ...(subscriber ? {subscriberExpiresAt:subscriber.expiresAt} : {}) }
       },
       async activate(candidate) {
         install(config.dispatcherName, { PREVIEW_VERIFY_SECRET: verifySecret })

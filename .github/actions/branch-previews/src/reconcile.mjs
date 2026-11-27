@@ -2,7 +2,7 @@ import { branchPolicy } from './release-contract.mjs'
 
 // Run under the same non-preemptive workflow concurrency group as deployments.
 // A failed or ambiguous candidate is reported instead of being overwritten.
-export async function reconcilePreviews({ branches, store, retire, recoverCandidate, cleanupAbandoned, cleanupRetained, ciStatus, dispatchCi, dispatchPreview, now = Date.now }) {
+export async function reconcilePreviews({ branches, store, retire, recoverCandidate, cleanupAbandoned, cleanupRetained, revokeAmbiguousSubscribers, ciStatus, dispatchCi, dispatchPreview, now = Date.now }) {
   const [remote, initialInventory] = await Promise.all([branches.list(), store.list()])
   let inventory = initialInventory
   const result = { retired: [], scheduled: [], pending: [], errors: [] }
@@ -33,6 +33,14 @@ export async function reconcilePreviews({ branches, store, retire, recoverCandid
         const updated = { ...record, candidate: null, abandoned: [...(record.abandoned || []), { ...record.candidate, abandonedAt: now() }] }
         if (await branches.head(record.ref) !== null || !await store.compareAndSwap(record.ref, snapshot.revision, updated)) throw new Error('Branch or inventory changed during candidate abandonment')
       } else if (record.candidate?.phase === 'activating') {
+        // The candidate flag write may have succeeded before an interruption.
+        // Revoke both possible senders while leaving routing for reconciliation.
+        const releases = [record.active, record.previous, ...(record.retained || []), record.candidate].filter(Boolean)
+        if (releases.some(release => release.resources?.workers?.subscriber)) {
+          if (typeof revokeAmbiguousSubscribers !== 'function') throw new Error('Subscriber fence revocation requires operator reconciliation')
+          if (await branches.head(record.ref) !== null) throw new Error('Branch was recreated before subscriber revocation')
+          await revokeAmbiguousSubscribers(record, releases)
+        }
         throw new Error('Deleted branch activation requires operator reconciliation')
       }
       const outcome = await retire(record.ref)

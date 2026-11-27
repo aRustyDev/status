@@ -5,6 +5,7 @@ import { Alert, ApiError, ConfirmModal, DataTable, DataTh, EmptyTableRow, ErrorS
 import { Link } from 'react-router-dom'
 import { deliveryHistoryUrl } from '../deliveryHistoryUrl'
 import { api } from '../api/client'
+import { useCapabilities } from '../capabilities'
 
 type Action = { id:string; name:string; endpointId:string; triggerStatus:string; vaultId:number; secretId:number; enabled:number; version:number; checkIds:string[] }
 type Choice = {id:string;name:string}
@@ -12,11 +13,14 @@ type Check = Choice & {componentId:string;configVersion:number}
 type CheckSnapshot = Pick<Check,'id'|'componentId'|'configVersion'>
 type Vault = {id:number;name:string}
 type Secret = {id:number;name:string;type:string}
+type Delivery = {actionId:string;checkId:string;status:string;state:string;updatedAt:number}
 
 export default function CloudflareActions() {
+  const capabilities = useCapabilities()
   const qc=useQueryClient(), [editing,setEditing]=useState<Action|'new'|null>(null), [removing,setRemoving]=useState<Action|null>(null)
   const [busy,setBusy]=useState(false), [message,setMessage]=useState('')
   const actions=useQuery<Action[]>({queryKey:['worker-actions'],queryFn:()=>api.get('/admin/actions')})
+  const deliveries=useQuery<Delivery[]>({queryKey:['worker-action-runs'],queryFn:()=>api.get('/admin/actions/runs')})
   const destinations = useQuery<Choice[]>({ queryKey: ['worker-action-destinations'], queryFn: () => api.get('/admin/actions/destinations') })
   const { rows, sort } = useTableSort(actions.data ?? [], {
     name: action => action.name,
@@ -32,7 +36,7 @@ export default function CloudflareActions() {
   }
   return <PageContainer>
     <PageHeader title="Actions" subtitle="HTTP requests sent when a monitor changes status" actions={<>
-      <Link to={deliveryHistoryUrl('actions')} className="btn btn-secondary"><span className="material-symbols-outlined" aria-hidden="true">history</span> Run history</Link>
+      {capabilities.supportedRoutes.includes('/admin/delivery-history') && <Link to={deliveryHistoryUrl('actions')} className="btn btn-secondary"><span className="material-symbols-outlined" aria-hidden="true">history</span> Run history</Link>}
       <button type="button" className="btn btn-primary" onClick={() => setEditing('new')}><span className="material-symbols-outlined" aria-hidden="true">add</span> Add Action</button>
     </>} />
     {destinations.data?.some(destination => destination.id === 'issue14-isolated-sink')
@@ -65,6 +69,11 @@ export default function CloudflareActions() {
           </tbody>
         </DataTable>
       </div>}
+    <section><h2 className="font-headline font-bold">Recent action runs</h2><p className="text-sm">Initial monitor results do not run actions. Unavailable credentials or destinations fail closed. An uncertain result may mean the external system acted; inspect it before taking further action.</p>
+      {deliveries.isError && <p role="alert">Could not load delivery status.</p>}
+      {deliveries.data?.length===0 && <p>No action runs yet.</p>}
+      {deliveries.data?.map((delivery,index)=><p key={`${delivery.actionId}-${delivery.checkId}-${delivery.updatedAt}-${index}`} className="text-sm">{actions.data?.find(c=>c.id===delivery.actionId)?.name ?? 'Action'}: {delivery.status}, {delivery.state}</p>)}
+    </section>
     {editing && <ActionForm action={editing==='new'?null:editing} onClose={()=>setEditing(null)} onSaved={async()=>{setEditing(null);await qc.invalidateQueries({queryKey:['worker-actions']})}} />}
     {removing && <ConfirmModal title="Delete action" message={`Delete "${removing.name}"? Its pending runs and history will also be removed.${message ? ` ${message}` : ''}`} confirmLabel="Delete" pending={busy} pendingLabel="Deleting…" onConfirm={() => void remove()} onCancel={() => { if (!busy) setRemoving(null) }} />}
   </PageContainer>

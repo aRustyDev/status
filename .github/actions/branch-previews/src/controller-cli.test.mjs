@@ -1,6 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { activationIdentity, main, selectWorkerSecrets } from './controller-cli.mjs'
+import { activationIdentity, main, selectWorkerSecrets, redactSubscriberAddresses } from './controller-cli.mjs'
+
+test('schema diagnostics redact approved sender and recipient regardless of case', () => {
+  const redacted = redactSubscriberAddresses('Sender@Example.com -> recipient@example.com', {sender:'sender@example.com',recipient:'RECIPIENT@example.com'})
+  assert.equal(redacted, '[redacted] -> [redacted]')
+})
 
 const workers = key => ({ gateway: {}, api: key ? { VAULT_ENCRYPTION_KEY: key } : {}, statusApi: {}, monitoring: {}, status: {}, admin: {}, probe: key ? { VAULT_ENCRYPTION_KEY: key } : {} })
 
