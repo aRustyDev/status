@@ -22,7 +22,7 @@ export const ALL_SECTIONS: NavSection[] = [
     items: [
       { to: '/admin/notifications',    label: 'Notifications',    icon: 'notifications', minRole: 'admin' },
       { to: '/admin/actions',          label: 'Actions',          icon: 'bolt',          minRole: 'admin' },
-      { to: '/admin/delivery-history', label: 'Delivery history', icon: 'history',       minRole: 'operator' },
+      { to: '/admin/delivery-history', label: 'Delivery history', icon: 'history',       minRole: 'admin' },
     ],
   },
   {

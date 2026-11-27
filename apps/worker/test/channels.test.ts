@@ -29,7 +29,7 @@ const request=(method:string,body?:unknown)=>new Request('https://status.example
 
 async function setup() {
   const local=new DB()
-  for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+  for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql','0018_delivery_history.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
   local.db.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')").run()
   local.db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Test monitor',0)").run()
   local.db.prepare("INSERT INTO endpoint_registry VALUES ('check','approved')").run()
@@ -64,6 +64,20 @@ test('channel configuration and test use only persisted credentials and approved
   assert.equal(await sendChannel({...x.env,CHANNEL_ENDPOINTS:destinations.replace('https:','http:')},x.channel.id,1,{},false),'unavailable')
   const audit=x.local.db.prepare("SELECT details FROM audit_events WHERE entity_type='notification_channel'").all()
   assert.doesNotMatch(JSON.stringify(audit),/fixture-token|private response body/)
+})
+
+test('test delivery reports the provider outcome when history recording fails',async()=>{
+  const x=await setup()
+  x.local.db.exec(`CREATE TRIGGER fail_test_history BEFORE INSERT ON notification_test_deliveries BEGIN SELECT RAISE(FAIL, 'history unavailable'); END`)
+  const path=`/admin/notifications/channels/${x.channel.id}/test`
+  const response=await channelApi(request('POST',{version:1}),x.env,actor,path)
+  assert.equal(response.status,200)
+  assert.deepEqual(await response.json(),{ok:true})
+  assert.equal(x.calls.length,1)
+  assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM notification_test_deliveries').get() as {n:number}).n,0)
+  x.setStatus(500)
+  await assert.rejects(channelApi(request('POST',{version:1}),x.env,actor,path),(e:unknown)=>e instanceof ChannelError && e.status===502)
+  assert.equal(x.calls.length,2)
 })
 
 test('status transition outbox is atomic and concurrent flushes claim only one delivery',async()=>{
@@ -141,6 +155,17 @@ test('failed deliveries retry within a bound and record only generic errors',asy
   const row=x.local.db.prepare('SELECT state,attempts,error_code FROM notification_outbox').get() as {state:string;attempts:number;error_code:string}
   assert.deepEqual({...row},{state:'failed',attempts:3,error_code:'delivery_failed'})
   assert.doesNotMatch(JSON.stringify(row),/fixture-token|private response body/)
+  const failures=x.local.db.prepare('SELECT attempt_number,result FROM notification_attempts ORDER BY attempt_number').all().map(attempt=>({...attempt}))
+  assert.deepEqual(failures,[1,2,3].map(attempt_number=>({attempt_number,result:'delivery_failed'})))
+  x.local.db.prepare("UPDATE notification_outbox SET state='pending',manual_retry=1,error_code=NULL").run()
+  x.setStatus(200)
+  await Promise.all([flushChannelDeliveries(x.env),flushChannelDeliveries(x.env)])
+  assert.equal(x.calls.length,4)
+  const keys=x.calls.map(call=>(call.init.headers as Record<string,string>)['Idempotency-Key'])
+  assert.ok(keys[0])
+  assert.ok(keys.every(value=>value===keys[0]))
+  assert.deepEqual({...x.local.db.prepare('SELECT state,attempts,manual_retry FROM notification_outbox').get()},{state:'sent',attempts:4,manual_retry:1})
+  assert.deepEqual({...x.local.db.prepare('SELECT attempt_number,result FROM notification_attempts WHERE attempt_number=4').get()},{attempt_number:4,result:'sent'})
 })
 
 test('revoked actors cannot mutate channels or send tests',async()=>{
@@ -157,7 +182,7 @@ test('Workerd D1 atomically queues and claims one delivery for concurrent schedu
   const runtime=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response()}}',d1Databases:['DB']}))
   try {
     const db=await runtime.getD1Database('DB') as D1Database
-    for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql']) {
+    for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql','0018_delivery_history.sql']) {
       const sql=readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8').replace(/^\s*--[^\n]*$/gm,'')
       const parts=sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements=parts.shift()!.split(';').map(s=>s.trim()).filter(Boolean)
@@ -676,4 +701,155 @@ test('channel rename during claimed pre-send validation defers rather than disca
   assert.equal(x.calls.length,0)
   await flushChannelDeliveries(x.env)
   assert.equal(x.calls.length,1)
+})
+
+test('delivery history filters, redacts details, and retries a failed webhook once', async () => {
+  const { deliveryHistoryApi } = await import('../src/delivery-history.ts')
+  const x = await setup()
+  await queueTimingEvent(x)
+  x.setStatus(500)
+  await flushChannelDeliveries(x.env)
+  await flushChannelDeliveries(x.env)
+  await flushChannelDeliveries(x.env)
+  const job = x.local.db.prepare('SELECT id FROM notification_outbox').get() as {id:string}
+  const route = `/admin/delivery-history/notifications/${encodeURIComponent(job.id)}`
+  const response = await deliveryHistoryApi(request('GET'), x.env, actor, '/admin/delivery-history/notifications')
+  const list = await response.json() as {items:{id:string;canRetry:boolean}[];total:number}
+  assert.equal(list.total,1)
+  assert.equal(list.items[0]?.id,job.id)
+  assert.equal(list.items[0]?.canRetry,true)
+  const detail = await (await deliveryHistoryApi(request('GET'),x.env,actor,route)).json() as {attempts:unknown[]}
+  assert.equal(detail.attempts.length,3)
+  assert.doesNotMatch(JSON.stringify(detail),/fixture-token|private response body|webhook.example/)
+  const failedRequest = new Request('https://status.example.test?status=sent')
+  assert.equal(((await (await deliveryHistoryApi(failedRequest,x.env,actor,'/admin/delivery-history/notifications')).json()) as {total:number}).total,0)
+  const retries = await Promise.all([
+    deliveryHistoryApi(request('POST',{}),x.env,actor,`${route}/retry`),
+    deliveryHistoryApi(request('POST',{}),x.env,actor,`${route}/retry`),
+  ])
+  assert.deepEqual(retries.map(r=>r.status).sort(),[200,409])
+  x.setStatus(200)
+  await flushChannelDeliveries(x.env)
+  assert.equal(x.calls.length,4)
+  const keys = x.calls.map(call => (call.init.headers as Record<string,string>)['Idempotency-Key'])
+  assert.ok(keys.every(key => key === job.id))
+  assert.equal(x.local.db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_type='notification_delivery'").get()?.n,1)
+  const after = await (await deliveryHistoryApi(request('GET'),x.env,actor,route)).json() as {state:string;attempts:unknown[]}
+  assert.equal(after.state,'sent')
+  assert.equal(after.attempts.length,4)
+})
+
+test('manual retry refuses a changed identity, superseded transition, and expired job', async () => {
+  const { deliveryHistoryApi } = await import('../src/delivery-history.ts')
+  const x = await setup()
+  await queueTimingEvent(x)
+  x.setStatus(500)
+  for (let i=0;i<3;i++) await flushChannelDeliveries(x.env)
+  const job = x.local.db.prepare('SELECT id FROM notification_outbox').get() as {id:string}
+  const route = `/admin/delivery-history/notifications/${encodeURIComponent(job.id)}/retry`
+  assert.equal((await deliveryHistoryApi(request('POST',{}),x.env,{...actor,version:2},route)).status,409)
+  x.local.db.prepare('UPDATE notification_transition_state SET generation=generation+1 WHERE check_id=?').run(checkId)
+  const stale = await (await deliveryHistoryApi(request('GET'),x.env,actor,'/admin/delivery-history/notifications')).json() as {items:{canRetry:boolean}[]}
+  assert.equal(stale.items[0]?.canRetry,false)
+  assert.equal((await deliveryHistoryApi(request('POST',{}),x.env,actor,route)).status,409)
+  x.local.db.prepare('UPDATE notification_transition_state SET generation=generation-1 WHERE check_id=?').run(checkId)
+  x.local.db.prepare('UPDATE notification_outbox SET created_at=? WHERE id=?').run(Date.now()-3_600_001,job.id)
+  assert.equal((await deliveryHistoryApi(request('POST',{}),x.env,actor,route)).status,409)
+  const expired = await (await deliveryHistoryApi(request('GET'),x.env,actor,'/admin/delivery-history/notifications')).json() as {items:{canRetry:boolean}[]}
+  assert.equal(expired.items[0]?.canRetry,false)
+  assert.equal(x.local.db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_type='notification_delivery'").get()?.n,0)
+})
+
+test('action history filters and paginates stored runs without exposing destination data', async () => {
+  const { deliveryHistoryApi } = await import('../src/delivery-history.ts')
+  const x = await setup()
+  const now = Date.now()
+  x.local.db.prepare("INSERT INTO worker_actions (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,trigger_status,created_at,updated_at) VALUES ('action','Action','sensitive-endpoint','sensitive-fingerprint',1,1,'down',?,?)").run(now,now)
+  const insert = x.local.db.prepare("INSERT INTO worker_action_outbox (id,action_id,action_version,check_id,check_version,scheduled_at,status,state,created_at,updated_at) VALUES (?,'action',1,?,1,?,'down',?,?,?)")
+  insert.run('run-one',checkId,1,'uncertain',now,now)
+  insert.run('run-two',checkId,2,'completed',now+1,now+1)
+  const list = await (await deliveryHistoryApi(new Request('https://status.example.test?page=1&limit=1&status=uncertain&actionId=action'),x.env,actor,'/admin/delivery-history/actions')).json() as {items:{id:string;state:string}[];total:number;pages:number}
+  assert.equal(list.total,1)
+  assert.equal(list.items[0]?.id,'run-one')
+  assert.equal(list.items[0]?.state,'uncertain')
+  assert.doesNotMatch(JSON.stringify(list),/sensitive-endpoint|sensitive-fingerprint|fixture-token/)
+  const all = await (await deliveryHistoryApi(new Request('https://status.example.test?page=2&limit=1'),x.env,actor,'/admin/delivery-history/actions')).json() as {items:{id:string}[];pages:number}
+  assert.equal(all.pages,2)
+  assert.equal(all.items[0]?.id,'run-one')
+})
+
+test('manual retries survive an older probe and remain fenced against cancellation and expiry', async () => {
+  const { deliveryHistoryApi } = await import('../src/delivery-history.ts')
+  for (const scenario of ['legacy', 'deferred', 'rename', 'rename_during', 'unlink', 'other_link', 'expired'] as const) {
+    const x = await setup()
+    await queueTimingEvent(x)
+    x.setStatus(500)
+    for (let i=0;i<3;i++) await flushChannelDeliveries(x.env)
+    const job = x.local.db.prepare('SELECT id FROM notification_outbox').get() as {id:string}
+    const route = `/admin/delivery-history/notifications/${encodeURIComponent(job.id)}`
+    assert.equal((await deliveryHistoryApi(request('POST',{}),x.env,actor,`${route}/retry`)).status,200)
+    const queued = await (await deliveryHistoryApi(request('GET'),x.env,actor,route)).json() as {state:string;canRetry:boolean}
+    assert.equal(queued.state,'pending')
+    assert.equal(queued.canRetry,false)
+    // This is the relevant pre-0018 probe cleanup predicate, which used to
+    // consume pending rows with three attempts before the new probe could send.
+    x.local.db.prepare(`UPDATE notification_outbox SET state='failed',error_code='delivery_failed',lease_token=NULL,lease_until=NULL,updated_at=?
+      WHERE (state='pending' OR (state='sending' AND lease_until<?)) AND attempts>=3`).run(Date.now(),Date.now())
+    assert.match(String(x.local.db.prepare('SELECT error_code FROM notification_outbox').get()?.error_code),/^retry_queued:/)
+    if (scenario === 'unlink') {
+      const before=x.local.db.prepare('SELECT association_version FROM notification_channels WHERE id=?').get(x.channel.id)?.association_version as number
+      x.local.db.prepare('DELETE FROM notification_channel_checks WHERE channel_id=? AND check_id=?').run(x.channel.id,checkId)
+      x.local.db.prepare('INSERT INTO notification_channel_checks (channel_id,check_id) VALUES (?,?)').run(x.channel.id,checkId)
+      assert.ok(Number(x.local.db.prepare('SELECT association_version FROM notification_channels WHERE id=?').get(x.channel.id)?.association_version)>before)
+    }
+    if (scenario === 'other_link') {
+      x.local.db.prepare("INSERT INTO components (id,name,updated_at) VALUES ('other','Other',0)").run()
+      x.local.db.prepare("INSERT INTO http_checks (id,component_id,endpoint_id,enabled,interval_minutes,expected_status) VALUES ('other','other','check',1,1,200)").run()
+      x.local.db.prepare('INSERT INTO notification_channel_checks (channel_id,check_id) VALUES (?,?)').run(x.channel.id,'other')
+    }
+    const rename=()=>channelApi(request('PATCH',{...x.channelBody,expectedCheckIds:[checkId],expectedAssociationVersion:1,name:'Renamed',version:1}),x.env,actor,`/admin/notifications/channels/${x.channel.id}`)
+    if (scenario === 'rename') await rename()
+    if (scenario === 'expired') x.local.db.prepare('UPDATE notification_outbox SET created_at=? WHERE id=?').run(Date.now()-3_600_001,job.id)
+    x.setStatus(200)
+    if (scenario === 'deferred') {
+      let inserted=false
+      const db={prepare(sql:string) {
+        if (!inserted && sql.includes('SELECT o.created_at AS createdAt,o.lease_until AS leaseUntil,')) {
+          inserted=true
+          const now=Date.now()
+          x.local.db.prepare("INSERT INTO maintenance (id,name,starts_at,ends_at,created_at,updated_at) VALUES ('m','window',?,?,?,?)").run(now-1000,now+60_000,now,now)
+        }
+        return x.db.prepare(sql)
+      },batch:x.db.batch.bind(x.db)} as D1Database
+      await flushChannelDeliveries({...x.env,DB:db})
+      assert.match(String(x.local.db.prepare('SELECT error_code FROM notification_outbox').get()?.error_code),/^retry_queued:/)
+      assert.equal(x.calls.length,3)
+      x.local.db.prepare("DELETE FROM maintenance WHERE id='m'").run()
+    }
+    if (scenario === 'rename_during') {
+      let renamed=false
+      const db={prepare(sql:string) {
+        const statement=x.db.prepare(sql)
+        if (renamed || !sql.includes('SELECT 1 AS present FROM notification_channels WHERE')) return statement
+        return {bind(...values:unknown[]){statement.bind(...values);return this},async first() {
+          renamed=true
+          await rename()
+          return statement.first()
+        }} as D1PreparedStatement
+      },batch:x.db.batch.bind(x.db)} as D1Database
+      await flushChannelDeliveries({...x.env,DB:db})
+      assert.match(String(x.local.db.prepare('SELECT error_code FROM notification_outbox').get()?.error_code),/^retry_queued:/)
+      assert.equal(x.calls.length,3)
+    }
+    await Promise.all([flushChannelDeliveries(x.env),flushChannelDeliveries(x.env)])
+    const row=x.local.db.prepare('SELECT state,attempts,error_code FROM notification_outbox WHERE id=?').get(job.id)
+    if (scenario === 'legacy' || scenario === 'deferred' || scenario === 'rename' || scenario === 'rename_during') {
+      assert.deepEqual({...row},{state:'sent',attempts:4,error_code:null})
+      assert.equal(x.calls.length,4)
+    } else {
+      assert.equal(row?.state,'failed')
+      assert.equal(row?.error_code,scenario === 'expired' ? 'delivery_failed' : 'unavailable')
+      assert.equal(x.calls.length,3)
+    }
+  }
 })

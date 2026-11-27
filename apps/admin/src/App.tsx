@@ -16,6 +16,7 @@ const Audit = lazy(() => import('./pages/AuditLog'))
 const Vault = lazy(() => import('./pages/Vault'))
 const Notifications = lazy(() => import('./pages/CloudflareNotifications'))
 const Actions = lazy(() => import('./pages/CloudflareActions'))
+const DeliveryHistory = lazy(() => import('./pages/CloudflareDeliveryHistory'))
 const Backups = lazy(() => import('./pages/Backups'))
 const SystemHealth = lazy(() => import('./pages/SystemHealth'))
 const Subscribers = lazy(() => import('./pages/Subscribers'))
@@ -140,6 +141,7 @@ export default function App() {
             <Route path="incidents" element={capabilities.supportedRoutes.includes("/admin/incidents") ? <Incidents /> : <Unavailable />} />
             <Route path="maintenance" element={capabilities.supportedRoutes.includes("/admin/maintenance") ? <Maintenance /> : <Unavailable />} />
             <Route path="subscribers" element={capabilities.supportedRoutes.includes("/admin/subscribers") ? <Subscribers /> : <Unavailable />} />
+            <Route path="delivery-history" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/delivery-history') ? <DeliveryHistory /> : <Unavailable />} />
             <Route path="actions" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/actions') ? <Actions /> : <Unavailable />} />
             <Route path="notifications" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/notifications') ? <Notifications /> : <Unavailable />} />
             <Route path="vault" element={identity.role === 'admin' && capabilities.supportedRoutes.includes("/admin/vault") ? <Vault /> : <Unavailable />} />
