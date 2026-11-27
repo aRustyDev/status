@@ -4,7 +4,7 @@ import gatewayModule from '../index.ts'
 import dispatcherModule from '../preview-dispatcher.ts'
 import { createDispatcher, verifyServiceToken } from '../preview-dispatcher.ts'
 import { generateKeyPair, SignJWT } from 'jose'
-import { candidateVerificationHeader } from '../../../scripts/preview/verify-candidate.mjs'
+import { candidateVerificationHeader } from '../../../.github/actions/branch-previews/src/verify-candidate.mjs'
 
 const gateway = 'default' in gatewayModule ? gatewayModule.default as typeof gatewayModule : gatewayModule
 const dispatcher = 'default' in dispatcherModule ? dispatcherModule.default as typeof dispatcherModule : dispatcherModule
