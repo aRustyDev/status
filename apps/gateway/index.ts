@@ -8,6 +8,7 @@ interface Env {
   ADMIN_UI: Fetcher
   UI_MODE: string
   FLAGS?: Flagship
+  PREVIEW_DISPATCHER?: Fetcher
   PREVIEW_SELECTOR?: string
   PREVIEW_RELEASE?: string
   [key: `PREVIEW_${number}_${'A' | 'B'}`]: Fetcher
@@ -29,10 +30,19 @@ function uncached(response: Response, release?: string): Response {
 
 async function preview(request: Request, env: Env, selector: string): Promise<Response> {
   const match = /^([1-6])\.[0-9a-f]{32}$/.exec(selector)
-  if (!match) return uncached(new Response('Invalid preview selector', { status: 400 }))
+  const branch = /^branch-[0-9a-f]{24}$/.test(selector)
+  if (!match && !branch) return uncached(new Response('Invalid preview selector', { status: 400 }))
+
+  // Only the private dispatcher can authenticate this narrow service probe.
+  // Ordinary requests continue through the human-identity check below.
+  if (branch && request.method === 'GET' && new URL(request.url).pathname === '/__preview/verify' && request.headers.has('X-Status-Preview-Verify')) {
+    if (!env.PREVIEW_DISPATCHER) return uncached(new Response('Preview routing unavailable', { status: 503 }))
+    try { return uncached(await env.PREVIEW_DISPATCHER.fetch(request)) }
+    catch { return uncached(new Response('Preview routing unavailable', { status: 503 })) }
+  }
 
   // The baseline API validates the Access assertion before a client can select a build.
-  const identityUrl = new URL('/api/v1/auth/me', request.url)
+  const identityUrl = new URL('/api/v1/auth/preview-verify', request.url)
   let identity: Response
   try {
     identity = await env.API.fetch(new Request(identityUrl, { method: 'GET', headers: request.headers }))
@@ -40,6 +50,17 @@ async function preview(request: Request, env: Env, selector: string): Promise<Re
     return uncached(new Response('Preview routing unavailable', { status: 503 }))
   }
   if (!identity.ok) return uncached(identity)
+  if (branch) {
+    if (!env.PREVIEW_DISPATCHER) return uncached(new Response('Preview routing unavailable', { status: 503 }))
+    try {
+      const headers = new Headers(request.headers)
+      headers.delete('X-Status-Preview-Release')
+      return uncached(await env.PREVIEW_DISPATCHER.fetch(new Request(request, { headers })))
+    } catch {
+      return uncached(new Response('Preview routing unavailable', { status: 503 }))
+    }
+  }
+  if (!match) return uncached(new Response('Invalid preview selector', { status: 400 }))
   if (!env.FLAGS) return uncached(new Response('Preview routing unavailable', { status: 503 }))
 
   try {

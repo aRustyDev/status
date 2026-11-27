@@ -11,7 +11,7 @@ test('preview shared audit preserves history and works with legacy entity filter
     db.exec(`CREATE TABLE users (id TEXT PRIMARY KEY);
       CREATE TABLE audit_events (id TEXT PRIMARY KEY, actor_email TEXT NOT NULL, action TEXT NOT NULL,
         entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, created_at INTEGER NOT NULL, details TEXT NOT NULL);`)
-    for (const name of ['0020_preview_subscribers.sql', '0021_preview_audit_scope.sql', '0022_preview_audit_events.sql']) db.exec(migration(name))
+    for (const name of ['0021_preview_subscribers.sql', '0022_preview_audit_scope.sql', '0023_preview_audit_events.sql']) db.exec(migration(name))
     const scope = 'a'.repeat(64)
     const expiredScope = 'b'.repeat(64)
     db.prepare('INSERT INTO preview_subscriber_leases VALUES (?, 3, ?, ?, ?)').run(scope, 'a', 'release', 1)
@@ -24,7 +24,7 @@ test('preview shared audit preserves history and works with legacy entity filter
     add('private-before', scope, 'subscriber', 'subscriber-1')
     db.exec("INSERT INTO audit_events VALUES ('baseline', 'admin@example.com', 'update', 'incident', 'baseline-incident', 99, '{}', NULL)")
     const before = db.prepare('SELECT * FROM audit_events ORDER BY id').all()
-    db.exec(migration('0023_preview_shared_audit_filter.sql'))
+    db.exec(migration('0024_preview_shared_audit_filter.sql'))
     assert.deepEqual(db.prepare('SELECT * FROM audit_events ORDER BY id').all(), before)
 
     add('new-slot', scope, 'incident', 'incident-new')

@@ -7,6 +7,12 @@ npx playwright install chromium
 node scripts/preview-browser.mjs https://status.sow.foo/ 1.0123456789abcdef0123456789abcdef
 ```
 
+For an automatically deployed branch preview, use its branch selector instead:
+
+```sh
+node scripts/preview-browser.mjs https://status.sow.foo/ branch-0123456789abcdef01234567
+```
+
 Replace the example URL and selector with the values returned by the deployment workflow. Sign in through Cloudflare Access in the browser window. The launcher sends the selector to the specified HTTPS origin on navigation, asset, and API requests. Each invocation opens a separate browser profile, so two previews can be used side by side. Closing the browser removes its temporary profile and extension.
 
-For API clients, send the same `X-Status-Preview` header with every request to the staging origin, alongside the normal Access authentication. Requests without a selector reach the baseline staging deployment. Staging data is shared, so identify test records with the preview selector and leave test monitors disabled when exercising configuration changes.
+For API clients, send the same `X-Status-Preview` header with every request to the staging origin, alongside the normal Access authentication. Requests without a selector reach the baseline staging deployment. Dev and Stage databases are shared within their environments, so identify test records with the preview selector and leave test monitors disabled when exercising configuration changes. Schema branch previews use a dedicated database.

@@ -1,0 +1,46 @@
+name: Branch previews
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to deploy, or empty for reconciliation
+        required: false
+        type: string
+      sha:
+        description: Exact tested commit
+        required: false
+        type: string
+  schedule:
+    - cron: 17 * * * *
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - feat/**
+      - fix/**
+      - stage/**
+      - schema/**
+  delete: null
+permissions:
+  contents: read
+  actions: read
+jobs:
+  deploy:
+    if: vars.PREVIEW_AUTO_ENABLED == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.branch != '' && inputs.sha != '') || (github.event_name == 'workflow_run' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') && github.event.workflow_run.conclusion == 'success'))
+    secrets: inherit
+    uses: aRustyDev/status/.github/workflows/deploy.yml@3e08bf162be6b1c6b5371df91c4886da83de1afc
+    with:
+      fixture: false
+      branch: ${{ github.event.workflow_run.head_branch || inputs.branch }}
+      sha: ${{ github.event.workflow_run.head_sha || inputs.sha }}
+  reconcile:
+    if: vars.PREVIEW_AUTO_ENABLED == 'true' && vars.PREVIEW_RECONCILE_ENABLED == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.branch == '') || (github.event_name == 'delete' && github.event.ref_type == 'branch'))
+    permissions:
+      contents: read
+      actions: write
+    secrets: inherit
+    uses: aRustyDev/status/.github/workflows/reconcile.yml@3e08bf162be6b1c6b5371df91c4886da83de1afc
+    with:
+      fixture: false

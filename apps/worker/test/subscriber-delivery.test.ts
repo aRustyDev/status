@@ -28,10 +28,10 @@ function fixture(send?: () => Promise<unknown>) {
     CREATE TABLE subscription_settings(id INTEGER PRIMARY KEY,enabled INTEGER,allow_email INTEGER,allowed_events TEXT,updated_at INTEGER);
     INSERT INTO subscription_settings VALUES (1,1,1,'["incident.created"]',0);
     INSERT INTO subscribers VALUES (1,'test@example.test','active','["incident.created"]','["component-a"]',NULL,NULL,0,'owner');`)
-  local.sqlite.exec(readFileSync(new URL('../migrations/0019_subscriber_deliveries.sql',import.meta.url),'utf8'))
-  local.sqlite.exec(readFileSync(new URL('../migrations/0020_preview_subscribers.sql',import.meta.url),'utf8'))
-  local.sqlite.exec(readFileSync(new URL('../migrations/0021_preview_audit_scope.sql',import.meta.url),'utf8'))
-  local.sqlite.exec(readFileSync(new URL('../migrations/0022_preview_audit_events.sql',import.meta.url),'utf8'))
+  local.sqlite.exec(readFileSync(new URL('../migrations/0020_subscriber_deliveries.sql',import.meta.url),'utf8'))
+  local.sqlite.exec(readFileSync(new URL('../migrations/0021_preview_subscribers.sql',import.meta.url),'utf8'))
+  local.sqlite.exec(readFileSync(new URL('../migrations/0022_preview_audit_scope.sql',import.meta.url),'utf8'))
+  local.sqlite.exec(readFileSync(new URL('../migrations/0023_preview_audit_events.sql',import.meta.url),'utf8'))
   let calls = 0
   const env = { DB: local as unknown as D1Database, SUBSCRIBER_EMAIL_READY: 'true', SUBSCRIBER_EMAIL_FROM: 'status@example.test', SUBSCRIBER_EMAIL_DESTINATIONS: JSON.stringify([{id:'test',name:'Test',address:'test@example.test'}]), SUBSCRIBER_PUBLIC_URL: 'https://status.example.test', SUBSCRIBER_EMAIL: {send: async () => { calls++; return send ? send() : {messageId:'accepted'} }} as unknown as SendEmail }
   return {local,env,get calls() { return calls }}

@@ -166,7 +166,7 @@ function stableJson(value: unknown): string {
 function effectiveTestConfig(value: Json): Json {
   return { ...value, method: typeof value.method === 'string' ? value.method.toUpperCase() : 'GET', timeoutMs: value.timeoutMs ?? 10_000, attempts: value.attempts ?? 1 }
 }
-async function authenticate(request: Request, env: Env): Promise<User> {
+async function accessIdentity(request: Request, env: Env): Promise<{ issuer: string; subject: string; email: string }> {
   const token = request.headers.get('Cf-Access-Jwt-Assertion')
   if (!token || !env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) throw new HttpError(401, 'Access authentication required')
   const issuer = `https://${env.ACCESS_TEAM_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '')}`
@@ -178,6 +178,10 @@ async function authenticate(request: Request, env: Env): Promise<User> {
     subject = payload.sub
     email = payload.email
   } catch { throw new HttpError(401, 'Invalid Access identity') }
+  return { issuer, subject, email }
+}
+async function authenticate(request: Request, env: Env): Promise<User> {
+  const { issuer, subject, email } = await accessIdentity(request, env)
   await env.DB.prepare('INSERT INTO users (id, issuer, subject, email) VALUES (?, ?, ?, ?) ON CONFLICT(issuer, subject) DO UPDATE SET email=excluded.email').bind(id(), issuer, subject, email).run()
   const user = await env.DB.prepare('SELECT * FROM users WHERE issuer=? AND subject=?').bind(issuer, subject).first<User>()
   if (!user) throw new Error('User lookup failed')
@@ -1176,6 +1180,13 @@ export default {
     let receipt: ReceiptContext | null = null
     try {
       const url = new URL(request.url)
+      // The shared gateway checks preview identity before choosing a release.
+      // This check must not create or update a user in the shared database.
+      if (url.pathname === '/api/v1/auth/preview-verify') {
+        if (request.method !== 'GET') throw new HttpError(405, 'Method not allowed')
+        await accessIdentity(request, env)
+        return json({ ok: true })
+      }
       const user = await authenticate(request, env)
       if (!['GET','HEAD','OPTIONS'].includes(request.method) && request.headers.get('origin') !== url.origin) throw new HttpError(403,'Invalid request origin')
       if (url.pathname === '/api/v1/bsp/admin/backups' || /^\/api\/v1\/bsp\/admin\/backups\/[a-f0-9]{64}\/(verify|download)$/.test(url.pathname)) {

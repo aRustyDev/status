@@ -28,7 +28,7 @@ const operator = { id:'o', email:'o@example.test', role:'operator' }
 const request = (method: string, data?: unknown) => new Request('https://status.example.test', { method, headers: { 'Content-Type':'application/json' }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) })
 function fixture() {
   const local = new DB()
-  for (const file of ['0001_board.sql', '0004_aliases.sql', '0018_subscribers.sql', '0020_preview_subscribers.sql', '0021_preview_audit_scope.sql', '0022_preview_audit_events.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
+  for (const file of ['0001_board.sql', '0004_aliases.sql', '0019_subscribers.sql', '0021_preview_subscribers.sql', '0022_preview_audit_scope.sql', '0023_preview_audit_events.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
   local.db.exec("INSERT INTO users (id,issuer,subject,email,role) VALUES ('a','issuer','a','a@example.test','viewer'),('b','issuer','b','b@example.test','viewer'),('o','issuer','o','o@example.test','operator')")
   local.db.exec("UPDATE subscription_settings SET enabled=1,allow_email=1 WHERE id=1")
   const messages: Array<{text:string}> = []

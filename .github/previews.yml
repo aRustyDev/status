@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "workflows": {
+    "ci": "ci.yml",
+    "preview": "branch-previews.yml"
+  },
+  "branches": {
+    "feat": "dev",
+    "fix": "dev",
+    "stage": "stage",
+    "schema": "schema"
+  },
+  "compatibilityDate": "2026-11-23",
+  "smokePath": "/",
+  "launcher": "scripts/preview-browser.mjs",
+  "database": {
+    "migrations": "apps/worker/migrations",
+    "seed": ".github/previews/seed.sql"
+  },
+  "build": [
+    [
+      "npm",
+      "ci"
+    ],
+    [
+      "npm",
+      "run",
+      "build",
+      "-w",
+      "@bsp/shared"
+    ],
+    [
+      "npm",
+      "run",
+      "build",
+      "-w",
+      "@bsp/board"
+    ],
+    [
+      "npm",
+      "run",
+      "build",
+      "-w",
+      "@bsp/status"
+    ],
+    [
+      "npm",
+      "run",
+      "build",
+      "-w",
+      "@bsp/admin"
+    ]
+  ],
+  "components": {
+    "probe": {
+      "suffix": "probe",
+      "entry": "apps/probe/src/index.ts",
+      "database": true,
+      "settingsVars": "probeVars",
+      "fromSettings": {
+        "ENDPOINTS": "endpoints"
+      },
+      "vpc": true
+    },
+    "api": {
+      "suffix": "operations",
+      "entry": "apps/gateway/api.ts",
+      "assets": "apps/board/dist",
+      "database": true,
+      "settingsVars": "apiVars",
+      "fromSettings": {
+        "ACCESS_TEAM_DOMAIN": "accessTeamDomain",
+        "ACCESS_AUD": "accessAud",
+        "ENDPOINTS": "endpoints"
+      },
+      "services": {},
+      "vars": {
+        "API_SCOPE": "operations",
+        "PREVIEW_SUBSCRIBER_REQUIRED": "true",
+        "SUBSCRIBERS_READY": "false",
+        "SUBSCRIBER_EMAIL_READY": "false"
+      },
+      "subscriberScope": true,
+      "releaseVar": true
+    },
+    "statusApi": {
+      "suffix": "status-api",
+      "entry": "apps/gateway/api.ts",
+      "assets": "apps/board/dist",
+      "database": true,
+      "settingsVars": "statusApiVars",
+      "fromSettings": {
+        "ACCESS_TEAM_DOMAIN": "accessTeamDomain",
+        "ACCESS_AUD": "accessAud",
+        "ENDPOINTS": "endpoints"
+      },
+      "services": {},
+      "vars": {
+        "API_SCOPE": "status",
+        "PREVIEW_SUBSCRIBER_REQUIRED": "true",
+        "SUBSCRIBERS_READY": "false",
+        "SUBSCRIBER_EMAIL_READY": "false"
+      },
+      "subscriberScope": true,
+      "releaseVar": true
+    },
+    "monitoring": {
+      "suffix": "monitoring-api",
+      "entry": "apps/gateway/api.ts",
+      "assets": "apps/board/dist",
+      "database": true,
+      "settingsVars": "monitoringVars",
+      "fromSettings": {
+        "ACCESS_TEAM_DOMAIN": "accessTeamDomain",
+        "ACCESS_AUD": "accessAud",
+        "ENDPOINTS": "endpoints"
+      },
+      "services": {
+        "PROBE": "probe"
+      },
+      "vars": {
+        "API_SCOPE": "monitoring",
+        "PREVIEW_SUBSCRIBER_REQUIRED": "true",
+        "SUBSCRIBERS_READY": "false",
+        "SUBSCRIBER_EMAIL_READY": "false"
+      },
+      "subscriberScope": true,
+      "releaseVar": true
+    },
+    "status": {
+      "suffix": "status-ui",
+      "entry": "apps/gateway/assets.ts",
+      "assets": "apps/status/dist"
+    },
+    "admin": {
+      "suffix": "admin-ui",
+      "entry": "apps/gateway/assets.ts",
+      "assets": "apps/admin/dist"
+    },
+    "gateway": {
+      "suffix": "gateway",
+      "entry": "apps/gateway/index.ts",
+      "vars": {
+        "UI_MODE": "upstream"
+      },
+      "fromSettings": {
+        "UI_MODE": "uiMode"
+      },
+      "services": {
+        "API": "api",
+        "STATUS_API": "statusApi",
+        "MONITORING_API": "monitoring",
+        "STATUS_UI": "status",
+        "ADMIN_UI": "admin"
+      }
+    }
+  }
+}
