@@ -29,7 +29,7 @@ const checkA = '00000000-0000-4000-8000-000000000001'
 const checkB = '00000000-0000-4000-8000-000000000002'
 function setup(applyLimit = true) {
   const local = new DB()
-  for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0010_monitor_alert_links.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
+  for (const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0010_monitor_alert_links.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0018_delivery_history.sql']) local.db.exec(readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8'))
   if (applyLimit) local.db.exec(readFileSync(new URL('../migrations/0014_monitor_alert_channel_limit.sql',import.meta.url),'utf8'))
   local.db.exec("INSERT INTO users (id,issuer,subject,email,role) VALUES ('admin','issuer','subject','admin@example.test','admin')")
   local.db.exec("INSERT INTO components (id,name,updated_at) VALUES ('component-a','A',0),('component-b','B',0),('manual','Manual',0)")
@@ -285,7 +285,7 @@ test('Workerd D1 serializes concurrent rename and association edits', {skip:!pro
   const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response()}}',d1Databases:['DB']}))
   try {
     const db=await mf.getD1Database('DB') as unknown as D1Database
-    for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0010_monitor_alert_links.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0014_monitor_alert_channel_limit.sql']) {
+    for(const file of ['0001_board.sql','0002_checks.sql','0003_endpoint_registry.sql','0005_gatus_sources.sql','0006_advanced_http.sql','0008_vault.sql','0009_monitor_auth.sql','0009_channels.sql','0010_monitor_alert_links.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0014_monitor_alert_channel_limit.sql','0018_delivery_history.sql']) {
       const sql=readFileSync(new URL(`../migrations/${file}`,import.meta.url),'utf8').replace(/^\s*--[^\n]*$/gm,'')
       const parts=sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements=parts.shift()!.split(';').map(value=>value.trim()).filter(Boolean)

@@ -79,6 +79,9 @@ async function withDeadline(fetcher: Fetcher, request: Request): Promise<Respons
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    // Preview requests must never fall back to the shared environment snapshot.
+    // Forward even empty or invalid selectors so the gateway can reject them.
+    if (request.headers.has('X-Status-Preview')) return env.GATEWAY.fetch(request)
     const url = new URL(request.url)
     if (url.pathname.startsWith(prefix)) return protectedCopy(request, env, url.pathname)
     if (request.method !== 'GET' || url.pathname !== '/' || !request.headers.get('accept')?.includes('text/html')) return env.GATEWAY.fetch(request)

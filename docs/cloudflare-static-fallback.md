@@ -4,6 +4,8 @@ Static fallback keeps a saved status-page snapshot in a private R2 bucket. Admin
 
 The fallback Worker runs on a route in front of the gateway's Custom Domain. It tries the live reader and status API for a navigation to `/`. If either fails or times out, it serves the last successful snapshot and its own status-reader assets. The snapshot banner shows when the copy was taken and warns when it is stale. Reloading after the live page recovers returns to the live reader. Admin routes, API requests, and writes continue to the gateway. A saved copy remains in the bucket after publication is disabled, but the Worker stops serving it.
 
+Requests with an `X-Status-Preview` header go directly to the gateway, including requests for fallback paths. Preview failures therefore cannot display the shared staging snapshot.
+
 The fallback Worker validates the Cloudflare Access JWT before serving the copy, assets, or snapshot. Protect the entire hostname with the existing Access application. Keep the bucket private, disable workers.dev and preview URLs, and do not expose its contents through a public R2 domain. Fallback serving does not require the gateway or D1, but still depends on Cloudflare Access, Workers, R2, and DNS.
 
 ## Deployment

@@ -9,7 +9,11 @@ let route: Record<string, unknown> = { selector, release, target: 'a', expiresAt
 let enabled = true
 let flagError: string | undefined
 let identityStatus = 200
-const api = { fetch: async () => new Response('{}', { status: identityStatus }) }
+const api = { fetch: async (req: Request) => {
+  assert.equal(new URL(req.url).pathname, '/api/v1/auth/preview-verify')
+  assert.equal(req.method, 'GET')
+  return new Response('{}', { status: identityStatus })
+} }
 const flags = {
   getBooleanDetails: async () => ({ value: enabled }),
   getObjectDetails: async () => ({ value: route, errorCode: flagError }),
@@ -27,6 +31,14 @@ test('routes an authenticated request through Flagship and the selected binding'
   assert.equal(await response.text(), 'feature')
   assert.equal(response.headers.get('X-Status-Preview-Commit'), release)
   assert.equal(response.headers.get('Cache-Control'), 'no-store')
+})
+
+test('checks branch previews with the verification-only endpoint', async () => {
+  const branchSelector = 'branch-' + 'a'.repeat(24)
+  const dispatcher = { fetch: async () => new Response('branch feature') }
+  const response = await gateway.fetch(request(branchSelector), { API: api, PREVIEW_DISPATCHER: dispatcher } as never)
+  assert.equal(response.status, 200)
+  assert.equal(await response.text(), 'branch feature')
 })
 
 test('rejects malformed, unknown, and expired selectors', async () => {
