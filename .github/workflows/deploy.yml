@@ -58,7 +58,7 @@ jobs:
           ref: ${{ inputs.fixture && 'main' || github.event.repository.default_branch }}
           path: control
           persist-credentials: false
-      - uses: aRustyDev/status/.github/actions/branch-previews@1abfea92c66e76bb4003d8055f69b2cb710c0a0c
+      - uses: aRustyDev/status/.github/actions/branch-previews@e4ed0fb43fc08974e4dff852c66acb849021064c
         with:
           operation: check
           config: ${{ inputs.config }}
@@ -70,7 +70,7 @@ jobs:
           ref: ${{ inputs.sha }}
           path: feature
           persist-credentials: false
-      - uses: aRustyDev/status/.github/actions/branch-previews@1abfea92c66e76bb4003d8055f69b2cb710c0a0c
+      - uses: aRustyDev/status/.github/actions/branch-previews@e4ed0fb43fc08974e4dff852c66acb849021064c
         with:
           operation: build
           config: ${{ inputs.config }}
@@ -121,7 +121,7 @@ jobs:
           path: control
           persist-credentials: false
           token: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
-      - uses: aRustyDev/status/.github/actions/branch-previews@1abfea92c66e76bb4003d8055f69b2cb710c0a0c
+      - uses: aRustyDev/status/.github/actions/branch-previews@e4ed0fb43fc08974e4dff852c66acb849021064c
         with:
           operation: check
           config: ${{ inputs.config }}
@@ -143,7 +143,7 @@ jobs:
           run-id: ${{ steps.verify.outputs.ci_run_id }}
           name: ${{ format('preview-{0}', inputs.sha) }}
           path: ${{ format('{0}/download', runner.temp) }}
-      - uses: aRustyDev/status/.github/actions/branch-previews@1abfea92c66e76bb4003d8055f69b2cb710c0a0c
+      - uses: aRustyDev/status/.github/actions/branch-previews@e4ed0fb43fc08974e4dff852c66acb849021064c
         with:
           operation: deploy
           config: ${{ inputs.config }}
