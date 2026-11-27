@@ -68,8 +68,12 @@ async function ownRun(settings, pairs, path) {
     for (const view of viewers) view.close()
     server?.close()
     try {
-      if (provider) await provider.close()
-      await rm(dir, { recursive: true, force: true })
+      try {
+        if (provider) {
+          // Provider shutdown is idempotent. Retry once after a transport failure.
+          try { await provider.close() } catch { await provider.close() }
+        }
+      } finally { await rm(dir, { recursive: true, force: true }) }
       for (const response of closeRequests) response.end('closed')
     } catch (error) {
       for (const response of closeRequests) response.writeHead(500).end('Preview shutdown could not be confirmed.')
