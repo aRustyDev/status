@@ -19,3 +19,18 @@ test('schema approval artifacts are byte-stable across checkout paths', async t 
   }
   assert.deepEqual(results[0],results[1])
 })
+
+test('approved raw worker bundles are byte-stable across checkout paths', async t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'fixture-artifact-'))
+  t.after(() => rmSync(dir,{recursive:true,force:true}))
+  const results = []
+  for (const name of ['first','second']) {
+    const root = path.join(dir,name)
+    mkdirSync(root)
+    writeFileSync(path.join(root,'dependency.js'),'export function value() { return 42 }\n')
+    writeFileSync(path.join(root,'worker.js'),`import {value} from './dependency.js'; export default { fetch() {return new Response(String(value()))} }`)
+    const {outputFiles} = await build(schemaBuildOptions({bundle:true,write:false,format:'esm',platform:'browser',entryPoints:[path.join(root,'worker.js')]}))
+    results.push(outputFiles[0].contents)
+  }
+  assert.deepEqual(results[0],results[1])
+})

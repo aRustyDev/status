@@ -18,7 +18,7 @@ export async function buildArtifact(feature, output) {
   mkdirSync(path.join(output,'workers'),{recursive:true})
   for (const [id,c] of Object.entries(manifest.components)) {
     const entry = ownedPath(feature,c.entry)
-    const options = {bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers',id+'.mjs')}
+    const options = schemaBuildOptions({absWorkingDir:feature, bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers',id+'.mjs')})
     if (id === 'gateway') {
       // The wrapper verifies the binding selected by the dispatcher before calling the app.
       const contents = [
@@ -47,10 +47,25 @@ export async function buildArtifact(feature, output) {
     const source = ownedPath(feature, manifest.schemaSubscriber.entry)
     const wrapper = fileURLToPath(new URL('../runtime/branch-subscriber-scheduler.mjs', import.meta.url))
     const contents = `import { runBranchSubscriberScheduler } from ${JSON.stringify(wrapper)}\nimport { PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT, flushPreviewSubscriberDeliveries } from ${JSON.stringify(source)}\nexport default { async scheduled(_event, env) { if (PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT === 2) await runBranchSubscriberScheduler(env, flushPreviewSubscriberDeliveries) } }\n`
-    await build(schemaBuildOptions({bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers','subscriber.mjs'), stdin:{contents,resolveDir:feature,sourcefile:'schema-subscriber.mjs'}}))
+    await build(schemaBuildOptions({absWorkingDir:feature, bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers','subscriber.mjs'), stdin:{contents,resolveDir:feature,sourcefile:'schema-subscriber.mjs'}}))
     const files = ['preview-subscriber-scheduler.ts', 'subscriber-delivery.ts', 'subscribers.ts', 'email-channel.ts', 'idempotency.ts', 'index.ts']
     const hashes = Object.fromEntries(files.map(name => [name, createHash('sha256').update(readFileSync(ownedPath(feature, `apps/worker/src/${name}`))).digest('hex')]))
     writeFileSync(path.join(output,'workers','subscriber-source.json'), JSON.stringify(hashes))
+  }
+  // The optional fixture target is still built from the CI-tested feature
+  // source in this credential-free job. The path itself is trusted manifest
+  // configuration; absence is handled by the deployment policy.
+  if (manifest.fixtures?.casEntry && existsSync(path.join(feature, manifest.fixtures.casEntry))) {
+    await build(schemaBuildOptions({ absWorkingDir:feature, entryPoints:[ownedPath(feature, manifest.fixtures.casEntry)], bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers','cas.mjs') }))
+  }
+  // Feature scheduler code is untrusted data. The privileged deploy job wraps
+  // this already-built module using controller-owned fencing code.
+  if (manifest.fixtures?.subscriberEntry && existsSync(path.join(feature, manifest.fixtures.subscriberEntry))) {
+    const options = schemaBuildOptions({ absWorkingDir:feature, bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'] })
+    await build({ ...options, entryPoints:[ownedPath(feature, manifest.fixtures.subscriberEntry)], outfile:path.join(output,'workers','subscriber-feature.mjs') })
+    // The normal api.mjs intentionally contains the legacy schema wrapper.
+    // The new fixture authorization must wrap the raw feature API exactly once.
+    await build({ ...options, entryPoints:[ownedPath(feature, manifest.components.api.entry)], outfile:path.join(output,'workers','api-feature.mjs') })
   }
   cpSync(ownedPath(feature,manifest.database.migrations),path.join(output,'migrations'),{recursive:true})
 }

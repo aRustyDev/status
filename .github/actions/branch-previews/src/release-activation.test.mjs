@@ -24,19 +24,20 @@ test('schema scheduler fence revokes old release before activating and publishin
   const events = []
   const adapter = createActivationAdapter({store:{list:async()=>[{record}]},appId:'app',accountId:'account',token:'token',dispatcherName:'dispatcher',dispatcherSource:'/trusted.ts',directory,run:async()=>{},verificationSecret:'x'.repeat(32),previewUrl:'https://preview.example',accessTeamDomain:'team',accessAud:'aud',serviceTokenId:'service',wait:async()=>{},
     subscriberFence:{revoke:async()=>events.push('revoke'),activate:async()=>events.push('activate')},
+    executionFenceFor:async()=>({controller:{beginActivation:async()=>events.push('drain'),finishActivation:async()=>events.push('finish')},previousRelease:oldSha}),
     fetchImpl:async (url,options) => {
       if (url === 'https://preview.example/__preview/verify') return {ok:true,headers:new Headers({'X-Status-Preview-Commit':sha})}
       if (options.method === 'PUT') {events.push('publish');flag=JSON.parse(options.body)}
       return {ok:true,json:async()=>({success:true,result:flag})}
     }})
   await adapter({ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active})
-  assert.deepEqual(events,['revoke','activate','publish'])
+  assert.deepEqual(events,['revoke','activate','drain','publish','finish'])
   // A new release without approval still revokes its opted-in predecessor.
   events.length = 0
   record.candidate.resources.workers = {}
   flag = {enabled:true,default_variation:'current',rules:[],variations:{current:{selector:record.selector,release:oldSha}}}
   await adapter({ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active})
-  assert.deepEqual(events,['revoke','activate','publish'])
+  assert.deepEqual(events,['revoke','activate','drain','publish','finish'])
 })
 
 test('published schema candidate recovers after approval expires without enabling mail', async t => {
@@ -118,6 +119,18 @@ test('does not publish a flag if the candidate remains unavailable', async t => 
   assert.equal(waits, 60)
 })
 
+test('a fenced release appearing after a lazy inventory scan cannot publish without a fence controller', async t => {
+  const directory=mkdtempSync(path.join(tmpdir(),'preview-lazy-fence-'))
+  t.after(()=>rmSync(directory,{force:true,recursive:true}))
+  const record=newRelease({ref,sha}), stem=`status-p-${createHash('sha256').update(`${record.selector}:${sha}`).digest('hex').slice(0,24)}`
+  record.candidate={sha,generation:1,phase:'activating',resources:{gateway:`${stem}-gateway`,workers:{fence:`${stem}-fence`}}}
+  let published=false
+  const adapter=createActivationAdapter({store:{list:async()=>[{record}]},appId:'app',accountId:'account',token:'token',dispatcherName:'dispatcher',dispatcherSource:'/trusted.ts',directory,run:async()=>{},verificationSecret:'x'.repeat(32),previewUrl:'https://preview.example',accessTeamDomain:'team',accessAud:'aud',serviceTokenId:'service',wait:async()=>{},
+    fetchImpl:async url=>{if(url==='https://preview.example/__preview/verify') return {ok:true,headers:new Headers({'X-Status-Preview-Commit':sha})};published=true;return {status:404}}})
+  await assert.rejects(adapter({ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active:null}),/Missing execution fence/)
+  assert.equal(published,false)
+})
+
 test('reports the last HTTP status after the full propagation window', async t => {
   const directory = mkdtempSync(path.join(tmpdir(), 'preview-activation-'))
   t.after(() => rmSync(directory, { force: true, recursive: true }))
@@ -187,4 +200,35 @@ test('reuses only a cleared tombstone for a branch with no active release', asyn
     assert.equal(result.writes, 0)
     assert.match(result.error?.message || '', /Unexpected existing Flagship state/)
   }
+})
+
+test('execution fence drains before publishing and activates only after edge verification', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'preview-activation-fence-'))
+  t.after(() => rmSync(directory, {force:true,recursive:true}))
+  const record = newRelease({ref,sha})
+  const stem = createHash('sha256').update(`${record.selector}:${sha}`).digest('hex').slice(0,24)
+  record.candidate = {sha,generation:1,phase:'activating',resources:{gateway:`status-p-${stem}-gateway`}}
+  const events = []
+  let flag = null, failEdge = true
+  const controller = {
+    async beginActivation(args) { events.push('drain'); assert.equal(args.previousRelease,null) },
+    async finishActivation() { events.push('activate') },
+  }
+  const adapter = createActivationAdapter({store:{list:async()=>[{record}]},appId:'app',accountId:'account',token:'token',dispatcherName:'dispatcher',dispatcherSource:'/trusted/dispatcher.ts',directory,run:async()=>{},verificationSecret:'x'.repeat(32),previewUrl:'https://preview.example',accessTeamDomain:'team.cloudflareaccess.com',accessAud:'aud',serviceTokenId:'client.access',wait:async()=>{},executionFenceFor:async()=>({controller,previousRelease:null}),
+    fetchImpl:async(url,options)=> {
+      if (url === 'https://preview.example/__preview/verify') {
+        if (options.headers['X-Status-Preview-Verify'].includes('.candidate.')) {events.push('candidate'); return {ok:true,headers:new Headers({'X-Status-Preview-Commit':sha})}}
+        if (failEdge) return {ok:false,status:503}
+        events.push('edge'); return {ok:true,headers:new Headers({'X-Status-Preview-Commit':sha})}
+      }
+      if (options.method === 'POST') {events.push('publish'); flag=JSON.parse(options.body)}
+      return flag ? {ok:true,status:200,json:async()=>({success:true,result:flag})} : {status:404}
+    },
+  })
+  const input={ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active:null}
+  await assert.rejects(adapter(input),/Preview route did not confirm/)
+  assert.deepEqual(events,['candidate','drain','publish'])
+  failEdge=false
+  await adapter(input)
+  assert.deepEqual(events,['candidate','drain','publish','candidate','drain','edge','activate'])
 })
