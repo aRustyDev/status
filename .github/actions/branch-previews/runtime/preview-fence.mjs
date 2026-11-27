@@ -62,7 +62,7 @@ export default {
         if (!row) return new Response(null, { status: 409 })
         return Response.json({ token })
       }
-      if (!['/check', '/release', '/claim-email'].includes(path)) return new Response(null, { status: 404 })
+      if (!['/check', '/release', '/claim-email', '/claim-reservation'].includes(path)) return new Response(null, { status: 404 })
       const body = await readSmallJson(request)
       if (!body || !/^[a-f0-9-]{36}$/.test(body.token || '')) return new Response(null, { status: 400 })
       if (path === '/release') {
@@ -73,6 +73,18 @@ export default {
       }
       if (!await current(env, id, body.token)) return new Response(null, { status: 409 })
       if (path === '/check') return new Response(null, { status: 204 })
+      if (path === '/claim-reservation') {
+        if (!['delivery','confirmation'].includes(body.kind) || typeof body.item !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(body.item) || (body.kind === 'confirmation' && !/^[a-f0-9]{64}$/.test(body.item))) return new Response(null, { status: 400 })
+        // The trusted service fixes selector and release; callers cannot
+        // choose another preview. Each release owns a separate database; an
+        // ambiguous delivery cannot be retried with a different claim there.
+        const row = await env.INVENTORY.prepare(`INSERT OR IGNORE INTO preview_mail_reservations(selector,release,kind,item)
+          SELECT ?,?,?,? WHERE ? > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+          AND EXISTS (SELECT 1 FROM preview_execution_fences f JOIN preview_execution_leases l ON l.selector=f.selector AND l.release=f.active_release
+            WHERE f.selector=? AND f.active_release=? AND f.state='active' AND l.lease_id=?) RETURNING selector`)
+          .bind(id.selector,id.release,body.kind,body.item,id.expiresAt,id.selector,id.release,body.token).first()
+        return new Response(null, { status: row && id.expiresAt > Date.now() ? 204 : 409 })
+      }
       const now = Date.now()
       const row = await env.INVENTORY.prepare(`INSERT INTO preview_email_quota (selector, sent_at)
         SELECT ?, ? WHERE (SELECT count(*) FROM preview_email_quota WHERE selector=? AND sent_at>?) < 4

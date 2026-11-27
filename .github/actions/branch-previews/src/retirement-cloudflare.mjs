@@ -90,7 +90,7 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
       await run(['deploy', '--dry-run', '--config', configPath])
       await run(['deploy', '--config', configPath])
     },
-    async deleteOwnedResources({ ref, release }) {
+    async deleteOwnedResources({ ref, release, deferReservationCleanup = false }) {
       const selector = `branch-${branchKey(ref)}`
       if (!/^[a-f0-9]{40}$/.test(release.sha)) throw new Error('Invalid release SHA')
       const stem = installation().workerStem(selector, release.sha)
@@ -109,22 +109,28 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
       if (workers?.subscriberScheduler && workers?.subscriberFeature && workers?.mailer && workers?.fence && workers?.fixture) suffixes.subscriberScheduler = 'subscriber-scheduler'
       if (workers?.authorization && workers?.mailer && workers?.fence && workers?.fixture) suffixes.authorization = 'authorization'
       if (!workers || Object.keys(workers).length !== Object.keys(suffixes).length || Object.entries(suffixes).some(([key, suffix]) => workers[key] !== `${stem}-${suffix}`) || release.resources.gateway !== workers.gateway) throw new Error('Worker ownership verification failed')
+      if (workers.fence && (!executionFence || typeof executionFence.assertReleaseQuiescent !== 'function' || typeof executionFence.deleteReleaseReservations !== 'function')) throw new Error('Missing execution fence for fixture cleanup')
+      if (workers.mailer && !deferReservationCleanup && release.resources.database?.owned !== true) throw new Error('Missing owned preview database for reservation cleanup')
+      if (workers.fence) await executionFence.assertReleaseQuiescent(selector, release.sha)
       // Delete in reverse service dependency order. Never use force.
       const order = (workers.subscriber ? ['subscriber'] : []).concat(workers.subscriberScheduler ? ['subscriberScheduler'] : [], workers.probeScheduler ? ['probeScheduler'] : [], Object.keys(installation().manifest.components).reverse(), workers.subscriberFeature ? ['subscriberFeature'] : [], workers.authorization ? ['authorization'] : [], workers.mailer ? ['mailer'] : [], workers.cas ? ['cas'] : [], workers.fixture ? ['fixture'] : [], workers.fence ? ['fence'] : [])
       for (const key of order) await request(`${base}/workers/scripts/${encodeURIComponent(workers[key])}`, 'DELETE')
       for (const database of [release.resources.database, release.resources.validationDatabase]) {
         if (database?.owned) await deleteOwnedDatabase({ database, config: databaseConfig, adapter: databaseAdapter, ref, sha: release.sha })
       }
+      if (workers.mailer && !deferReservationCleanup) await executionFence.deleteReleaseReservations(selector, release.sha)
     },
     async deleteAbandonedResources({ ref, release }) {
       const resources = release.resources || {}
-      if (resources.workers) await this.deleteOwnedResources({ ref, release: { ...release, resources: { ...resources, database: null, validationDatabase: null } } })
+      if (resources.workers) await this.deleteOwnedResources({ ref, release: { ...release, resources: { ...resources, database: null, validationDatabase: null } }, deferReservationCleanup:true })
       for (const database of [resources.database, resources.validationDatabase]) {
         if (database?.owned) await deleteOwnedDatabase({ database, config: databaseConfig, adapter: databaseAdapter, ref, sha: release.sha })
       }
       // Intent alone is not proof of a database's identity. Keep the record
       // for an operator rather than deleting a potentially unrelated D1.
-      return { unresolved: Boolean((resources.databaseIntent && !resources.database) || (resources.validationDatabaseIntent && !resources.validationDatabase)) }
+      const unresolved = Boolean((resources.databaseIntent && !resources.database) || (resources.validationDatabaseIntent && !resources.validationDatabase))
+      if (!unresolved && resources.workers?.mailer) await executionFence.deleteReleaseReservations(`branch-${branchKey(ref)}`, release.sha)
+      return { unresolved }
     },
   }
 }

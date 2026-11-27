@@ -52,9 +52,11 @@ export async function ensureExecutionFenceSchema(query) {
     preview_execution_fences: ['selector','active_release','state'],
     preview_execution_leases: ['lease_id','selector','release'],
     preview_email_quota: ['selector','sent_at'],
+    preview_mail_reservations: ['selector','release','kind','item'],
   })) {
     const columns = await query(`PRAGMA table_info(${table})`, [])
     if (!Array.isArray(columns) || names.some(name => !columns.some(column => column.name === name))) throw new Error('Incompatible execution fence schema')
+    if (table === 'preview_mail_reservations' && ['selector','release','kind','item'].some((name,index) => !columns.some(column => column.name === name && Number(column.pk) === index + 1))) throw new Error('Incompatible email reservation primary key')
     if (table === 'preview_execution_fences' && columns.some(column => column.name === 'lease_id')) {
       if ((await query('SELECT selector FROM preview_execution_fences WHERE lease_id IS NOT NULL LIMIT 1', [])).length) throw new Error('Legacy execution lease requires manual recovery')
     }
@@ -124,7 +126,14 @@ export function createExecutionFenceController({ query, wait = ms => new Promise
     }
     throw new Error('Preview execution is still leased; manual recovery may be required')
   }
+  async function assertReleaseQuiescent(selector, release) {
+    assertSelector(selector); assertRelease(release)
+    const safety=await query(`SELECT CASE WHEN EXISTS (SELECT 1 FROM preview_execution_leases WHERE selector=? AND release=?)
+      OR EXISTS (SELECT 1 FROM preview_execution_fences WHERE selector=? AND active_release=?) THEN 0 ELSE 1 END AS safe`,[selector,release,selector,release])
+    if (safety.length!==1 || Number(safety[0].safe)!==1) throw new Error('Release reservations are still in use')
+  }
   return {
+    assertReleaseQuiescent,
     async readState(selector) {
       assertSelector(selector)
       const current = await row(selector)
@@ -165,6 +174,18 @@ export function createExecutionFenceController({ query, wait = ms => new Promise
       const current = await row(selector)
       if (!current || (current.state === 'draining' && current.active_release === null && current.leased === 0)) return
       throw new Error('Execution fence could not retire')
+    },
+    // Caller must hold the controller lock and prove this release's Workers
+    // and owned application databases have already been deleted. Never clear
+    // selector-wide quotas or another release's retained reservations.
+    async deleteReleaseReservations(selector, release) {
+      assertSelector(selector); assertRelease(release)
+      await assertReleaseQuiescent(selector, release)
+      await query(`DELETE FROM preview_mail_reservations WHERE selector=? AND release=?
+        AND NOT EXISTS (SELECT 1 FROM preview_execution_leases WHERE selector=? AND release=?)
+        AND NOT EXISTS (SELECT 1 FROM preview_execution_fences WHERE selector=? AND active_release=?) RETURNING item`,[selector,release,selector,release,selector,release])
+      const remain=await query('SELECT item FROM preview_mail_reservations WHERE selector=? AND release=? LIMIT 1',[selector,release])
+      if (remain.length) throw new Error('Release reservation cleanup was not confirmed')
     },
   }
 }

@@ -20,8 +20,11 @@ export async function withActiveBranchExecution(env, run, { leaseToken } = {}) {
     const claimEmail = async () => {
       try { return (await call('claim-email', { token })).status === 204 } catch { return false }
     }
+    const claimReservation = async (kind, item) => {
+      try { return (await call('claim-reservation', { token, kind, item })).status === 204 } catch { return false }
+    }
     if (!await isCurrent()) return false
-    await run(isCurrent, claimEmail, token)
+    await run(isCurrent, claimEmail, token, claimReservation)
     return true
   } finally {
     // If release cannot be confirmed, the control plane must fail closed.
