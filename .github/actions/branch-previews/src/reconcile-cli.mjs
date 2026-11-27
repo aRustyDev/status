@@ -18,6 +18,7 @@ import { recoverCandidate } from './recover-candidate.mjs'
 import { branchKey } from './release-contract.mjs'
 import { cleanupAbandoned } from './cleanup-abandoned.mjs'
 import { cleanupRetained } from './cleanup-retained.mjs'
+import { createSchemaFence } from './schema-subscriber.mjs'
 
 function object(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Missing ${name}`)
@@ -48,11 +49,12 @@ export async function reconcile(env = process.env) {
   const temp = await mkdtemp(path.join(tmpdir(), 'status-preview-reconcile-'))
   try {
     const databaseAdapter = cloudflareDatabaseAdapter({ accountId, token, wrangler, seedSql: readFileSync(ownedPath(control,manifest.database.seed),'utf8'), recordDatabase: async () => {} })
+    const subscriberFence = createSchemaFence({ query:databaseAdapter.query, findDatabase:databaseAdapter.findDatabase, config:{...databaseConfig, inventoryDatabaseId:config.inventoryDatabaseId} })
     const run = async args => execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
     const dispatcherName = text(config.dispatcherName, 'dispatcher name')
     const dispatcherSource = path.join(root, 'runtime/dispatcher.ts')
-    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run })
-    const activate = createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory: temp, run, verificationSecret: text(secrets.verificationSecret, 'verification secret'), previewUrl: text(config.previewUrl, 'preview URL'), accessHeaders: object(secrets.accessHeaders, 'Access headers'), accessTeamDomain: dispatcherVars.ACCESS_TEAM_DOMAIN, accessAud: dispatcherVars.ACCESS_AUD, serviceTokenId: dispatcherVars.PREVIEW_SERVICE_TOKEN_ID })
+    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run, subscriberFence })
+    const activate = createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory: temp, run, verificationSecret: text(secrets.verificationSecret, 'verification secret'), previewUrl: text(config.previewUrl, 'preview URL'), accessHeaders: object(secrets.accessHeaders, 'Access headers'), accessTeamDomain: dispatcherVars.ACCESS_TEAM_DOMAIN, accessAud: dispatcherVars.ACCESS_AUD, serviceTokenId: dispatcherVars.PREVIEW_SERVICE_TOKEN_ID, subscriberFence })
     async function isPublishedCandidate({ ref, sha, selector }) {
       const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/flagship/apps/${encodeURIComponent(appId)}/flags/${installation().flagPrefix}branch-${branchKey(ref)}`
       const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
@@ -64,6 +66,9 @@ export async function reconcile(env = process.env) {
       return flag.enabled === true && flag.default_variation === 'current' && !flag.rules?.length && flag.variations?.current?.selector === selector && flag.variations.current.release === sha
     }
     const result = await reconcilePreviews({ branches, store,
+      revokeAmbiguousSubscribers: async (record, releases) => {
+        for (const release of releases) await subscriberFence.revoke({ref:record.ref, selector:record.selector, release})
+      },
       retire: ref => retireDeletedBranch({ ref, store, readRemoteHead: branches.head, ...adapter }),
       recoverCandidate: (ref, sha, options) => recoverCandidate({ ref, sha, store, readRemoteHead: branches.head, activate, isPublishedCandidate, ...options }),
       cleanupAbandoned: ref => cleanupAbandoned({ ref, store, deleteResources: input => adapter.deleteAbandonedResources(input) }),

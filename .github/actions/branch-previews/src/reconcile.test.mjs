@@ -72,3 +72,18 @@ test('deleted branch leaves an ambiguous activation and active route untouched',
   assert.match(result.errors[0].message, /operator reconciliation/)
   assert.equal(record.active.sha, 'b'.repeat(40))
 })
+
+test('deleted branch with an ambiguous subscriber activation revokes both releases before reporting it', async () => {
+  const ref = 'refs/heads/schema/deleted'
+  const active = {sha:'b'.repeat(40),resources:{workers:{subscriber:'old'}}}
+  const candidate = {sha:'a'.repeat(40),phase:'activating',resources:{workers:{subscriber:'new'}}}
+  const record = {ref,selector:'branch-'+'f'.repeat(24),candidate,active}
+  let revoked = []
+  const result = await reconcilePreviews({
+    branches:{list:async()=>[],head:async()=>null},store:{list:async()=>[{record}]},
+    revokeAmbiguousSubscribers:async (_record,releases)=>{revoked = releases.map(release => release.sha)},
+    retire:async()=>assert.fail('routing remains ambiguous'),ciStatus:async()=>assert.fail(),dispatchCi:async()=>assert.fail(),dispatchPreview:async()=>assert.fail(),
+  })
+  assert.deepEqual(revoked,[active.sha,candidate.sha])
+  assert.match(result.errors[0].message,/operator reconciliation/)
+})

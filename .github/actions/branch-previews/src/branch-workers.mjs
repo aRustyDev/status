@@ -5,7 +5,7 @@ import { installation } from './installation.mjs'
 
 const allowedBindings = new Set(['r2_buckets','kv_namespaces','hyperdrive','analytics_engine_datasets','durable_objects','queues','send_email'])
 
-export function createBranchConfigs({ settings, selector, sha, branchDir, dir }) {
+export function createBranchConfigs({ settings, selector, sha, branchDir, dir, subscriber = null, appId }) {
   if (!/^branch-[0-9a-f]{24}$/.test(selector) || !/^[0-9a-f]{40}$/.test(sha)) throw new Error('Invalid branch release identity')
   const app = installation()
   const { components, compatibilityDate } = app.manifest
@@ -20,6 +20,7 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
       else if (!(key in vars)) throw new Error('Missing environment setting ' + source)
     }
     if (component.subscriberScope) vars.PREVIEW_SUBSCRIBER_SCOPE = createHash('sha256').update(selector).digest('hex')
+    if (subscriber && id === 'api') Object.assign(vars, { PREVIEW_BRANCH_MODE:'schema', PREVIEW_SELECTOR:selector, PREVIEW_SLOT:'1', PREVIEW_TARGET:'a', SUBSCRIBERS_READY:'true', SUBSCRIBER_EMAIL_READY:'true', SUBSCRIBER_EMAIL_FROM:subscriber.sender, SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'preview-test',name:'Preview test',address:subscriber.recipient}]), SUBSCRIBER_PUBLIC_URL:subscriber.publicUrl })
     if (component.releaseVar || id === 'gateway') vars.PREVIEW_RELEASE = sha
     if (id === 'gateway') vars.PREVIEW_SELECTOR = selector
     const services = [...(settings.extraServices?.[id] || []), ...Object.entries(component.services || {}).map(([binding,target]) => ({ binding, service:names[target] }))]
@@ -34,13 +35,26 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
       if (!allowedBindings.has(key) || (key === 'queues' && (!value || Object.keys(value).some(k => k !== 'producers')))) throw new Error('Unsupported resource binding ' + key)
       config[key] = value
     }
+    if (subscriber && id === 'api') {
+      if (!appId) throw new Error('Missing schema authorization service')
+      config.send_email = [{name:'SUBSCRIBER_EMAIL', allowed_sender_addresses:[subscriber.sender], allowed_destination_addresses:[subscriber.recipient]}]
+      config.flagship = [{binding:'FLAGS',app_id:appId}]
+    }
     writeFileSync(path.join(dir,id + '.json'), JSON.stringify(config), {mode:0o600})
+  }
+  if (subscriber) {
+    if (!appId || !settings.d1DatabaseId || !settings.d1DatabaseName) throw new Error('Missing isolated scheduler configuration')
+    names.subscriber = stem + '-subscriber'
+    order.push('subscriber')
+    const vars = { PREVIEW_BRANCH_MODE:'schema', PREVIEW_SELECTOR:selector, PREVIEW_RELEASE:sha, PREVIEW_SLOT:'1', PREVIEW_TARGET:'a', PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:createHash('sha256').update(selector).digest('hex'), SUBSCRIBERS_READY:'true', SUBSCRIBER_EMAIL_READY:'true', SUBSCRIBER_EMAIL_FROM:subscriber.sender, SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'preview-test',name:'Preview test',address:subscriber.recipient}]), SUBSCRIBER_PUBLIC_URL:subscriber.publicUrl }
+    const config = {name:names.subscriber, main:path.join(branchDir,'workers/subscriber.mjs'), compatibility_date:compatibilityDate, workers_dev:false, preview_urls:false, observability:{enabled:true}, vars, d1_databases:[{binding:'DB',database_id:settings.d1DatabaseId,database_name:settings.d1DatabaseName}], flagship:[{binding:'FLAGS',app_id:appId}], send_email:[{name:'SUBSCRIBER_EMAIL',allowed_sender_addresses:[subscriber.sender],allowed_destination_addresses:[subscriber.recipient]}], triggers:{crons:['* * * * *']}}
+    writeFileSync(path.join(dir,'subscriber.json'), JSON.stringify(config), {mode:0o600})
   }
   return { names, order }
 }
 
-export async function deployBranchWorkers({ settings, selector, sha, branchDir, dir, run, installSecrets }) {
-  const {names,order} = createBranchConfigs({settings,selector,sha,branchDir,dir})
+export async function deployBranchWorkers({ settings, selector, sha, branchDir, dir, run, installSecrets, subscriber = null, appId }) {
+  const {names,order} = createBranchConfigs({settings,selector,sha,branchDir,dir,subscriber,appId})
   for (const dry of [true,false]) {
     for (const id of order) {
       const args = ['deploy','--no-bundle','--config',path.join(dir,id + '.json'),'--experimental-auto-create=false']

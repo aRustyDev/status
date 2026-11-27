@@ -6,7 +6,7 @@ import { candidateVerificationHeader } from './verify-candidate.mjs'
 
 // The caller must serialize all dispatcher and Flagship writers. Candidate
 // verification must reach the private candidate before the Flagship switch.
-export function createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory, run, verificationSecret, previewUrl, accessTeamDomain, accessAud, serviceTokenId, accessHeaders = {}, fetchImpl = globalThis.fetch, wait = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
+export function createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory, run, verificationSecret, previewUrl, accessTeamDomain, accessAud, serviceTokenId, accessHeaders = {}, fetchImpl = globalThis.fetch, wait = ms => new Promise(resolve => setTimeout(resolve, ms)), subscriberFence }) {
   if (!store || !appId || !accountId || !token || !dispatcherName || !dispatcherSource || !directory || typeof run !== 'function' || typeof verificationSecret !== 'string' || verificationSecret.length < 32 || !previewUrl || !accessTeamDomain || !accessAud || !serviceTokenId) throw new Error('Missing activation configuration or private candidate verifier')
   const apiBase = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/flagship/apps/${encodeURIComponent(appId)}/flags`
   async function request(url, options = {}) {
@@ -60,6 +60,13 @@ export function createActivationAdapter({ store, appId, accountId, token, dispat
     }
     // Worker deployments may still be propagating immediately after upload.
     await verifyPreview('candidate', 60)
+    // Revoke before publishing the new route. If activation fails or times
+    // out, the old scheduler remains fenced until explicit reconciliation.
+    if (active?.resources?.workers?.subscriber || resources?.workers?.subscriber) {
+      if (!subscriberFence) throw new Error('Missing schema subscriber fence')
+      if (active) await subscriberFence.revoke({ ref, selector, release: active })
+      await subscriberFence.activate({ ref, selector, release: { sha, resources } })
+    }
     const flagKey = installation().flagPrefix + 'branch-' + key
     const flagUrl = `${apiBase}/${flagKey}`
     const flag = await request(flagUrl)

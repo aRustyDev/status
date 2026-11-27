@@ -6,7 +6,7 @@ import { deleteOwnedDatabase } from './database.mjs'
 
 // All callers share the deployment workflow's concurrency group. A timed-out
 // flag update stays in the inventory's disabling phase for operator recovery.
-export function createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars = {}, directory, run, databaseConfig, databaseAdapter, fetcher = fetch, now = Date.now, drainMs = 3600_000 }) {
+export function createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars = {}, directory, run, databaseConfig, databaseAdapter, fetcher = fetch, now = Date.now, drainMs = 3600_000, subscriberFence }) {
   if (!accountId || !appId || !token || !store || !dispatcherName || !dispatcherSource || !directory || typeof run !== 'function' || !databaseConfig || !databaseAdapter || !Number.isSafeInteger(drainMs) || drainMs < 3600_000) throw new Error('Invalid retirement configuration')
   const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`
   async function request(url, method = 'GET', body) {
@@ -20,6 +20,13 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
   }
   const flagUrl = ref => `${base}/flagship/apps/${encodeURIComponent(appId)}/flags/${installation().flagPrefix}branch-${branchKey(ref)}`
   async function disableFlag({ ref, selector }) {
+    const snapshot = await store.read(ref)
+    for (const release of [snapshot?.record?.active, snapshot?.record?.previous, ...(snapshot?.record?.retained || [])].filter(Boolean)) {
+      if (release.resources?.workers?.subscriber) {
+        if (!subscriberFence) throw new Error('Missing schema subscriber fence')
+        await subscriberFence.revoke({ref, selector, release})
+      }
+    }
     const flag = await request(flagUrl(ref))
     if (!flag) return
     if (flag.default_variation !== 'current' || flag.rules?.length || !flag.variations?.current || (flag.variations.current.selector !== selector && Object.keys(flag.variations.current).length !== 0)) throw new Error('Unexpected Flagship state before retirement')
@@ -67,6 +74,7 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
       const stem = installation().workerStem(selector, release.sha)
       const suffixes = Object.fromEntries(Object.entries(installation().manifest.components).map(([key, component]) => [key, component.suffix]))
       const workers = release.resources?.workers
+      if (workers?.subscriber) suffixes.subscriber = 'subscriber'
       if (!workers || Object.keys(workers).length !== Object.keys(suffixes).length || Object.entries(suffixes).some(([key, suffix]) => workers[key] !== `${stem}-${suffix}`) || release.resources.gateway !== workers.gateway) throw new Error('Worker ownership verification failed')
       // Delete in reverse service dependency order. Never use force.
       for (const key of Object.keys(suffixes).reverse()) await request(`${base}/workers/scripts/${encodeURIComponent(workers[key])}`, 'DELETE')

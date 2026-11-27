@@ -10,6 +10,27 @@ import { createActivationAdapter } from './release-activation.mjs'
 const ref = 'refs/heads/feat/test'
 const sha = 'a'.repeat(40)
 
+test('schema scheduler fence revokes old release before activating and publishing candidate', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(),'schema-activation-'))
+  t.after(() => rmSync(directory,{recursive:true,force:true}))
+  const ref = 'refs/heads/schema/one', sha = 'a'.repeat(40), oldSha = 'b'.repeat(40)
+  const record = newRelease({ref,sha}), stem = release => `status-p-${createHash('sha256').update(`${record.selector}:${release}`).digest('hex').slice(0,24)}`
+  const active = {sha:oldSha,generation:1,resources:{gateway:stem(oldSha)+'-gateway',workers:{subscriber:stem(oldSha)+'-subscriber'}}}
+  record.active=active
+  record.candidate={sha,generation:1,phase:'activating',resources:{gateway:stem(sha)+'-gateway',workers:{subscriber:stem(sha)+'-subscriber'}}}
+  let flag = {enabled:true,default_variation:'current',rules:[],variations:{current:{selector:record.selector,release:oldSha}}}
+  const events = []
+  const adapter = createActivationAdapter({store:{list:async()=>[{record}]},appId:'app',accountId:'account',token:'token',dispatcherName:'dispatcher',dispatcherSource:'/trusted.ts',directory,run:async()=>{},verificationSecret:'x'.repeat(32),previewUrl:'https://preview.example',accessTeamDomain:'team',accessAud:'aud',serviceTokenId:'service',wait:async()=>{},
+    subscriberFence:{revoke:async()=>events.push('revoke'),activate:async()=>events.push('activate')},
+    fetchImpl:async (url,options) => {
+      if (url === 'https://preview.example/__preview/verify') return {ok:true,headers:new Headers({'X-Status-Preview-Commit':sha})}
+      if (options.method === 'PUT') {events.push('publish');flag=JSON.parse(options.body)}
+      return {ok:true,json:async()=>({success:true,result:flag})}
+    }})
+  await adapter({ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active})
+  assert.deepEqual(events,['revoke','activate','publish'])
+})
+
 test('keeps other bindings and verifies candidate before publishing the flag', async t => {
   const directory = mkdtempSync(path.join(tmpdir(), 'preview-activation-'))
   t.after(() => rmSync(directory, { force: true, recursive: true }))

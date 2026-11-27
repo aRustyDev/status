@@ -41,6 +41,7 @@ export function validateManifest(m) {
   if (Array.from(seen).at(-1) !== 'gateway' || m.components.gateway.suffix !== 'gateway') throw new Error('The gateway must be the last component')
   if (!/^\/(?!\/)[A-Za-z0-9_/.~-]*$/.test(m.smokePath || '')) throw new Error('Invalid application smoke path')
   if (m.launcher) relativePath(m.launcher)
+  if (m.schemaSubscriber) relativePath(m.schemaSubscriber.entry)
   return m
 }
 export function loadManifest(root, filename) {
