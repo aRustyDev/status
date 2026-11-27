@@ -10,8 +10,8 @@ export function previewRule(url, selector) {
   if (target.protocol !== 'https:' || target.username || target.password || !/^[a-z0-9.-]+$/i.test(target.hostname)) {
     throw new Error('The staging URL must be an HTTPS URL with a DNS hostname and no credentials')
   }
-  if (!/^(?:[1-6]\.[a-f0-9]{32}|branch-[a-f0-9]{24})$/.test(selector)) {
-    throw new Error('The preview selector must be a slot or branch selector from the deployment workflow')
+  if (!/^branch-[a-f0-9]{24}$/.test(selector)) {
+    throw new Error('The preview selector must be a branch selector from the deployment workflow')
   }
   const origin = target.origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   return {
@@ -38,7 +38,7 @@ export function previewRule(url, selector) {
 async function main() {
   const [url, selector, ...extra] = process.argv.slice(2)
   if (!url || !selector || extra.length) {
-    throw new Error('Usage: node scripts/preview-browser.mjs <staging-url> <preview-selector>')
+    throw new Error('Usage: node .github/actions/branch-previews/preview-browser.mjs <staging-url> <preview-selector>')
   }
   const { manifest, rules } = previewRule(url, selector)
   const directory = await mkdtemp(join(tmpdir(), 'status-preview-'))

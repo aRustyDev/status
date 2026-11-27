@@ -7,18 +7,9 @@ interface Env {
   MONITORING_API: Fetcher
   ADMIN_UI: Fetcher
   UI_MODE: string
-  FLAGS?: Flagship
   PREVIEW_DISPATCHER?: Fetcher
   PREVIEW_SELECTOR?: string
   PREVIEW_RELEASE?: string
-  [key: `PREVIEW_${number}_${'A' | 'B'}`]: Fetcher
-}
-
-interface PreviewRoute {
-  selector?: string
-  target?: string
-  release?: string
-  expiresAt?: number
 }
 
 function uncached(response: Response, release?: string): Response {
@@ -29,13 +20,11 @@ function uncached(response: Response, release?: string): Response {
 }
 
 async function preview(request: Request, env: Env, selector: string): Promise<Response> {
-  const match = /^([1-6])\.[0-9a-f]{32}$/.exec(selector)
-  const branch = /^branch-[0-9a-f]{24}$/.test(selector)
-  if (!match && !branch) return uncached(new Response('Invalid preview selector', { status: 400 }))
+  if (!/^branch-[0-9a-f]{24}$/.test(selector)) return uncached(new Response('Invalid preview selector', { status: 400 }))
 
   // Only the private dispatcher can authenticate this narrow service probe.
   // Ordinary requests continue through the human-identity check below.
-  if (branch && request.method === 'GET' && new URL(request.url).pathname === '/__preview/verify' && request.headers.has('X-Status-Preview-Verify')) {
+  if (request.method === 'GET' && new URL(request.url).pathname === '/__preview/verify' && request.headers.has('X-Status-Preview-Verify')) {
     if (!env.PREVIEW_DISPATCHER) return uncached(new Response('Preview routing unavailable', { status: 503 }))
     try { return uncached(await env.PREVIEW_DISPATCHER.fetch(request)) }
     catch { return uncached(new Response('Preview routing unavailable', { status: 503 })) }
@@ -50,37 +39,11 @@ async function preview(request: Request, env: Env, selector: string): Promise<Re
     return uncached(new Response('Preview routing unavailable', { status: 503 }))
   }
   if (!identity.ok) return uncached(identity)
-  if (branch) {
-    if (!env.PREVIEW_DISPATCHER) return uncached(new Response('Preview routing unavailable', { status: 503 }))
-    try {
-      const headers = new Headers(request.headers)
-      headers.delete('X-Status-Preview-Release')
-      return uncached(await env.PREVIEW_DISPATCHER.fetch(new Request(request, { headers })))
-    } catch {
-      return uncached(new Response('Preview routing unavailable', { status: 503 }))
-    }
-  }
-  if (!match) return uncached(new Response('Invalid preview selector', { status: 400 }))
-  if (!env.FLAGS) return uncached(new Response('Preview routing unavailable', { status: 503 }))
-
+  if (!env.PREVIEW_DISPATCHER) return uncached(new Response('Preview routing unavailable', { status: 503 }))
   try {
-    const enabled = await env.FLAGS.getBooleanDetails('status-preview-enabled', false)
-    if (enabled.errorCode || !enabled.value) return uncached(new Response('Preview routing unavailable', { status: 503 }))
-    const details = await env.FLAGS.getObjectDetails<PreviewRoute>(`status-preview-slot-${match[1]}`, {})
-    if (details.errorCode) return uncached(new Response('Preview routing unavailable', { status: 503 }))
-    const route = details.value
-    if (route.selector !== selector || typeof route.expiresAt !== 'number' || route.expiresAt <= Date.now()) {
-      return uncached(new Response('Preview not found', { status: 404 }))
-    }
-    if ((route.target !== 'a' && route.target !== 'b') || !route.release || !/^[0-9a-f]{40}$/.test(route.release)) {
-      return uncached(new Response('Preview routing unavailable', { status: 503 }))
-    }
-    const binding = env[`PREVIEW_${match[1]}_${route.target.toUpperCase()}` as `PREVIEW_${number}_${'A' | 'B'}`]
-    if (!binding) return uncached(new Response('Preview routing unavailable', { status: 503 }))
     const headers = new Headers(request.headers)
-    headers.set('X-Status-Preview-Release', route.release)
-    const response = await binding.fetch(new Request(request, { headers }))
-    return uncached(response, route.release)
+    headers.delete('X-Status-Preview-Release')
+    return uncached(await env.PREVIEW_DISPATCHER.fetch(new Request(request, { headers })))
   } catch {
     return uncached(new Response('Preview routing unavailable', { status: 503 }))
   }
