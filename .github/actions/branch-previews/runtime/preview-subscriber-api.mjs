@@ -11,6 +11,7 @@ export function wrapBranchSubscriberApi(app) {
       const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(selector))
       if ([...new Uint8Array(digest)].map(value=>value.toString(16).padStart(2,'0')).join('') !== scope) return new Response(null,{status:503})
       const { PREVIEW_MAILER:mailer, PREVIEW_AUTHORIZATION:authorization, PREVIEW_FENCE, INVENTORY, FLAGS, EMAIL, ...safe } = env
+      void [PREVIEW_FENCE, INVENTORY, FLAGS, EMAIL] // Omit privileged bindings from feature code.
       if (!authorization || typeof authorization.fetch !== 'function') return new Response(null,{status:503})
       const isCurrent = async () => {
         try { return (await authorization.fetch('https://preview-authorization.internal/check')).status === 204 } catch { return false }

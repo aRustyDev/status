@@ -27,6 +27,8 @@ export async function withActiveBranchExecution(env, run, { leaseToken } = {}) {
     // If release cannot be confirmed, the control plane must fail closed.
     if (!inherited) {
       const response = await call('release', { token })
+      // A release failure must override any earlier result so the caller fails closed.
+      // eslint-disable-next-line no-unsafe-finally
       if (response.status !== 204) throw new Error('Preview execution lease could not be released')
     }
   }

@@ -46,6 +46,7 @@ export async function dispatchBranchSubscribers(request, env, dispatch, contract
     // No lease token or central control service crosses into branch code. The
     // restricted mailer independently acquires an authoritative fence lease.
     const {PREVIEW_SCHEDULE_SECRET:_secret,PREVIEW_MAILER:_mailer, ...safe}=env
+    void [_secret, _mailer] // Omit the signing secret and direct mailer from feature code.
     await dispatch({...safe,PREVIEW_SLOT:'1',PREVIEW_TARGET:'a',SUBSCRIBER_EMAIL:branchPreviewEmailProxy(mailer)},async()=>true)
     return new Response(null,{status:204})
   } catch { return new Response(null,{status:503}) }
