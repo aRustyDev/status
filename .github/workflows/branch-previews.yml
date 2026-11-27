@@ -30,7 +30,7 @@ jobs:
   deploy:
     if: vars.PREVIEW_AUTO_ENABLED == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.branch != '' && inputs.sha != '') || (github.event_name == 'workflow_run' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') && github.event.workflow_run.conclusion == 'success'))
     secrets: inherit
-    uses: aRustyDev/status/.github/workflows/deploy.yml@3e08bf162be6b1c6b5371df91c4886da83de1afc
+    uses: aRustyDev/status/.github/workflows/deploy.yml@05370b76532414e4ddeb6260c08bbde6b7b9a011
     with:
       fixture: false
       branch: ${{ github.event.workflow_run.head_branch || inputs.branch }}
@@ -41,6 +41,6 @@ jobs:
       contents: read
       actions: write
     secrets: inherit
-    uses: aRustyDev/status/.github/workflows/reconcile.yml@3e08bf162be6b1c6b5371df91c4886da83de1afc
+    uses: aRustyDev/status/.github/workflows/reconcile.yml@05370b76532414e4ddeb6260c08bbde6b7b9a011
     with:
       fixture: false
