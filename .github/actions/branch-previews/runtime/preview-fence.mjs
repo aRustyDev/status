@@ -3,22 +3,25 @@
 function identity(env) {
   const selector = env.PREVIEW_SELECTOR
   const release = env.PREVIEW_RELEASE
-  if (!/^branch-[a-f0-9]{24}$/.test(selector || '') || !/^[a-f0-9]{40}$/.test(release || '') || !/^[a-z0-9-]+-preview-$/.test(env.PREVIEW_FLAG_PREFIX || '') || !env.INVENTORY || !env.FLAGS) return null
-  return { selector, release }
+  const expiry = env.PREVIEW_FIXTURE_EXPIRES_AT
+  if (!/^branch-[a-f0-9]{24}$/.test(selector || '') || !/^[a-f0-9]{40}$/.test(release || '') || !/^[a-z0-9-]+-preview-$/.test(env.PREVIEW_FLAG_PREFIX || '') || !/^[0-9]{1,16}$/.test(expiry || '') || !Number.isSafeInteger(Number(expiry)) || !env.INVENTORY || !env.FLAGS) return null
+  return { selector, release, expiresAt:Number(expiry) }
 }
 
-async function flagshipActive(env, { selector, release }) {
+async function flagshipActive(env, { selector, release, expiresAt }) {
+  if (expiresAt <= Date.now()) return false
   const enabled = await env.FLAGS.getBooleanDetails(`${env.PREVIEW_FLAG_PREFIX}enabled`, false)
   const route = await env.FLAGS.getObjectDetails(`${env.PREVIEW_FLAG_PREFIX}branch-${selector.slice(7)}`, {})
-  return !enabled.errorCode && enabled.value === true && !route.errorCode && route.value?.selector === selector && route.value?.release === release
+  return expiresAt > Date.now() && !enabled.errorCode && enabled.value === true && !route.errorCode && route.value?.selector === selector && route.value?.release === release
 }
 
 async function current(env, id, token) {
   if (!/^[a-f0-9-]{36}$/.test(token || '') || !await flagshipActive(env, id)) return false
-  return !!await env.INVENTORY.prepare(`SELECT f.selector FROM preview_execution_fences f
+  const row = await env.INVENTORY.prepare(`SELECT f.selector FROM preview_execution_fences f
     JOIN preview_execution_leases l ON l.selector=f.selector AND l.release=f.active_release
     WHERE f.selector=? AND f.active_release=? AND f.state='active' AND l.lease_id=?`)
     .bind(id.selector, id.release, token).first()
+  return !!row && id.expiresAt > Date.now()
 }
 
 async function readSmallJson(request) {

@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import service from './preview-fence.mjs'
 import { withActiveBranchExecution } from './branch-preview-fence.mjs'
 import scheduler from './preview-probe-scheduler.mjs'
+import { wrapPreviewFixture } from './preview-fixture-fence.mjs'
 
 function harness() {
   const db = new DatabaseSync(':memory:')
@@ -15,10 +16,44 @@ function harness() {
   db.prepare(`INSERT INTO preview_execution_fences(selector,active_release,state) VALUES (?,?,'active')`).run(selector, release)
   const INVENTORY = { prepare(sql) { return { bind(...values) { return { async first() { return db.prepare(sql).get(...values) || null } } } } } }
   const FLAGS = { async getBooleanDetails(key) { assert.equal(key, 'status-preview-enabled'); return { value: true } }, async getObjectDetails(key) { assert.equal(key, `status-preview-branch-${selector.slice(7)}`); return { value: route } } }
-  const svcEnv = { PREVIEW_SELECTOR: selector, PREVIEW_RELEASE: release, PREVIEW_FLAG_PREFIX:'status-preview-', INVENTORY, FLAGS }
+  const svcEnv = { PREVIEW_SELECTOR: selector, PREVIEW_RELEASE: release, PREVIEW_FLAG_PREFIX:'status-preview-', PREVIEW_FIXTURE_EXPIRES_AT:String(Date.now()+60000), INVENTORY, FLAGS }
   const PREVIEW_FENCE = { fetch(url, init) { return service.fetch(new Request(url, init), svcEnv) } }
   return { db, selector, release, route, svcEnv, env: { PREVIEW_FENCE } }
 }
+
+test('expired approval blocks acquire and send checks but permits releasing an in-flight lease', async () => {
+  const h = harness()
+  const call = (url, body = {}) => h.env.PREVIEW_FENCE.fetch(`https://preview-fence.internal/${url}`, {method:'POST', body:JSON.stringify(body)})
+  const acquired = await call('acquire')
+  const {token} = await acquired.json()
+  h.svcEnv.PREVIEW_FIXTURE_EXPIRES_AT = String(Date.now()-1)
+  assert.equal((await call('acquire')).status,409)
+  assert.equal((await call('check',{token})).status,409)
+  assert.equal((await call('claim-email',{token})).status,409)
+  assert.equal((await call('release',{token})).status,204)
+  h.db.close()
+})
+
+test('synthetic monitor, Actions and CAS fixture requests are fenced and expire', async () => {
+  const h = harness(), seen=[]
+  const app=wrapPreviewFixture({async fetch(request,env) {
+    assert.equal(env.PREVIEW_FENCE,undefined)
+    assert.equal(env.INVENTORY,undefined)
+    assert.equal(env.FLAGS,undefined)
+    seen.push(new URL(request.url).pathname)
+    return new Response('ok')
+  }})
+  for (const path of ['/monitor','/actions/success','/cas/v1/tickets']) {
+    assert.equal((await app.fetch(new Request(`https://preview-fixture.invalid${path}`),h.env)).status,200)
+  }
+  h.svcEnv.PREVIEW_FIXTURE_EXPIRES_AT=String(Date.now()-1)
+  for (const path of ['/monitor','/actions/success','/cas/v1/tickets']) {
+    assert.equal((await app.fetch(new Request(`https://preview-fixture.invalid${path}`),h.env)).status,503)
+  }
+  assert.deepEqual(seen,['/monitor','/actions/success','/cas/v1/tickets'])
+  assert.equal(h.db.prepare('SELECT count(*) AS n FROM preview_execution_leases').get().n,0)
+  h.db.close()
+})
 
 test('only the active fixed release can acquire and independent leases cannot be stolen', async () => {
   const h = harness()

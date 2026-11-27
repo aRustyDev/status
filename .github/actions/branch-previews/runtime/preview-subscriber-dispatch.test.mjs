@@ -20,7 +20,7 @@ async function harness() {
   const INVENTORY={prepare(sql){return {bind(...args){return {async first(){return control.prepare(sql).get(...args)||null}}}}}}
   const DB={prepare(sql){return {bind(...args){return {async run(){return {meta:{changes:db.prepare(sql).run(...args).changes}}}}}}}}
   const FLAGS={async getBooleanDetails(){return {value:true}},async getObjectDetails(){return {value:{selector,release}}}}
-  const fenceEnv={INVENTORY,FLAGS,PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_FLAG_PREFIX:'status-preview-'}
+  const fenceEnv={INVENTORY,FLAGS,PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_FLAG_PREFIX:'status-preview-',PREVIEW_FIXTURE_EXPIRES_AT:String(Date.now()+60000)}
   const PREVIEW_FENCE={fetch(url,init){return fenceService.fetch(new Request(url,init),fenceEnv)}}
   let send=async()=>{}
   const mailEnv={PREVIEW_FENCE,PREVIEW_MAIL_FROM:'status@example.test',PREVIEW_MAIL_TO:'owner@example.test',PREVIEW_MAIL_PUBLIC_URL:'https://example.test/',EMAIL:{send:async message=>send(message)}}
@@ -56,7 +56,9 @@ test('drain waits for both scheduler and in-flight mailer, while preventing new 
   const started=new Promise(resolve=>{entered=resolve}), wait=new Promise(resolve=>{release=resolve})
   h.setSend(async()=>{entered();await wait})
   const tick=scheduler.scheduled({scheduledTime:Date.now()},h.env)
-  await started
+  let timeout
+  try { await Promise.race([started,new Promise((_,reject)=>{timeout=setTimeout(()=>reject(new Error('provider send did not start')),1000)})]) }
+  finally { clearTimeout(timeout) }
   const args={selector:h.selector,previousRelease:h.release,release:'c'.repeat(40)}
   await assert.rejects(h.controller.beginActivation(args),/still leased/)
   assert.equal(h.control.prepare('SELECT count(*) n FROM preview_execution_leases').get().n,2)

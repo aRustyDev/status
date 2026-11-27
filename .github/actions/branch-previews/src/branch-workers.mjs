@@ -6,7 +6,7 @@ import { fixtureCatalog } from './fixture-catalog.mjs'
 
 const allowedBindings = new Set(['r2_buckets','kv_namespaces','hyperdrive','analytics_engine_datasets','durable_objects','queues','send_email'])
 
-export function createBranchConfigs({ settings, selector, sha, branchDir, dir }) {
+export function createBranchConfigs({ settings, selector, sha, branchDir, dir, subscriber = null, appId }) {
   if (!/^branch-[0-9a-f]{24}$/.test(selector) || !/^[0-9a-f]{40}$/.test(sha)) throw new Error('Invalid branch release identity')
   const app = installation()
   const { components, compatibilityDate } = app.manifest
@@ -14,16 +14,16 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
   const names = Object.fromEntries(Object.entries(components).map(([id,c]) => [id, stem + '-' + c.suffix]))
   const order = Object.keys(components)
   const fixture = settings.isolatedFixture
+  if (fixture && subscriber) throw new Error('Legacy subscriber approval and isolated fixtures are mutually exclusive')
   if (fixture) {
     if (settings.databaseOwned !== true || !settings.d1DatabaseId || !settings.d1DatabaseName) throw new Error('Isolated fixtures require an owned database')
-    if (typeof fixture !== 'object' || Array.isArray(fixture) || Object.keys(fixture).some(key => !['source','casSource','wrappers','subscriber','probe'].includes(key)) || !path.isAbsolute(fixture.source || '') || (fixture.casSource !== undefined && !path.isAbsolute(fixture.casSource)) || (fixture.subscriber !== undefined && typeof fixture.subscriber !== 'boolean') || (fixture.probe !== undefined && typeof fixture.probe !== 'boolean')) throw new Error('Invalid isolated fixture source')
+    if (typeof fixture !== 'object' || Array.isArray(fixture) || Object.keys(fixture).some(key => !['source','casSource','wrappers','subscriber','probe','expiresAt'].includes(key)) || !path.isAbsolute(fixture.source || '') || (fixture.casSource !== undefined && !path.isAbsolute(fixture.casSource)) || (fixture.subscriber !== undefined && typeof fixture.subscriber !== 'boolean') || (fixture.probe !== undefined && typeof fixture.probe !== 'boolean')) throw new Error('Invalid isolated fixture source')
     if (fixture.casSource && path.resolve(fixture.casSource) !== path.resolve(branchDir, 'workers', 'cas.mjs')) throw new Error('CAS source must be the feature artifact')
-    if (fixture.probe || fixture.subscriber) {
-      const wrappers = fixture.wrappers
-      const required = [...(fixture.probe ? ['probe','probeScheduler'] : []), ...(fixture.subscriber ? ['api','subscriberFeature','subscriberScheduler','mailer'] : [])]
-      if (!wrappers || typeof wrappers !== 'object' || Array.isArray(wrappers) || Object.keys(wrappers).some(id => !required.includes(id)) || required.some(id => typeof wrappers[id] !== 'string' || path.resolve(wrappers[id]) !== path.resolve(dir, `trusted-${id}.mjs`))) throw new Error('Invalid trusted fixture wrappers')
-      if (!settings.internalScheduling) throw new Error('Fixture execution requires a trusted fence')
-    } else if (fixture.wrappers && Object.keys(fixture.wrappers).length) throw new Error('Unexpected trusted fixture wrappers')
+    if (!Number.isSafeInteger(fixture.expiresAt) || fixture.expiresAt <= Date.now() || fixture.expiresAt > Date.now()+48*3600_000) throw new Error('Invalid fixture approval expiry')
+    const wrappers = fixture.wrappers
+    const required = ['fixture', ...(fixture.probe ? ['probe','probeScheduler'] : []), ...(fixture.subscriber ? ['api','subscriberFeature','subscriberScheduler','mailer','authorization'] : [])]
+    if (!wrappers || typeof wrappers !== 'object' || Array.isArray(wrappers) || Object.keys(wrappers).some(id => !required.includes(id)) || required.some(id => typeof wrappers[id] !== 'string' || path.resolve(wrappers[id]) !== path.resolve(dir, `trusted-${id}.mjs`))) throw new Error('Invalid trusted fixture wrappers')
+    if (!settings.internalScheduling) throw new Error('Fixture execution requires a trusted fence')
     if (Object.keys(settings.extraServices || {}).some(key => (settings.extraServices[key] || []).length) || (settings.vpcServices || []).length) throw new Error('Isolated fixtures forbid external services')
     for (const bindings of Object.values(settings.resourceBindings || {})) {
       if (Object.keys(bindings).length) throw new Error('Isolated fixtures forbid shared resources')
@@ -33,7 +33,7 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
     names.fixture = `${stem}-fixture`
     if (fixture.casSource) names.cas = `${stem}-cas`
     const shared = { compatibility_date: compatibilityDate, workers_dev: false, preview_urls: false, observability: { enabled: true }, d1_databases: [{ binding: 'DB', database_id: settings.d1DatabaseId, database_name: settings.d1DatabaseName }], triggers: { crons: [] } }
-    writeFileSync(path.join(dir, 'fixture.json'), JSON.stringify({ ...shared, name: names.fixture, main: fixture.source }), { mode: 0o600 })
+    writeFileSync(path.join(dir, 'fixture.json'), JSON.stringify({ ...shared, name: names.fixture, main: fixture.wrappers.fixture, services:[{binding:'PREVIEW_FENCE',service:`${stem}-fence`}] }), { mode: 0o600 })
     // Services must exist before the Workers which consume them.
     order.unshift('fixture')
   }
@@ -61,7 +61,7 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
         fence.compatibility_date !== compatibilityDate || scheduler.compatibility_date !== compatibilityDate ||
         fence.workers_dev !== false || fence.preview_urls !== false || scheduler.workers_dev !== false || scheduler.preview_urls !== false ||
         JSON.stringify(fence.triggers?.crons) !== '[]' || JSON.stringify(scheduler.triggers?.crons) !== '["* * * * *"]' ||
-        fence.vars?.PREVIEW_SELECTOR !== selector || fence.vars?.PREVIEW_RELEASE !== sha || fence.vars?.PREVIEW_FLAG_PREFIX !== app.flagPrefix ||
+        fence.vars?.PREVIEW_SELECTOR !== selector || fence.vars?.PREVIEW_RELEASE !== sha || fence.vars?.PREVIEW_FLAG_PREFIX !== app.flagPrefix || fence.vars?.PREVIEW_FIXTURE_EXPIRES_AT !== String(fixture.expiresAt) ||
         !Array.isArray(fence.d1_databases) || fence.d1_databases.length !== 1 || fence.d1_databases[0].binding !== 'INVENTORY' ||
         !fence.d1_databases[0].database_id || fence.d1_databases[0].database_id === settings.d1DatabaseId ||
         !Array.isArray(fence.flagship) || fence.flagship.length !== 1 || fence.flagship[0].binding !== 'FLAGS' || !fence.flagship[0].app_id ||
@@ -83,17 +83,19 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
     try { const url = new URL(mail?.publicUrl); if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash || url.origin !== mail.publicUrl) throw new Error(); origin = url.origin } catch { throw new Error('Invalid trusted subscriber configuration') }
     if (!mail || typeof mail !== 'object' || Array.isArray(mail) || Object.keys(mail).some(key => !['from','to','publicUrl'].includes(key)) || !address(mail.from) || !address(mail.to)) throw new Error('Invalid trusted subscriber configuration')
     const suffixes = new Set(Object.values(components).map(c => c.suffix))
-    if (names.mailer || names.subscriberFeature || names.subscriberScheduler || ['mailer','subscriber-feature','subscriber-scheduler'].some(s => suffixes.has(s))) throw new Error('Reserved subscriber component')
+    if (names.mailer || names.subscriberFeature || names.subscriberScheduler || names.authorization || ['mailer','subscriber-feature','subscriber-scheduler','authorization'].some(s => suffixes.has(s))) throw new Error('Reserved subscriber component')
     names.mailer = `${stem}-mailer`
     names.subscriberFeature = `${stem}-subscriber-feature`
     names.subscriberScheduler = `${stem}-subscriber-scheduler`
+    names.authorization = `${stem}-authorization`
     subscriberVars = { SUBSCRIBERS_READY:'true', SUBSCRIBER_EMAIL_READY:'true', SUBSCRIBER_EMAIL_FROM:mail.from, SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'preview',name:'Preview recipient',address:mail.to}]), SUBSCRIBER_PUBLIC_URL:origin, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:createHash('sha256').update(selector).digest('hex'), PREVIEW_SELECTOR:selector, PREVIEW_RELEASE:sha, PREVIEW_DATABASE_ISOLATED:'true' }
     const common = { compatibility_date:compatibilityDate, workers_dev:false, preview_urls:false, observability:{enabled:true} }
     const mailer = { ...common, name:names.mailer, main:fixture.wrappers.mailer, vars:{PREVIEW_MAIL_FROM:mail.from,PREVIEW_MAIL_TO:mail.to,PREVIEW_MAIL_PUBLIC_URL:origin}, services:[{binding:'PREVIEW_FENCE',service:names.fence}], send_email:[{name:'EMAIL',allowed_sender_addresses:[mail.from],allowed_destination_addresses:[mail.to]}], triggers:{crons:[]} }
     const feature = { ...common, name:names.subscriberFeature, main:fixture.wrappers.subscriberFeature, vars:subscriberVars, d1_databases:[{binding:'DB',database_id:settings.d1DatabaseId,database_name:settings.d1DatabaseName}], services:[{binding:'PREVIEW_MAILER',service:names.mailer}], triggers:{crons:[]} }
     const scheduler = { ...common, name:names.subscriberScheduler, main:fixture.wrappers.subscriberScheduler, services:[{binding:'PREVIEW_FENCE',service:names.fence},{binding:'SUBSCRIBER_FEATURE',service:names.subscriberFeature}], triggers:{crons:['* * * * *']} }
-    for (const [id,config] of Object.entries({mailer,subscriberFeature:feature,subscriberScheduler:scheduler})) writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(config), { mode:0o600 })
-    order.splice(order.indexOf('fence')+1, 0, 'mailer', 'subscriberFeature')
+    const authorization = { ...common, name:names.authorization, main:fixture.wrappers.authorization, vars:{PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:sha,PREVIEW_SUBSCRIBER_SCOPE:subscriberVars.PREVIEW_SUBSCRIBER_SCOPE,PREVIEW_DATABASE_ISOLATED:'true'}, d1_databases:[{binding:'DB',database_id:settings.d1DatabaseId,database_name:settings.d1DatabaseName}], services:[{binding:'PREVIEW_FENCE',service:names.fence}], triggers:{crons:[]} }
+    for (const [id,config] of Object.entries({mailer,subscriberFeature:feature,subscriberScheduler:scheduler,authorization})) writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(config), { mode:0o600 })
+    order.splice(order.indexOf('fence')+1, 0, 'mailer', 'subscriberFeature', 'authorization')
     order.push('subscriberScheduler')
   } else if (settings.internalSubscriber) throw new Error('Unexpected subscriber configuration')
   for (const [id, component] of Object.entries(components)) {
@@ -103,6 +105,10 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
       else if (!(key in vars)) throw new Error('Missing environment setting ' + source)
     }
     if (component.subscriberScope) vars.PREVIEW_SUBSCRIBER_SCOPE = createHash('sha256').update(selector).digest('hex')
+    if (settings.previewEnvironment === 'schema' && (!subscriber || id !== 'api')) {
+      for (const key of Object.keys(vars)) if (key.startsWith('SUBSCRIBER_')) delete vars[key]
+    }
+    if (subscriber && id === 'api') Object.assign(vars, { PREVIEW_BRANCH_MODE:'schema', PREVIEW_SELECTOR:selector, PREVIEW_SLOT:'1', PREVIEW_TARGET:'a', SUBSCRIBERS_READY:'true', SUBSCRIBER_EMAIL_READY:'true', SUBSCRIBER_EMAIL_FROM:subscriber.sender, SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'preview-test',name:'Preview test',address:subscriber.recipient}]), SUBSCRIBER_PUBLIC_URL:subscriber.publicUrl })
     if (component.releaseVar || id === 'gateway') vars.PREVIEW_RELEASE = sha
     if (id === 'gateway') vars.PREVIEW_SELECTOR = selector
     const services = [...(settings.extraServices?.[id] || []), ...Object.entries(component.services || {}).map(([binding,target]) => ({ binding, service:names[target] }))]
@@ -119,6 +125,7 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
       if (id === 'api' && subscriberVars) {
         Object.assign(vars, subscriberVars)
         services.push({ binding:'PREVIEW_MAILER', service:names.mailer })
+        services.push({ binding:'PREVIEW_AUTHORIZATION', service:names.authorization })
       }
       if (fixture.casSource) {
         vars.MONITOR_AUTH_READY = 'true'
@@ -138,19 +145,36 @@ export function createBranchConfigs({ settings, selector, sha, branchDir, dir })
       if (!allowedBindings.has(key) || (key === 'queues' && (!value || Object.keys(value).some(k => k !== 'producers')))) throw new Error('Unsupported resource binding ' + key)
       config[key] = value
     }
+    if (settings.previewEnvironment === 'schema' && (!subscriber || id !== 'api') && Array.isArray(config.send_email)) {
+      config.send_email = config.send_email.filter(binding => binding?.name !== 'SUBSCRIBER_EMAIL')
+      if (!config.send_email.length) delete config.send_email
+    }
+    if (subscriber && id === 'api') {
+      if (!appId) throw new Error('Missing schema authorization service')
+      config.send_email = [{name:'SUBSCRIBER_EMAIL', allowed_sender_addresses:[subscriber.sender], allowed_destination_addresses:[subscriber.recipient]}]
+      config.flagship = [{binding:'FLAGS',app_id:appId}]
+    }
     writeFileSync(path.join(dir,id + '.json'), JSON.stringify(config), {mode:0o600})
+  }
+  if (subscriber) {
+    if (!appId || !settings.d1DatabaseId || !settings.d1DatabaseName) throw new Error('Missing isolated scheduler configuration')
+    names.subscriber = stem + '-subscriber'
+    order.push('subscriber')
+    const vars = { PREVIEW_BRANCH_MODE:'schema', PREVIEW_SELECTOR:selector, PREVIEW_RELEASE:sha, PREVIEW_SLOT:'1', PREVIEW_TARGET:'a', PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:createHash('sha256').update(selector).digest('hex'), SUBSCRIBERS_READY:'true', SUBSCRIBER_EMAIL_READY:'true', SUBSCRIBER_EMAIL_FROM:subscriber.sender, SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'preview-test',name:'Preview test',address:subscriber.recipient}]), SUBSCRIBER_PUBLIC_URL:subscriber.publicUrl }
+    const config = {name:names.subscriber, main:path.join(branchDir,'workers/subscriber.mjs'), compatibility_date:compatibilityDate, workers_dev:false, preview_urls:false, observability:{enabled:true}, vars, d1_databases:[{binding:'DB',database_id:settings.d1DatabaseId,database_name:settings.d1DatabaseName}], flagship:[{binding:'FLAGS',app_id:appId}], send_email:[{name:'SUBSCRIBER_EMAIL',allowed_sender_addresses:[subscriber.sender],allowed_destination_addresses:[subscriber.recipient]}], triggers:{crons:['* * * * *']}}
+    writeFileSync(path.join(dir,'subscriber.json'), JSON.stringify(config), {mode:0o600})
   }
   return { names, order }
 }
 
-export async function deployBranchWorkers({ settings, selector, sha, branchDir, dir, run, installSecrets }) {
-  const {names,order} = createBranchConfigs({settings,selector,sha,branchDir,dir})
+export async function deployBranchWorkers({ settings, selector, sha, branchDir, dir, run, installSecrets, subscriber = null, appId }) {
+  const {names,order} = createBranchConfigs({settings,selector,sha,branchDir,dir,subscriber,appId})
   for (const dry of [true,false]) {
     for (const id of order) {
       const args = ['deploy','--no-bundle','--config',path.join(dir,id + '.json'),'--experimental-auto-create=false']
       if (dry) args.push('--dry-run')
       await run(args)
-      if (!dry && !['fixture','fence','mailer'].includes(id)) await installSecrets(id,names[id])
+      if (!dry && !['fixture','fence','mailer','authorization'].includes(id)) await installSecrets(id,names[id])
     }
   }
   return names

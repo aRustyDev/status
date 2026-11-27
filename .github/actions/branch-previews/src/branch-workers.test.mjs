@@ -6,6 +6,7 @@ import test from 'node:test'
 import { createBranchConfigs, deployBranchWorkers } from './branch-workers.mjs'
 import { installation } from './installation.mjs'
 import { createFixtureSchedulingConfigs } from './fixture-scheduling-config.mjs'
+import { isolatedFallbackSettings } from './fixture-policy.mjs'
 
 const settings = { d1DatabaseId: 'id', d1DatabaseName: 'db', accessTeamDomain: 'access', accessAud: 'aud', endpoints: '[]', apiVars: { SUBSCRIBERS_READY: 'true' } }
 const selector = 'branch-' + 'a'.repeat(24)
@@ -31,6 +32,26 @@ test('creates a private release stack with the selected database and disabled sc
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
+test('stale fixture fallback creates a side-effect-free stack with no shared bindings', () => {
+  const dir=mkdtempSync(path.join(tmpdir(),'branch-fallback-test-'))
+  try {
+    const unsafe={...settings,previewEnvironment:'schema',endpoints:'shared',apiVars:{ACTIONS_READY:'true',SUBSCRIBERS_READY:'true',EMAIL_READY:'true'},extraServices:{api:[{binding:'GATUS',service:'shared-stage'}]},resourceBindings:{api:{send_email:[{name:'EMAIL'}],r2_buckets:[{binding:'R2',bucket_name:'shared'}]}},vpcServices:[{binding:'VPC',service_id:'shared'}]}
+    const safe=isolatedFallbackSettings(unsafe)
+    const {names,order}=createBranchConfigs({settings:safe,selector,sha,branchDir:'/feature',dir})
+    for(const id of order){
+      const config=JSON.parse(readFileSync(path.join(dir,`${id}.json`)))
+      assert.equal(config.send_email,undefined)
+      assert.equal(config.r2_buckets,undefined)
+      assert.ok(!(config.vpc_services||[]).length)
+      assert.ok((config.services||[]).every(service=>Object.values(names).includes(service.service)))
+      assert.deepEqual(config.triggers.crons,[])
+      assert.ok(!Object.entries(config.vars||{}).some(([key,value])=>key.endsWith('_READY')&&value==='true'))
+    }
+    const api=JSON.parse(readFileSync(path.join(dir,'api.json')))
+    assert.equal(api.vars.ENDPOINTS,'[]')
+  } finally {rmSync(dir,{recursive:true,force:true})}
+})
+
 test('runs every dry run before deployment and stops after a secret failure', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'branch-workers-test-'))
   const events = []
@@ -47,9 +68,11 @@ test('runs every dry run before deployment and stops after a secret failure', as
 test('isolated fixtures use only release-owned Workers and the owned database', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'branch-workers-test-'))
   try {
-    const fixtureSettings = { ...settings, databaseOwned: true, isolatedFixture: { source: '/trusted/fixture.mjs', casSource: '/feature/workers/cas.mjs' } }
-    const { names, order } = createBranchConfigs({ settings: fixtureSettings, selector, sha, branchDir: '/feature', dir })
-    assert.deepEqual(order.slice(0, 3), ['fixture', 'cas', 'probe'])
+    const app=installation(),ref='refs/heads/schema/fixture', select=`branch-${app.branchKey(ref)}`,stem=app.workerStem(select,sha)
+    const scheduling=createFixtureSchedulingConfigs({ref,selector:select,sha,database:{id:'id',name:app.schemaStem(ref,sha)+'-upgrade',owned:true},inventoryDatabase:{id:'inventory',name:'inventory'},sharedDatabaseIds:['dev','stage','prod'],flagshipAppId:'flagship',runtimeDir:'/trusted/runtime',probeName:`${stem}-probe`,dir,expiresAt:Date.now()+60000})
+    const fixtureSettings = { ...settings, databaseOwned: true, isolatedFixture: { source: '/trusted/fixture.mjs', casSource: '/feature/workers/cas.mjs',expiresAt:Number(scheduling.configs.fence.vars.PREVIEW_FIXTURE_EXPIRES_AT),wrappers:{fixture:path.join(dir,'trusted-fixture.mjs')} },internalScheduling:scheduling }
+    const { names, order } = createBranchConfigs({ settings: fixtureSettings, selector:select, sha, branchDir: '/feature', dir })
+    assert.deepEqual(order.slice(0, 4), ['fence', 'fixture', 'cas', 'probe'])
     for (const id of ['fixture', 'cas']) {
       const config = JSON.parse(readFileSync(path.join(dir, `${id}.json`)))
       assert.equal(config.name, names[id])
@@ -65,11 +88,13 @@ test('isolated fixtures use only release-owned Workers and the owned database', 
     assert.equal(api.vars.ACTIONS_READY, 'true')
     assert.equal(JSON.parse(api.vars.ACTION_ENDPOINTS)[0].serviceId, names.fixture)
     assert.equal(JSON.parse(api.vars.ENDPOINTS)[1].authProviders.cas.url, 'https://preview-fixture.invalid/cas/v1/tickets')
-    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, databaseOwned: false }, selector, sha, branchDir: '/feature', dir }), /owned database/)
-    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, isolatedFixture: { source: '/trusted/fixture.mjs', casSource: '/other/cas.mjs' } }, selector, sha, branchDir: '/feature', dir }), /feature artifact/)
-    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, extraServices: { api: [{ binding: 'EVIL', service: 'shared' }] } }, selector, sha, branchDir: '/feature', dir }), /external services/)
-    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, resourceBindings: { api: { r2_buckets: [] } } }, selector, sha, branchDir: '/feature', dir }), /shared resources/)
-    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, resourceBindings: { api: { send_email: [] } } }, selector, sha, branchDir: '/feature', dir }), /shared resources/)
+    assert.deepEqual(JSON.parse(readFileSync(path.join(dir,'fixture.json'))).services,[{binding:'PREVIEW_FENCE',service:names.fence}])
+    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, databaseOwned: false }, selector:select, sha, branchDir: '/feature', dir }), /owned database/)
+    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, isolatedFixture: { ...fixtureSettings.isolatedFixture, casSource: '/other/cas.mjs' } }, selector:select, sha, branchDir: '/feature', dir }), /feature artifact/)
+    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, extraServices: { api: [{ binding: 'EVIL', service: 'shared' }] } }, selector:select, sha, branchDir: '/feature', dir }), /external services/)
+    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, resourceBindings: { api: { r2_buckets: [] } } }, selector:select, sha, branchDir: '/feature', dir }), /shared resources/)
+    assert.throws(() => createBranchConfigs({ settings: { ...fixtureSettings, resourceBindings: { api: { send_email: [] } } }, selector:select, sha, branchDir: '/feature', dir }), /shared resources/)
+    assert.throws(() => createBranchConfigs({ settings: fixtureSettings, selector:select, sha, branchDir: '/feature', dir, subscriber: { sender:'a@example.test', recipient:'b@example.test' }, appId:'flagship' }), /mutually exclusive/)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -77,7 +102,9 @@ test('installs isolated CAS secrets but no fixture secrets', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'branch-workers-test-'))
   const installed = []
   try {
-    await deployBranchWorkers({ settings: { ...settings, databaseOwned: true, isolatedFixture: { source: '/trusted/fixture.mjs', casSource: '/feature/workers/cas.mjs' } }, selector, sha, branchDir: '/feature', dir,
+    const app=installation(),ref='refs/heads/schema/fixture',select=`branch-${app.branchKey(ref)}`,stem=app.workerStem(select,sha)
+    const scheduling=createFixtureSchedulingConfigs({ref,selector:select,sha,database:{id:'id',name:app.schemaStem(ref,sha)+'-upgrade',owned:true},inventoryDatabase:{id:'inventory',name:'inventory'},sharedDatabaseIds:['dev','stage','prod'],flagshipAppId:'flagship',runtimeDir:'/trusted/runtime',probeName:`${stem}-probe`,dir,expiresAt:Date.now()+60000})
+    await deployBranchWorkers({ settings: { ...settings, databaseOwned: true, isolatedFixture: { source: '/trusted/fixture.mjs', casSource: '/feature/workers/cas.mjs',expiresAt:Number(scheduling.configs.fence.vars.PREVIEW_FIXTURE_EXPIRES_AT),wrappers:{fixture:path.join(dir,'trusted-fixture.mjs')} },internalScheduling:scheduling }, selector:select, sha, branchDir: '/feature', dir,
       run: async () => {}, installSecrets: async (component, name) => installed.push([component, name]),
     })
     assert.equal(installed.some(([component]) => component === 'fixture'), false)
@@ -88,8 +115,8 @@ test('installs isolated CAS secrets but no fixture secrets', async () => {
 test('owned scheduled fixtures deploy their fence first and scheduler last without exposing control D1', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'branch-workers-test-'))
   const app = installation(), ref = 'refs/heads/feat/scheduled', select = `branch-${app.branchKey(ref)}`, stem = app.workerStem(select, sha)
-  const scheduling = createFixtureSchedulingConfigs({ ref, selector: select, sha, database: { id: 'id', name: app.schemaStem(ref,sha)+'-upgrade', owned: true }, inventoryDatabase: { id: 'inventory', name: 'inventory' }, sharedDatabaseIds: ['dev','stage','prod'], flagshipAppId: 'flagship', runtimeDir: '/trusted/runtime', probeName: `${stem}-probe`, dir })
-  const fixtureSettings = { ...settings, databaseOwned: true, isolatedFixture: { source: '/trusted/fixture.mjs', probe:true, wrappers:{probe:path.join(dir,'trusted-probe.mjs'),probeScheduler:path.join(dir,'trusted-probeScheduler.mjs')} }, internalScheduling: { names: scheduling.names, configs: scheduling.configs } }
+  const scheduling = createFixtureSchedulingConfigs({ ref, selector: select, sha, database: { id: 'id', name: app.schemaStem(ref,sha)+'-upgrade', owned: true }, inventoryDatabase: { id: 'inventory', name: 'inventory' }, sharedDatabaseIds: ['dev','stage','prod'], flagshipAppId: 'flagship', runtimeDir: '/trusted/runtime', probeName: `${stem}-probe`, dir, expiresAt:Date.now()+60000 })
+  const fixtureSettings = { ...settings, databaseOwned: true, isolatedFixture: { source: '/trusted/fixture.mjs', probe:true, expiresAt:Number(scheduling.configs.fence.vars.PREVIEW_FIXTURE_EXPIRES_AT), wrappers:{fixture:path.join(dir,'trusted-fixture.mjs'),probe:path.join(dir,'trusted-probe.mjs'),probeScheduler:path.join(dir,'trusted-probeScheduler.mjs')} }, internalScheduling: { names: scheduling.names, configs: scheduling.configs } }
   try {
     const { names, order } = createBranchConfigs({ settings: fixtureSettings, selector: select, sha, branchDir: '/feature', dir })
     assert.equal(order[0], 'fence')
@@ -116,8 +143,8 @@ test('owned scheduled fixtures deploy their fence first and scheduler last witho
 test('subscriber fixtures keep the mail provider and fence in trusted private Workers', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'branch-workers-test-'))
   const app = installation(), ref = 'refs/heads/feat/subscriber', select = `branch-${app.branchKey(ref)}`, stem = app.workerStem(select, sha)
-  const scheduling = createFixtureSchedulingConfigs({ ref, selector: select, sha, database: { id: 'id', name: app.schemaStem(ref,sha)+'-upgrade', owned: true }, inventoryDatabase: { id: 'inventory', name: 'inventory' }, sharedDatabaseIds: ['dev','stage','prod'], flagshipAppId: 'flagship', runtimeDir: '/trusted/runtime', probeName: `${stem}-probe`, dir })
-  const fixtureSettings = { ...settings, databaseOwned:true, isolatedFixture:{source:'/trusted/fixture.mjs',subscriber:true,wrappers:Object.fromEntries(['api','subscriberFeature','subscriberScheduler','mailer'].map(name=>[name,path.join(dir,`trusted-${name}.mjs`)]))}, internalScheduling:{names:scheduling.names,configs:scheduling.configs}, internalSubscriber:{from:'sender@example.test',to:'owner@example.test',publicUrl:'https://status.example.test'} }
+  const scheduling = createFixtureSchedulingConfigs({ ref, selector: select, sha, database: { id: 'id', name: app.schemaStem(ref,sha)+'-upgrade', owned: true }, inventoryDatabase: { id: 'inventory', name: 'inventory' }, sharedDatabaseIds: ['dev','stage','prod'], flagshipAppId: 'flagship', runtimeDir: '/trusted/runtime', probeName: `${stem}-probe`, dir, expiresAt:Date.now()+60000 })
+  const fixtureSettings = { ...settings, databaseOwned:true, isolatedFixture:{source:'/trusted/fixture.mjs',subscriber:true,expiresAt:Number(scheduling.configs.fence.vars.PREVIEW_FIXTURE_EXPIRES_AT),wrappers:Object.fromEntries(['fixture','api','subscriberFeature','subscriberScheduler','mailer','authorization'].map(name=>[name,path.join(dir,`trusted-${name}.mjs`)]))}, internalScheduling:{names:scheduling.names,configs:scheduling.configs}, internalSubscriber:{from:'sender@example.test',to:'owner@example.test',publicUrl:'https://status.example.test'} }
   try {
     const { names,order } = createBranchConfigs({settings:fixtureSettings,selector:select,sha,branchDir:'/feature',dir})
     assert.deepEqual(order.slice(0,3),['fence','mailer','subscriberFeature'])
@@ -127,12 +154,14 @@ test('subscriber fixtures keep the mail provider and fence in trusted private Wo
     const mailer=JSON.parse(readFileSync(path.join(dir,'mailer.json')))
     const feature=JSON.parse(readFileSync(path.join(dir,'subscriberFeature.json')))
     const scheduler=JSON.parse(readFileSync(path.join(dir,'subscriberScheduler.json')))
+    const authorization=JSON.parse(readFileSync(path.join(dir,'authorization.json')))
     const api=JSON.parse(readFileSync(path.join(dir,'api.json')))
     assert.deepEqual(mailer.send_email, [{name:'EMAIL',allowed_sender_addresses:['sender@example.test'],allowed_destination_addresses:['owner@example.test']}])
     assert.deepEqual(mailer.services,[{binding:'PREVIEW_FENCE',service:names.fence}])
     assert.equal(mailer.d1_databases,undefined)
     assert.equal(api.send_email,undefined)
     assert.equal(api.services.find(s=>s.binding==='PREVIEW_MAILER').service,names.mailer)
+    assert.equal(api.services.find(s=>s.binding==='PREVIEW_AUTHORIZATION').service,names.authorization)
     assert.equal(api.services.some(s=>s.binding==='PREVIEW_FENCE'),false)
     assert.equal(api.main,fixtureSettings.isolatedFixture.wrappers.api)
     assert.equal(api.vars.SUBSCRIBERS_READY,'true')
@@ -145,10 +174,15 @@ test('subscriber fixtures keep the mail provider and fence in trusted private Wo
     assert.equal(scheduler.d1_databases,undefined)
     assert.equal(scheduler.send_email,undefined)
     assert.deepEqual(scheduler.services,[{binding:'PREVIEW_FENCE',service:names.fence},{binding:'SUBSCRIBER_FEATURE',service:names.subscriberFeature}])
+    assert.deepEqual(authorization.services,[{binding:'PREVIEW_FENCE',service:names.fence}])
+    assert.equal(authorization.d1_databases[0].database_id,'id')
+    assert.equal(authorization.send_email,undefined)
+    assert.ok(order.indexOf('authorization') < order.indexOf('api'))
     const installed=[]
     await deployBranchWorkers({settings:fixtureSettings,selector:select,sha,branchDir:'/feature',dir,run:async()=>{},installSecrets:async id=>installed.push(id)})
     assert.equal(installed.includes('fence'),false)
     assert.equal(installed.includes('mailer'),false)
+    assert.equal(installed.includes('authorization'),false)
     assert.ok(installed.includes('subscriberFeature') && installed.includes('subscriberScheduler'))
     for (const bad of [
       {...fixtureSettings,internalSubscriber:{...fixtureSettings.internalSubscriber,to:'attacker@example.test\nBCC: x'}},

@@ -1,5 +1,46 @@
 import { readFileSync } from 'node:fs'
 
+// Inventory is already authoritative for every release operation. Avoid
+// adding fence-table DDL/read dependencies until a current or retained Worker
+// or isolated-preview history requires it, or a new fixture is deployed.
+export function inventoryHasFencedResources(snapshots) {
+  if (!Array.isArray(snapshots)) throw new Error('Invalid preview inventory')
+  for (const snapshot of snapshots) {
+    const record = snapshot?.record
+    if (!record || typeof record !== 'object' || Array.isArray(record) || (record.retained !== undefined && !Array.isArray(record.retained))) throw new Error('Invalid preview inventory')
+    for (const release of [record.active, record.previous, record.candidate, ...(record.retained || [])]) {
+      if (release == null) continue
+      // Fallback releases retain this marker after the fixture Workers are
+      // removed. The authoritative row must still advance during recovery.
+      if (release.resources?.isolatedPreview === true) return true
+      const workers = release.resources?.workers
+      if (workers == null) continue
+      if (typeof workers !== 'object' || Array.isArray(workers)) throw new Error('Invalid preview Worker inventory')
+      // A malformed name is still a recorded fence and must not silently skip
+      // the fail-closed dependency.
+      if (Object.hasOwn(workers, 'fence')) return true
+    }
+  }
+  return false
+}
+
+export async function initializeExecutionFenceIfNeeded({ store, fixtureEnabled = false, createFence, ref }) {
+  if (!store || typeof createFence !== 'function' || typeof fixtureEnabled !== 'boolean' ||
+      (ref === undefined ? typeof store.list !== 'function' : typeof ref !== 'string' || !ref.startsWith('refs/heads/') || typeof store.read !== 'function')) throw new Error('Invalid execution fence initialization')
+  // Deployments inspect only their own branch; another branch's fixtures
+  // cannot make an ordinary deployment depend on the fence tables.
+  // Reconciliation omits ref and checks every record before cleanup.
+  const current = ref === undefined ? null : await store.read(ref)
+  const snapshots = ref === undefined ? await store.list() : (current ? [current] : [])
+  if (!fixtureEnabled && !inventoryHasFencedResources(snapshots)) return null
+  // Validate the inventory even when the requested release itself is a fixture.
+  if (fixtureEnabled) inventoryHasFencedResources(snapshots)
+  const fence = createFence()
+  if (!fence || typeof fence.initialize !== 'function') throw new Error('Invalid execution fence controller')
+  await fence.initialize()
+  return fence
+}
+
 // Only the dedicated controller inventory database may receive these tables.
 // Statements are additive and rerunnable; incompatible existing tables fail
 // before any branch can be activated or retired.
@@ -38,10 +79,19 @@ export function executionFenceFor(controller) {
     const previous = active?.sha ?? null
     assertRelease(previous, true)
     if (state.activeRelease === sha && state.state === 'active') return { controller, previousRelease: previous }
+    // A deleted branch can be drained after its candidate was published but
+    // before inventory promotion. If recreated, recovery must revalidate the
+    // route before reactivating that already-published candidate.
+    if (state.activeRelease === sha && state.state === 'draining') return { controller, previousRelease: sha }
     if (state.activeRelease === previous) return { controller, previousRelease: previous }
     // A first fenced candidate can be interrupted after creating its empty
     // row while the previously active release was an unfenced one.
     if (state.activeRelease === null && !previousFenced) return { controller, previousRelease: null }
+    // Once all older fenced Workers have been retired from inventory, an
+    // unfenced branch can advance without touching this table. On later
+    // re-opt-in, drain the obsolete state (including any last in-flight
+    // lease) before switching to the new approved release.
+    if (incomingFenced && !previousFenced && !retainedFenced) return { controller, previousRelease: state.activeRelease }
     throw new Error('Execution fence does not match preview inventory')
   }
 }

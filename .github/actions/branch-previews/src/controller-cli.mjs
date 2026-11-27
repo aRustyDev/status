@@ -16,11 +16,13 @@ import { deployRelease } from './release-coordinator.mjs'
 import { createInventoryStore } from './release-inventory.mjs'
 import { createActivationAdapter } from './release-activation.mjs'
 import { reconcile } from './reconcile-cli.mjs'
-import { fixturePolicy, fixtureVaultKey, fixtureScheduleKey } from './fixture-policy.mjs'
+import { createSchemaFence, schemaSubscriberSettings } from './schema-subscriber.mjs'
+import { fixturePolicy, preserveIsolatedHistory, isolatedWorkerSecrets, isolatedFallbackSettings } from './fixture-policy.mjs'
 import { fixtureRegistryStatements } from './fixture-catalog.mjs'
-import { createCloudflareExecutionFence, executionFenceFor } from './execution-fence.mjs'
+import { createCloudflareExecutionFence, executionFenceFor, initializeExecutionFenceIfNeeded } from './execution-fence.mjs'
 import { createFixtureSchedulingConfigs } from './fixture-scheduling-config.mjs'
 import { buildTrustedPreviewWrappers } from './trusted-wrappers.mjs'
+import { validateFixtureArtifactApproval } from './fixture-artifact-approval.mjs'
 
 function object(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Missing or invalid ${name}`)
@@ -32,6 +34,15 @@ function parse(value, name) {
 function text(value, name) {
   if (typeof value !== 'string' || !value) throw new Error(`Missing ${name}`)
   return value
+}
+
+export function redactSubscriberAddresses(value, subscriber) {
+  let text = String(value || '')
+  for (const address of [subscriber?.sender, subscriber?.recipient].filter(Boolean)) {
+    const escaped = address.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    text = text.replace(new RegExp(escaped, 'gi'), '[redacted]')
+  }
+  return text
 }
 
 
@@ -77,50 +88,60 @@ export async function main(env = process.env) {
   const config = parse(env.PREVIEW_BRANCH_CONFIG, 'PREVIEW_BRANCH_CONFIG')
   const secrets = parse(env.PREVIEW_WORKER_SECRETS, 'PREVIEW_WORKER_SECRETS')
   const fixtureConfig = env.PREVIEW_ISOLATED_FIXTURE_CONFIG ? parse(env.PREVIEW_ISOLATED_FIXTURE_CONFIG, 'PREVIEW_ISOLATED_FIXTURE_CONFIG') : config.isolatedFixtures
-  const fixture = fixturePolicy(fixtureConfig, ref, sha)
+  const databaseConfig = object(config.databases, 'database configuration')
+  assertDatabaseIsolation(config)
+  const accountId = text(env.CLOUDFLARE_ACCOUNT_ID, 'Cloudflare account')
+  const token = text(env.CLOUDFLARE_API_TOKEN, 'Cloudflare token')
+  const appId = text(env.FLAGSHIP_APP_ID, 'Flagship app')
+  const store = createInventoryStore({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token })
+  // If inventory is unavailable or malformed, do not guess whether this ref
+  // previously held an isolated fixture and accidentally target shared D1.
+  const fixture = preserveIsolatedHistory({ ref, fixture:fixturePolicy(fixtureConfig, ref, sha), snapshot:await store.read(ref), sharedDatabaseIds:['dev','stage'].map(name => databaseConfig[name].id) })
   let workerSecrets = selectWorkerSecrets(secrets, fixture.environment)
   let fixtureRoot
-  if (fixture.enabled) {
+  if (fixture.enabled || fixture.isolatedFallback) {
     // No shared environment secrets reach opted-in feature code. A unique
     // per-release Vault key is derived from a controller-only root.
     fixtureRoot = env.PREVIEW_ISOLATED_FIXTURE_ROOT || object(secrets.isolatedFixtures, 'isolated fixture secrets').vaultRoot
-    const key = fixtureVaultKey(fixtureRoot, selectorForBranch(ref), sha)
-    workerSecrets = Object.fromEntries(Object.keys(workerSecrets).map(component => [component, {}]))
-    for (const component of ['api', 'monitoring', 'probe', 'cas']) workerSecrets[component] = { VAULT_ENCRYPTION_KEY: key }
-    const schedule = fixtureScheduleKey(fixtureRoot, selectorForBranch(ref), sha)
-    if (fixture.probe) {
-      workerSecrets.probe.PREVIEW_SCHEDULE_SECRET = schedule
-      workerSecrets.probeScheduler = { PREVIEW_SCHEDULE_SECRET: schedule }
-    }
-    if (fixture.subscriber) for (const name of ['subscriberFeature', 'subscriberScheduler']) workerSecrets[name] = { PREVIEW_SCHEDULE_SECRET: schedule }
+    workerSecrets = isolatedWorkerSecrets(workerSecrets, fixtureRoot, selectorForBranch(ref), sha, fixture)
   }
   const verifySecret = text(secrets.verificationSecret, 'candidate verification secret')
   if (verifySecret.length < 32) throw new Error('Candidate verification secret is too short')
   const access = object(secrets.accessHeaders, 'Access headers')
   if (Object.keys(access).length === 0 || Object.values(access).some(value => typeof value !== 'string' || !value)) throw new Error('Invalid Access headers')
-  const databaseConfig = object(config.databases, 'database configuration')
-  assertDatabaseIsolation(config)
-  const settings = object(object(config.environments, 'environment configuration')[fixture.environment], 'selected preview environment')
+  const selectedSettings = object(object(config.environments, 'environment configuration')[fixture.environment], 'selected preview environment')
+  const settings = fixture.isolatedFallback ? isolatedFallbackSettings(selectedSettings) : selectedSettings
   const previewUrl = new URL(text(config.previewUrl, 'preview URL'))
   if (previewUrl.protocol !== 'https:' || previewUrl.username || previewUrl.password) throw new Error('Invalid preview URL')
-  const accountId = text(env.CLOUDFLARE_ACCOUNT_ID, 'Cloudflare account')
-  const token = text(env.CLOUDFLARE_API_TOKEN, 'Cloudflare token')
-  const appId = text(env.FLAGSHIP_APP_ID, 'Flagship app')
-  const store = createInventoryStore({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token })
-  const executionFence = createCloudflareExecutionFence({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token })
-  await executionFence.initialize()
+  const executionFence = await initializeExecutionFenceIfNeeded({ store, ref, fixtureEnabled:fixture.enabled || fixture.isolatedFallback, createFence:() => createCloudflareExecutionFence({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token }) })
   const branches = githubBranches({ repository: text(env.PREVIEW_SOURCE_REPOSITORY || env.GITHUB_REPOSITORY, 'GitHub repository'), defaultBranch: env.PREVIEW_DEFAULT_BRANCH || 'main', dispatchRepository: env.GITHUB_REPOSITORY, dispatchToken: env.GH_TOKEN, dispatchBranch: env.PREVIEW_HOST_BRANCH || 'main', token: text(env.PREVIEW_SOURCE_TOKEN || env.GH_TOKEN, 'GitHub token'), apiUrl: env.GITHUB_API_URL })
   const root = fileURLToPath(new URL('../', import.meta.url))
   const control = env.PREVIEW_CONTROL_DIR
   const manifest = installation().manifest
   const branchDir = env.PREVIEW_ARTIFACT_DIR
+  const approval = env.PREVIEW_SCHEMA_SUBSCRIBER_CONFIG ? parse(env.PREVIEW_SCHEMA_SUBSCRIBER_CONFIG, 'PREVIEW_SCHEMA_SUBSCRIBER_CONFIG') : null
+  const subscriber = fixture.isolatedFallback ? null : schemaSubscriberSettings({ value:approval, environment:policy.environment, branch:policy.name, sha, branchDir, previewUrl:previewUrl.href })
+  if (subscriber && fixture.enabled) throw new Error('Legacy subscriber approval and isolated fixtures are mutually exclusive')
+  if (fixture.enabled) validateFixtureArtifactApproval({ approval:{...fixtureConfig.branches[ref],enabled:true}, sha, branchDir, manifest })
   const fixtureSource = fixture.enabled ? ownedPath(control, 'apps/preview-fixture/index.mjs') : null
   const fixtureSql = fixture.enabled ? ownedPath(control, 'apps/preview-fixture/schema.sql') : null
   const casSource = fixture.cas ? path.join(branchDir, 'workers', 'cas.mjs') : null
   if (fixture.cas && !existsSync(casSource)) throw new Error('Approved CAS fixture requires the feature CAS Worker')
   const wrangler = path.join(root, 'node_modules', '.bin', 'wrangler')
   const temp = await mkdtemp(path.join(tmpdir(), 'status-branch-release-'))
-  const run = async args => execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
+  const redactMail = subscriber || (fixture.subscriber ? { sender:fixtureConfig.mail?.from, recipient:fixtureConfig.mail?.to } : null)
+  const run = async args => {
+    if (!redactMail) return execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
+    try {
+      // Wrangler displays binding values and addresses on successful deployment.
+      return execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: ['ignore','pipe','pipe'], maxBuffer:16*1024*1024 })
+    } catch (error) {
+      const detail = redactSubscriberAddresses(error.stderr || '', redactMail).slice(0, 4000)
+      // The original error may contain raw Wrangler output with private addresses.
+      // eslint-disable-next-line preserve-caught-error
+      throw new Error(`Wrangler ${args[0]} failed (exit ${error.status ?? 'unknown'})${detail ? ': ' + detail : ''}`)
+    }
+  }
   function install(name, values) {
     const selected = object(values, `${name} secrets`)
     if (Object.entries(selected).some(([key, value]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== 'string' || !value)) throw new Error(`Invalid ${name} secrets`)
@@ -131,16 +152,20 @@ export async function main(env = process.env) {
     }
   }
   try {
+    const fenceAdapter = cloudflareDatabaseAdapter({ accountId, token, wrangler, seedSql: '', recordDatabase: async () => {} })
+    const subscriberFence = createSchemaFence({ query:fenceAdapter.query, findDatabase:fenceAdapter.findDatabase, config:{...databaseConfig, inventoryDatabaseId:config.inventoryDatabaseId} })
     const activate = createActivationAdapter({
       store, appId, accountId, token, dispatcherName: text(config.dispatcherName, 'dispatcher name'),
       dispatcherSource: path.join(root, 'runtime/dispatcher.ts'), directory: temp, run,
       verificationSecret: verifySecret, previewUrl: previewUrl.href, accessHeaders: access,
-      executionFenceFor: executionFenceFor(executionFence),
+      executionFenceFor: executionFence ? executionFenceFor(executionFence) : undefined,
       ...activationIdentity(config, access),
+      subscriberFence,
     })
     const record = await deployRelease({
       ref, sha, store, readRemoteHead: branches.head,
       async prepare({ recordResources, recordedResources }) {
+        if (fixture.enabled || fixture.isolatedFallback) await recordResources({ isolatedPreview:true })
         const adapter = cloudflareDatabaseAdapter({ accountId, token, wrangler, seedSql: readFileSync(ownedPath(control,manifest.database.seed),'utf8'),
           recordDatabase: async (database, purpose) => recordResources({ [purpose === 'clean' ? 'validationDatabase' : 'database']: database }),
           recordIntent: async (name, purpose) => recordResources({ [purpose === 'clean' ? 'validationDatabaseIntent' : 'databaseIntent']: { name } }),
@@ -153,29 +178,28 @@ export async function main(env = process.env) {
         const selector = selectorForBranch(ref)
         let fixtureSettings = {}
         if (fixture.enabled) {
-          const wrappers = (fixture.probe || fixture.subscriber)
-            ? await buildTrustedPreviewWrappers({ control, branchDir, dir: temp, probe: fixture.probe, subscriber: fixture.subscriber }) : {}
-          const isolatedFixture = { source: fixtureSource, ...(casSource ? { casSource } : {}), probe: fixture.probe, subscriber: fixture.subscriber, wrappers }
+          const wrappers = await buildTrustedPreviewWrappers({ control, branchDir, dir: temp, fixtureSource, probe: fixture.probe, subscriber: fixture.subscriber })
+          const isolatedFixture = { source: fixtureSource, ...(casSource ? { casSource } : {}), probe: fixture.probe, subscriber: fixture.subscriber, expiresAt:fixture.expiresAt, wrappers }
           fixtureSettings = { databaseOwned: database.owned === true, isolatedFixture }
-          if (fixture.probe || fixture.subscriber) {
+          {
             const probeName = installation().workerStem(selector, sha) + '-' + manifest.components.probe.suffix
             fixtureSettings.internalScheduling = createFixtureSchedulingConfigs({ ref, selector, sha, database,
               inventoryDatabase: { id: config.inventoryDatabaseId, name: text(fixtureConfig.inventoryDatabaseName, 'inventory database name') },
               sharedDatabaseIds: ['dev', 'stage', 'prod'].map(name => databaseConfig[name].id), flagshipAppId: appId,
-              runtimeDir: path.join(root, 'runtime'), probeName, dir: temp })
+              runtimeDir: path.join(root, 'runtime'), probeName, dir: temp, expiresAt:fixture.expiresAt })
           }
           if (fixture.subscriber) {
             const mail = object(fixtureConfig.mail, 'isolated subscriber mail configuration')
             fixtureSettings.internalSubscriber = { from: text(mail.from, 'preview sender'), to: text(mail.to, 'preview recipient'), publicUrl: previewUrl.origin }
           }
         }
-        const workerSettings = { ...settings, d1DatabaseId: database.id, d1DatabaseName: database.name, ...fixtureSettings }
-        const { names } = createBranchConfigs({ settings: workerSettings, selector, sha, branchDir, dir: temp })
+        const workerSettings = { ...settings, d1DatabaseId: database.id, d1DatabaseName: database.name, previewEnvironment:fixture.environment, ...fixtureSettings }
+        const { names } = createBranchConfigs({ settings: workerSettings, selector, sha, branchDir, dir: temp, subscriber, appId })
         if (fixture.enabled) await adapter.initializeFixtureRegistry(database, fixtureRegistryStatements(names.fixture, sha, Boolean(casSource)))
-        await recordResources({ workers: names, gateway: names.gateway })
-        await deployBranchWorkers({ settings: workerSettings, selector, sha, branchDir, dir: temp, run,
-          installSecrets: async (component, name) => install(name, workerSecrets[component]) })
-        return { database, workers: names, gateway: names.gateway }
+        await recordResources({ workers: names, gateway: names.gateway, ...(subscriber ? {subscriberExpiresAt:subscriber.expiresAt} : {}) })
+        await deployBranchWorkers({ settings: workerSettings, selector, sha, branchDir, dir: temp, run, subscriber, appId,
+          installSecrets: async (component, name) => install(name, component === 'subscriber' ? {} : workerSecrets[component]) })
+        return { database, workers: names, gateway: names.gateway, ...(subscriber ? {subscriberExpiresAt:subscriber.expiresAt} : {}) }
       },
       async activate(candidate) {
         install(config.dispatcherName, { PREVIEW_VERIFY_SECRET: verifySecret })

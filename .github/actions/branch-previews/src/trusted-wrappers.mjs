@@ -24,15 +24,16 @@ function denyFeatureImports(featurePaths) {
   } }
 }
 
-export async function buildTrustedPreviewWrappers({ control, branchDir, dir, probe = false, subscriber = false }) {
+export async function buildTrustedPreviewWrappers({ control, branchDir, dir, fixtureSource, probe = false, subscriber = false }) {
   if (!path.isAbsolute(control) || !path.isAbsolute(branchDir) || !path.isAbsolute(dir)) throw new Error('Trusted wrapper paths must be absolute')
   // Runtime code comes from the pinned controller action, never from a feature
   // artifact or the consumer checkout.
   const runtime = fileURLToPath(new URL('../runtime/', import.meta.url))
   const mailer = path.join(runtime, 'preview-mailer.mjs')
   const subscriberDispatch = path.join(runtime, 'preview-subscriber-dispatch.mjs')
+  const subscriberApi = path.join(runtime, 'preview-subscriber-api.mjs')
   const fence = path.join(runtime, 'branch-preview-fence.mjs')
-  const featureApi = path.join(branchDir, 'workers/api.mjs')
+  const featureApi = path.join(branchDir, 'workers/api-feature.mjs')
   const featureProbe = path.join(branchDir, 'workers/probe.mjs')
   const featureSubscriber = path.join(branchDir, 'workers/subscriber-feature.mjs')
   const output = {}
@@ -43,14 +44,19 @@ export async function buildTrustedPreviewWrappers({ control, branchDir, dir, pro
     await build({ ...options, stdin:{ contents, resolveDir:control, sourcefile:`trusted-${name}.mjs` }, outfile })
     output[name] = outfile
   }
+  if (fixtureSource) {
+    if (!path.isAbsolute(fixtureSource) || realpathSync(fixtureSource) !== realpathSync(path.join(control,'apps/preview-fixture/index.mjs'))) throw new Error('Invalid trusted fixture source')
+    await compile('fixture', [
+      `import fixture from ${JSON.stringify(fixtureSource)}`,
+      `import { wrapPreviewFixture } from ${JSON.stringify(path.join(runtime,'preview-fixture-fence.mjs'))}`,
+      `export default wrapPreviewFixture(fixture)`,
+    ].join('\n'))
+  }
   if (subscriber) {
     await compile('api', [
       `import app from ${JSON.stringify(featureApi)}`,
-      `import { branchPreviewEmailProxy } from ${JSON.stringify(mailer)}`,
-      `export default { fetch(request, env, ctx) {`,
-      `const { PREVIEW_MAILER, PREVIEW_FENCE, EMAIL, ...safe } = env`,
-      `safe.SUBSCRIBER_EMAIL = branchPreviewEmailProxy(PREVIEW_MAILER)`,
-      `return app.fetch(request, safe, ctx) } }`,
+      `import { wrapBranchSubscriberApi } from ${JSON.stringify(subscriberApi)}`,
+      `export default wrapBranchSubscriberApi(app)`,
     ].join('\n'))
     await compile('subscriberFeature', [
       `import { PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT, flushPreviewSubscriberDeliveries } from ${JSON.stringify(featureSubscriber)}`,
@@ -64,6 +70,7 @@ export async function buildTrustedPreviewWrappers({ control, branchDir, dir, pro
       `import { withActiveBranchExecution } from ${JSON.stringify(fence)}`,
       `export default { fetch(request, env) { return handleBranchPreviewMail(request, env, withActiveBranchExecution) } }`,
     ].join('\n'))
+    await compile('authorization', `export { default } from ${JSON.stringify(path.join(runtime,'preview-authorization.mjs'))}`)
   }
   if (probe) {
     await compile('probe', [

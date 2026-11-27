@@ -2,7 +2,50 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
-import { createExecutionFenceController, createCloudflareExecutionFence, ensureExecutionFenceSchema, executionFenceFor } from './execution-fence.mjs'
+import { createExecutionFenceController, createCloudflareExecutionFence, ensureExecutionFenceSchema, executionFenceFor, inventoryHasFencedResources, initializeExecutionFenceIfNeeded } from './execution-fence.mjs'
+
+test('missing fence tables do not affect unfenced previews, but recorded or new fixtures initialize fail-closed', async () => {
+  let calls=0
+  const unavailable=()=>{calls++;return {initialize:async()=>{throw new Error('missing fence table')}}}
+  const store=records=>({list:async()=>records.map(record=>({record}))})
+  assert.equal(await initializeExecutionFenceIfNeeded({store:store([{active:{resources:{workers:{api:'worker'}}}}]),createFence:unavailable}),null)
+  assert.equal(calls,0)
+  for (const key of ['active','previous','candidate','retained']) {
+    const release={resources:{workers:{fence:'owned-fence'}}}
+    const record={ [key]:key==='retained'?[release]:release }
+    assert.equal(inventoryHasFencedResources([{record}]),true)
+    await assert.rejects(initializeExecutionFenceIfNeeded({store:store([record]),createFence:unavailable}),/missing fence table/)
+  }
+  await assert.rejects(initializeExecutionFenceIfNeeded({store:store([]),fixtureEnabled:true,createFence:unavailable}),/missing fence table/)
+  assert.equal(calls,5)
+  assert.equal(inventoryHasFencedResources([{record:{candidate:{resources:{workers:{fence:''}}}}}]),true)
+  assert.throws(()=>inventoryHasFencedResources([{record:{active:{resources:{workers:'invalid'}}}}]),/Invalid preview Worker/)
+})
+
+test('deploy initialization ignores other branches but reconcile scans them globally', async () => {
+  const ref='refs/heads/feat/plain', other='refs/heads/feat/fixture'
+  const records=[{record:{ref,active:{resources:{workers:{api:'plain'}}}}},{record:{ref:other,active:{resources:{workers:{fence:'owned'}}}}}]
+  let reads=0,lists=0,creates=0
+  const store={read:async key=>{reads++;return records.find(({record})=>record.ref===key)??null},list:async()=>{lists++;return records}}
+  const unavailable=()=>{creates++;return {initialize:async()=>{throw new Error('missing fence table')}}}
+  assert.equal(await initializeExecutionFenceIfNeeded({store,ref,createFence:unavailable}),null)
+  assert.equal(reads,1);assert.equal(lists,0);assert.equal(creates,0)
+  await assert.rejects(initializeExecutionFenceIfNeeded({store,ref:other,createFence:unavailable}),/missing fence table/)
+  await assert.rejects(initializeExecutionFenceIfNeeded({store,createFence:unavailable}),/missing fence table/)
+  await assert.rejects(initializeExecutionFenceIfNeeded({store,ref,fixtureEnabled:true,createFence:unavailable}),/missing fence table/)
+  assert.equal(reads,3);assert.equal(lists,1);assert.equal(creates,3)
+})
+
+test('isolated-preview history initializes the fence after its Workers are pruned', async () => {
+  const release={resources:{isolatedPreview:true,workers:{api:'ordinary'}}}
+  for (const key of ['active','previous','candidate','retained']) {
+    const record={ [key]:key==='retained'?[release]:release }
+    assert.equal(inventoryHasFencedResources([{record}]),true)
+    await assert.rejects(initializeExecutionFenceIfNeeded({store:{list:async()=>[{record}]},createFence:()=>({initialize:async()=>{throw new Error('missing fence table')}})}),/missing fence table/)
+  }
+  assert.equal(inventoryHasFencedResources([{record:{active:{resources:{isolatedPreview:false,workers:{api:'ordinary'}}}}}]),false)
+  assert.equal(inventoryHasFencedResources([{record:{active:{resources:{isolatedPreview:true}}}}]),true)
+})
 
 test('inventory schema setup is idempotent and rejects incompatible tables', async () => {
   const db = new DatabaseSync(':memory:')
@@ -40,6 +83,38 @@ test('missing fence for an active fixture fails closed and initial unfenced tran
   const pending = await select({selector:h.selector,sha:h.next,resources:fenced,active:{sha:h.old,resources:{workers:{}}}})
   await pending.controller.beginActivation({selector:h.selector,previousRelease:null,release:h.next})
   assert.equal((await select({selector:h.selector,sha:h.next,resources:fenced,active:{sha:h.old,resources:{workers:{}}}})).previousRelease,null)
+  h.db.close()
+})
+
+test('a deleted-branch ambiguity drains a published candidate and remains recoverable', async () => {
+  const h = harness(), fenced = {workers:{fence:'owned-fence'}}
+  h.db.prepare("INSERT INTO preview_execution_fences(selector,active_release,state) VALUES (?,?,'active')").run(h.selector,h.next)
+  h.db.prepare('INSERT INTO preview_execution_leases(selector,release,lease_id) VALUES (?,?,?)').run(h.selector,h.next,'in-flight')
+  await assert.rejects(h.controller.beginRetirement(h.selector), /still leased/)
+  assert.deepEqual(await h.controller.readState(h.selector), {activeRelease:h.next,state:'draining',leased:true})
+  h.db.prepare('DELETE FROM preview_execution_leases WHERE selector=?').run(h.selector)
+  assert.equal(await h.controller.beginRetirement(h.selector),h.next)
+  const recovery=await executionFenceFor(h.controller)({selector:h.selector,sha:h.next,resources:fenced,active:{sha:h.old,resources:fenced}})
+  assert.equal(recovery.previousRelease,h.next)
+  await recovery.controller.beginActivation({selector:h.selector,previousRelease:recovery.previousRelease,release:h.next})
+  await recovery.controller.finishActivation({selector:h.selector,previousRelease:recovery.previousRelease,release:h.next})
+  assert.deepEqual(await h.controller.readState(h.selector), {activeRelease:h.next,state:'active',leased:false})
+  h.db.close()
+})
+
+test('fixture re-opt-in drains stale fence state after all recorded fenced Workers are retired', async () => {
+  const h=harness(), fenced={workers:{fence:'owned-fence'}}, plain={workers:{}}
+  h.db.prepare("INSERT INTO preview_execution_fences(selector,active_release,state) VALUES (?,?,'active')").run(h.selector,h.old)
+  h.db.prepare('INSERT INTO preview_execution_leases(selector,release,lease_id) VALUES (?,?,?)').run(h.selector,h.old,'in-flight')
+  const select=executionFenceFor(h.controller)
+  const next=await select({selector:h.selector,sha:h.next,resources:fenced,active:{sha:'d'.repeat(40),resources:plain}})
+  assert.equal(next.previousRelease,h.old)
+  await assert.rejects(next.controller.beginActivation({selector:h.selector,previousRelease:next.previousRelease,release:h.next}),/still leased/)
+  assert.equal((await h.controller.readState(h.selector)).state,'draining')
+  h.db.prepare('DELETE FROM preview_execution_leases WHERE selector=?').run(h.selector)
+  await next.controller.beginActivation({selector:h.selector,previousRelease:next.previousRelease,release:h.next})
+  await next.controller.finishActivation({selector:h.selector,previousRelease:next.previousRelease,release:h.next})
+  assert.deepEqual(await h.controller.readState(h.selector),{activeRelease:h.next,state:'active',leased:false})
   h.db.close()
 })
 
