@@ -2,7 +2,17 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { defineInstallation } from '../src/installation.mjs'
-import { relativePath } from '../src/manifest.mjs'
+import { relativePath, validateManifest } from '../src/manifest.mjs'
+import manifest from './fixtures/status.json' with { type: 'json' }
+
+test('manifest accepts nonnegative retirement delay seconds', () => {
+  for (const delay of [undefined, 0, 60, 3600]) {
+    assert.doesNotThrow(() => validateManifest({ ...manifest, retirementDelaySeconds: delay }))
+  }
+  for (const delay of [-1, 0.5, '60', null, Number.MAX_SAFE_INTEGER]) {
+    assert.throws(() => validateManifest({ ...manifest, retirementDelaySeconds: delay }), /Invalid preview retirement delay/)
+  }
+})
 
 test('isolates identical branch names and commits and preserves the original Status namespace', () => {
   const ref = 'refs/heads/feat/login', sha = 'a'.repeat(40)
