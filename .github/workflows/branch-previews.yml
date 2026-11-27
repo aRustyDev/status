@@ -41,6 +41,6 @@ jobs:
       contents: read
       actions: write
     secrets: inherit
-    uses: aRustyDev/status/.github/workflows/reconcile.yml@f3d70469045009cf6a902fb63e1d0e801606562e
+    uses: aRustyDev/status/.github/workflows/reconcile.yml@a7e278bf9d4b28e03cd62d15d15777aba9e23459
     with:
       fixture: false
