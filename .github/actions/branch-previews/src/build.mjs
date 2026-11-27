@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { cpSync, mkdirSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { build } from 'esbuild'
 import { installation } from './installation.mjs'
@@ -29,6 +29,17 @@ export async function buildArtifact(feature, output) {
       await build({...options, stdin:{contents,resolveDir:feature,sourcefile:'generated-preview-gateway.mjs'}})
     } else await build({...options,entryPoints:[entry]})
     if (c.assets) cpSync(ownedPath(feature,c.assets),path.join(output,'assets',id),{recursive:true})
+  }
+  // The optional fixture target is still built from the CI-tested feature
+  // source in this credential-free job. The path itself is trusted manifest
+  // configuration; absence is handled by the deployment policy.
+  if (manifest.fixtures?.casEntry && existsSync(path.join(feature, manifest.fixtures.casEntry))) {
+    await build({ entryPoints:[ownedPath(feature, manifest.fixtures.casEntry)], bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers','cas.mjs') })
+  }
+  // Feature scheduler code is untrusted data. The privileged deploy job wraps
+  // this already-built module using controller-owned fencing code.
+  if (manifest.fixtures?.subscriberEntry && existsSync(path.join(feature, manifest.fixtures.subscriberEntry))) {
+    await build({ entryPoints:[ownedPath(feature, manifest.fixtures.subscriberEntry)], bundle:true, format:'esm', platform:'browser', target:'es2022', conditions:['workerd','worker','browser'], external:['cloudflare:*','node:*'], outfile:path.join(output,'workers','subscriber-feature.mjs') })
   }
   cpSync(ownedPath(feature,manifest.database.migrations),path.join(output,'migrations'),{recursive:true})
 }

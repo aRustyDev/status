@@ -1,7 +1,7 @@
 import { installation } from './installation.mjs'
 import { assertDatabaseIsolation } from './isolation.mjs'
 import { fileURLToPath } from 'node:url'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { ownedPath } from './manifest.mjs'
 import { execFileSync } from 'node:child_process'
 import { appendFile, mkdtemp, rm } from 'node:fs/promises'
@@ -16,6 +16,11 @@ import { deployRelease } from './release-coordinator.mjs'
 import { createInventoryStore } from './release-inventory.mjs'
 import { createActivationAdapter } from './release-activation.mjs'
 import { reconcile } from './reconcile-cli.mjs'
+import { fixturePolicy, fixtureVaultKey, fixtureScheduleKey } from './fixture-policy.mjs'
+import { fixtureRegistryStatements } from './fixture-catalog.mjs'
+import { createCloudflareExecutionFence, executionFenceFor } from './execution-fence.mjs'
+import { createFixtureSchedulingConfigs } from './fixture-scheduling-config.mjs'
+import { buildTrustedPreviewWrappers } from './trusted-wrappers.mjs'
 
 function object(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Missing or invalid ${name}`)
@@ -71,25 +76,48 @@ export async function main(env = process.env) {
   if (!policy || !/^[a-f0-9]{40}$/.test(sha)) throw new Error('Invalid branch or commit')
   const config = parse(env.PREVIEW_BRANCH_CONFIG, 'PREVIEW_BRANCH_CONFIG')
   const secrets = parse(env.PREVIEW_WORKER_SECRETS, 'PREVIEW_WORKER_SECRETS')
-  const workerSecrets = selectWorkerSecrets(secrets, policy.environment)
+  const fixtureConfig = env.PREVIEW_ISOLATED_FIXTURE_CONFIG ? parse(env.PREVIEW_ISOLATED_FIXTURE_CONFIG, 'PREVIEW_ISOLATED_FIXTURE_CONFIG') : config.isolatedFixtures
+  const fixture = fixturePolicy(fixtureConfig, ref, sha)
+  let workerSecrets = selectWorkerSecrets(secrets, fixture.environment)
+  let fixtureRoot
+  if (fixture.enabled) {
+    // No shared environment secrets reach opted-in feature code. A unique
+    // per-release Vault key is derived from a controller-only root.
+    fixtureRoot = env.PREVIEW_ISOLATED_FIXTURE_ROOT || object(secrets.isolatedFixtures, 'isolated fixture secrets').vaultRoot
+    const key = fixtureVaultKey(fixtureRoot, selectorForBranch(ref), sha)
+    workerSecrets = Object.fromEntries(Object.keys(workerSecrets).map(component => [component, {}]))
+    for (const component of ['api', 'monitoring', 'probe', 'cas']) workerSecrets[component] = { VAULT_ENCRYPTION_KEY: key }
+    const schedule = fixtureScheduleKey(fixtureRoot, selectorForBranch(ref), sha)
+    if (fixture.probe) {
+      workerSecrets.probe.PREVIEW_SCHEDULE_SECRET = schedule
+      workerSecrets.probeScheduler = { PREVIEW_SCHEDULE_SECRET: schedule }
+    }
+    if (fixture.subscriber) for (const name of ['subscriberFeature', 'subscriberScheduler']) workerSecrets[name] = { PREVIEW_SCHEDULE_SECRET: schedule }
+  }
   const verifySecret = text(secrets.verificationSecret, 'candidate verification secret')
   if (verifySecret.length < 32) throw new Error('Candidate verification secret is too short')
   const access = object(secrets.accessHeaders, 'Access headers')
   if (Object.keys(access).length === 0 || Object.values(access).some(value => typeof value !== 'string' || !value)) throw new Error('Invalid Access headers')
   const databaseConfig = object(config.databases, 'database configuration')
   assertDatabaseIsolation(config)
-  const settings = object(object(config.environments, 'environment configuration')[policy.environment], 'selected preview environment')
+  const settings = object(object(config.environments, 'environment configuration')[fixture.environment], 'selected preview environment')
   const previewUrl = new URL(text(config.previewUrl, 'preview URL'))
   if (previewUrl.protocol !== 'https:' || previewUrl.username || previewUrl.password) throw new Error('Invalid preview URL')
   const accountId = text(env.CLOUDFLARE_ACCOUNT_ID, 'Cloudflare account')
   const token = text(env.CLOUDFLARE_API_TOKEN, 'Cloudflare token')
   const appId = text(env.FLAGSHIP_APP_ID, 'Flagship app')
   const store = createInventoryStore({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token })
+  const executionFence = createCloudflareExecutionFence({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token })
+  await executionFence.initialize()
   const branches = githubBranches({ repository: text(env.PREVIEW_SOURCE_REPOSITORY || env.GITHUB_REPOSITORY, 'GitHub repository'), defaultBranch: env.PREVIEW_DEFAULT_BRANCH || 'main', dispatchRepository: env.GITHUB_REPOSITORY, dispatchToken: env.GH_TOKEN, dispatchBranch: env.PREVIEW_HOST_BRANCH || 'main', token: text(env.PREVIEW_SOURCE_TOKEN || env.GH_TOKEN, 'GitHub token'), apiUrl: env.GITHUB_API_URL })
   const root = fileURLToPath(new URL('../', import.meta.url))
   const control = env.PREVIEW_CONTROL_DIR
   const manifest = installation().manifest
   const branchDir = env.PREVIEW_ARTIFACT_DIR
+  const fixtureSource = fixture.enabled ? ownedPath(control, 'apps/preview-fixture/index.mjs') : null
+  const fixtureSql = fixture.enabled ? ownedPath(control, 'apps/preview-fixture/schema.sql') : null
+  const casSource = fixture.cas ? path.join(branchDir, 'workers', 'cas.mjs') : null
+  if (fixture.cas && !existsSync(casSource)) throw new Error('Approved CAS fixture requires the feature CAS Worker')
   const wrangler = path.join(root, 'node_modules', '.bin', 'wrangler')
   const temp = await mkdtemp(path.join(tmpdir(), 'status-branch-release-'))
   const run = async args => execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
@@ -107,6 +135,7 @@ export async function main(env = process.env) {
       store, appId, accountId, token, dispatcherName: text(config.dispatcherName, 'dispatcher name'),
       dispatcherSource: path.join(root, 'runtime/dispatcher.ts'), directory: temp, run,
       verificationSecret: verifySecret, previewUrl: previewUrl.href, accessHeaders: access,
+      executionFenceFor: executionFenceFor(executionFence),
       ...activationIdentity(config, access),
     })
     const record = await deployRelease({
@@ -117,12 +146,32 @@ export async function main(env = process.env) {
           recordIntent: async (name, purpose) => recordResources({ [purpose === 'clean' ? 'validationDatabaseIntent' : 'databaseIntent']: { name } }),
           recordProgress: recordResources,
         })
-        const database = await prepareDatabase({ kind: policy.environment, ref, sha, config: databaseConfig,
+        const database = await prepareDatabase({ kind: fixture.environment, ref, sha, config: databaseConfig,
           mainMigrations: ownedPath(control, manifest.database.migrations), candidateMigrations: path.join(branchDir, 'migrations'), adapter, recordedResources })
         await recordResources({ database })
-        const workerSettings = { ...settings, d1DatabaseId: database.id, d1DatabaseName: database.name }
+        if (fixture.enabled) await adapter.initializeFixture(database, fixtureSql)
         const selector = selectorForBranch(ref)
+        let fixtureSettings = {}
+        if (fixture.enabled) {
+          const wrappers = (fixture.probe || fixture.subscriber)
+            ? await buildTrustedPreviewWrappers({ control, branchDir, dir: temp, probe: fixture.probe, subscriber: fixture.subscriber }) : {}
+          const isolatedFixture = { source: fixtureSource, ...(casSource ? { casSource } : {}), probe: fixture.probe, subscriber: fixture.subscriber, wrappers }
+          fixtureSettings = { databaseOwned: database.owned === true, isolatedFixture }
+          if (fixture.probe || fixture.subscriber) {
+            const probeName = installation().workerStem(selector, sha) + '-' + manifest.components.probe.suffix
+            fixtureSettings.internalScheduling = createFixtureSchedulingConfigs({ ref, selector, sha, database,
+              inventoryDatabase: { id: config.inventoryDatabaseId, name: text(fixtureConfig.inventoryDatabaseName, 'inventory database name') },
+              sharedDatabaseIds: ['dev', 'stage', 'prod'].map(name => databaseConfig[name].id), flagshipAppId: appId,
+              runtimeDir: path.join(root, 'runtime'), probeName, dir: temp })
+          }
+          if (fixture.subscriber) {
+            const mail = object(fixtureConfig.mail, 'isolated subscriber mail configuration')
+            fixtureSettings.internalSubscriber = { from: text(mail.from, 'preview sender'), to: text(mail.to, 'preview recipient'), publicUrl: previewUrl.origin }
+          }
+        }
+        const workerSettings = { ...settings, d1DatabaseId: database.id, d1DatabaseName: database.name, ...fixtureSettings }
         const { names } = createBranchConfigs({ settings: workerSettings, selector, sha, branchDir, dir: temp })
+        if (fixture.enabled) await adapter.initializeFixtureRegistry(database, fixtureRegistryStatements(names.fixture, sha, Boolean(casSource)))
         await recordResources({ workers: names, gateway: names.gateway })
         await deployBranchWorkers({ settings: workerSettings, selector, sha, branchDir, dir: temp, run,
           installSecrets: async (component, name) => install(name, workerSecrets[component]) })
@@ -133,7 +182,7 @@ export async function main(env = process.env) {
         await activate(candidate)
       },
     })
-    const result = { url: previewUrl.origin, header_name: installation().header, selector: record.selector, sha: record.active.sha, environment: record.environment }
+    const result = { url: previewUrl.origin, header_name: installation().header, selector: record.selector, sha: record.active.sha, environment: record.environment, database_environment: fixture.environment }
     console.log(JSON.stringify(result))
     if (env.GITHUB_OUTPUT) await appendFile(env.GITHUB_OUTPUT, Object.entries(result).map(([k,v]) => k + '=' + v).join('\n') + '\n')
     if (env.GITHUB_STEP_SUMMARY) await appendFile(env.GITHUB_STEP_SUMMARY, `### Branch preview\n\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\`\n`)

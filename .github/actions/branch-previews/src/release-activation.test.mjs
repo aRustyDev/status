@@ -142,3 +142,34 @@ test('reuses only a cleared tombstone for a branch with no active release', asyn
     assert.match(result.error?.message || '', /Unexpected existing Flagship state/)
   }
 })
+
+test('execution fence drains before publishing and activates only after edge verification', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'preview-activation-fence-'))
+  t.after(() => rmSync(directory, {force:true,recursive:true}))
+  const record = newRelease({ref,sha})
+  const stem = createHash('sha256').update(`${record.selector}:${sha}`).digest('hex').slice(0,24)
+  record.candidate = {sha,generation:1,phase:'activating',resources:{gateway:`status-p-${stem}-gateway`}}
+  const events = []
+  let flag = null, failEdge = true
+  const controller = {
+    async beginActivation(args) { events.push('drain'); assert.equal(args.previousRelease,null) },
+    async finishActivation() { events.push('activate') },
+  }
+  const adapter = createActivationAdapter({store:{list:async()=>[{record}]},appId:'app',accountId:'account',token:'token',dispatcherName:'dispatcher',dispatcherSource:'/trusted/dispatcher.ts',directory,run:async()=>{},verificationSecret:'x'.repeat(32),previewUrl:'https://preview.example',accessTeamDomain:'team.cloudflareaccess.com',accessAud:'aud',serviceTokenId:'client.access',wait:async()=>{},executionFenceFor:async()=>({controller,previousRelease:null}),
+    fetchImpl:async(url,options)=> {
+      if (url === 'https://preview.example/__preview/verify') {
+        if (options.headers['X-Status-Preview-Verify'].includes('.candidate.')) {events.push('candidate'); return {ok:true,headers:new Headers({'X-Status-Preview-Commit':sha})}}
+        if (failEdge) return {ok:false,status:503}
+        events.push('edge'); return {ok:true,headers:new Headers({'X-Status-Preview-Commit':sha})}
+      }
+      if (options.method === 'POST') {events.push('publish'); flag=JSON.parse(options.body)}
+      return flag ? {ok:true,status:200,json:async()=>({success:true,result:flag})} : {status:404}
+    },
+  })
+  const input={ref,sha,generation:1,selector:record.selector,resources:record.candidate.resources,active:null}
+  await assert.rejects(adapter(input),/Preview route did not confirm/)
+  assert.deepEqual(events,['candidate','drain','publish'])
+  failEdge=false
+  await adapter(input)
+  assert.deepEqual(events,['candidate','drain','publish','candidate','drain','edge','activate'])
+})

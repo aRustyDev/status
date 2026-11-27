@@ -1,0 +1,46 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import { tmpdir } from 'node:os'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { buildTrustedPreviewWrappers } from './trusted-wrappers.mjs'
+
+const control = fileURLToPath(new URL('../../../../', import.meta.url))
+function fixture(t) {
+  const dir = mkdtempSync(path.join(tmpdir(),'trusted-preview-test-'))
+  const branchDir = path.join(dir,'artifact'), workers = path.join(branchDir,'workers'), output = path.join(dir,'out')
+  mkdirSync(workers, {recursive:true}); mkdirSync(output)
+  t.after(() => rmSync(dir, {recursive:true,force:true}))
+  return { dir, workers, output, branchDir }
+}
+
+test('builds trusted wrappers without executing feature code and hides privileged bindings', async t => {
+  const h = fixture(t)
+  writeFileSync(path.join(h.workers,'api.mjs'), `globalThis.__fixtureExecuted = true; export default { fetch(_request, env) { return new Response(JSON.stringify({keys:Object.keys(env),send:typeof env.SUBSCRIBER_EMAIL?.send})) } }`)
+  writeFileSync(path.join(h.workers,'probe.mjs'), `export default { fetch(_r,env) { return new Response(JSON.stringify(Object.keys(env))) }, async scheduled(_e,env) { globalThis.__scheduledBindings=Object.keys(env) } }`)
+  writeFileSync(path.join(h.workers,'subscriber-feature.mjs'), `export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT=2; export async function flushPreviewSubscriberDeliveries() {}`)
+  const files = await buildTrustedPreviewWrappers({ control, branchDir:h.branchDir, dir:h.output, probe:true, subscriber:true })
+  assert.equal(globalThis.__fixtureExecuted, undefined)
+  assert.deepEqual(Object.keys(files).sort(), ['api','mailer','probe','probeScheduler','subscriberFeature','subscriberScheduler'])
+  const app = (await import(pathToFileURL(files.api).href)).default
+  const result = await app.fetch(new Request('https://example.test/'), { PREVIEW_MAILER:{fetch(){}}, PREVIEW_FENCE:{}, EMAIL:{}, DB:{} })
+  const data = await result.json()
+  assert.equal(data.send, 'function')
+  assert.ok(data.keys.includes('DB'))
+  for (const key of ['PREVIEW_MAILER','PREVIEW_FENCE','EMAIL']) assert.equal(data.keys.includes(key), false)
+  const probe = (await import(pathToFileURL(files.probe).href)).default
+  const probeResponse = await probe.fetch(new Request('https://example.test/'), {PREVIEW_SCHEDULE_SECRET:'secret', PREVIEW_FENCE:{}, DB:{}})
+  assert.deepEqual(await probeResponse.json(), ['DB'])
+  assert.doesNotMatch(readFileSync(files.api,'utf8'), /sourceMappingURL=/)
+  delete globalThis.__fixtureExecuted
+})
+
+test('refuses imports from a feature artifact into privileged controller files', async t => {
+  const h = fixture(t)
+  const secret = path.join(h.dir, 'controller-secret.mjs')
+  writeFileSync(secret, 'export default "PRIVATE-CONTROLLER-SECRET"')
+  writeFileSync(path.join(h.workers,'api.mjs'), `import secret from ${JSON.stringify(secret)}; export default secret`)
+  writeFileSync(path.join(h.workers,'subscriber-feature.mjs'), 'export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT=2; export function flushPreviewSubscriberDeliveries() {}')
+  await assert.rejects(buildTrustedPreviewWrappers({control,branchDir:h.branchDir,dir:h.output,subscriber:true}), /unresolved import/)
+})

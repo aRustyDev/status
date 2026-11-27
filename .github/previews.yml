@@ -13,6 +13,7 @@
   "compatibilityDate": "2026-11-23",
   "smokePath": "/",
   "launcher": "scripts/preview-browser.mjs",
+  "fixtures": { "casEntry": "apps/probe/src/cas-worker.ts", "subscriberEntry": "apps/worker/src/preview-subscriber-scheduler.ts" },
   "database": {
     "migrations": "apps/worker/migrations",
     "seed": ".github/previews/seed.sql"

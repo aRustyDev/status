@@ -18,6 +18,7 @@ import { recoverCandidate } from './recover-candidate.mjs'
 import { branchKey } from './release-contract.mjs'
 import { cleanupAbandoned } from './cleanup-abandoned.mjs'
 import { cleanupRetained } from './cleanup-retained.mjs'
+import { createCloudflareExecutionFence, executionFenceFor } from './execution-fence.mjs'
 
 function object(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Missing ${name}`)
@@ -40,6 +41,8 @@ export async function reconcile(env = process.env) {
   const access = new Headers(object(secrets.accessHeaders, 'Access headers'))
   const dispatcherVars = { ACCESS_TEAM_DOMAIN: text(stage.accessTeamDomain, 'Access team domain'), ACCESS_AUD: text(stage.accessAud, 'Access audience'), PREVIEW_SERVICE_TOKEN_ID: text(access.get('CF-Access-Client-Id'), 'Access service token ID') }
   const store = createInventoryStore({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token })
+  const executionFence = createCloudflareExecutionFence({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token })
+  await executionFence.initialize()
   const branches = githubBranches({ repository: text(env.PREVIEW_SOURCE_REPOSITORY || env.GITHUB_REPOSITORY, 'GitHub repository'), defaultBranch: env.PREVIEW_DEFAULT_BRANCH || 'main', dispatchRepository: env.GITHUB_REPOSITORY, dispatchToken: env.GH_TOKEN, dispatchBranch: env.PREVIEW_HOST_BRANCH || 'main', token: text(env.PREVIEW_SOURCE_TOKEN || env.GH_TOKEN, 'GitHub token'), apiUrl: env.GITHUB_API_URL })
   const root = fileURLToPath(new URL('../', import.meta.url))
   const control = env.PREVIEW_CONTROL_DIR
@@ -51,8 +54,8 @@ export async function reconcile(env = process.env) {
     const run = async args => execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
     const dispatcherName = text(config.dispatcherName, 'dispatcher name')
     const dispatcherSource = path.join(root, 'runtime/dispatcher.ts')
-    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run })
-    const activate = createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory: temp, run, verificationSecret: text(secrets.verificationSecret, 'verification secret'), previewUrl: text(config.previewUrl, 'preview URL'), accessHeaders: object(secrets.accessHeaders, 'Access headers'), accessTeamDomain: dispatcherVars.ACCESS_TEAM_DOMAIN, accessAud: dispatcherVars.ACCESS_AUD, serviceTokenId: dispatcherVars.PREVIEW_SERVICE_TOKEN_ID })
+    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run, executionFence })
+    const activate = createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory: temp, run, verificationSecret: text(secrets.verificationSecret, 'verification secret'), previewUrl: text(config.previewUrl, 'preview URL'), accessHeaders: object(secrets.accessHeaders, 'Access headers'), accessTeamDomain: dispatcherVars.ACCESS_TEAM_DOMAIN, accessAud: dispatcherVars.ACCESS_AUD, serviceTokenId: dispatcherVars.PREVIEW_SERVICE_TOKEN_ID, executionFenceFor: executionFenceFor(executionFence) })
     async function isPublishedCandidate({ ref, sha, selector }) {
       const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/flagship/apps/${encodeURIComponent(appId)}/flags/${installation().flagPrefix}branch-${branchKey(ref)}`
       const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })

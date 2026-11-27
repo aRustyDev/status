@@ -6,7 +6,7 @@ import { deleteOwnedDatabase } from './database.mjs'
 
 // All callers share the deployment workflow's concurrency group. A timed-out
 // flag update stays in the inventory's disabling phase for operator recovery.
-export function createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars = {}, directory, run, databaseConfig, databaseAdapter, fetcher = fetch, now = Date.now, drainMs = 3600_000 }) {
+export function createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars = {}, directory, run, databaseConfig, databaseAdapter, fetcher = fetch, now = Date.now, drainMs = 3600_000, executionFence }) {
   if (!accountId || !appId || !token || !store || !dispatcherName || !dispatcherSource || !directory || typeof run !== 'function' || !databaseConfig || !databaseAdapter || !Number.isSafeInteger(drainMs) || drainMs < 3600_000) throw new Error('Invalid retirement configuration')
   const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`
   async function request(url, method = 'GET', body) {
@@ -20,10 +20,23 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
   }
   const flagUrl = ref => `${base}/flagship/apps/${encodeURIComponent(appId)}/flags/${installation().flagPrefix}branch-${branchKey(ref)}`
   async function disableFlag({ ref, selector }) {
+    if (executionFence) {
+      const snapshot = await store.read(ref)
+      if (!snapshot?.record || snapshot.record.selector !== selector) throw new Error('Preview inventory changed before retirement')
+      const active = snapshot.record.active
+      const state = await executionFence.readState(selector)
+      if ([active, snapshot.record.previous, ...(snapshot.record.retained || [])].some(release => release?.resources?.workers?.fence) && !state) throw new Error('Recorded fixture release has no execution fence')
+      if (state && state.activeRelease !== (active?.sha ?? null) && !(state.state === 'draining' && state.activeRelease === null)) throw new Error('Execution fence does not match preview inventory')
+    }
+    const retiringRelease = executionFence ? await executionFence.beginRetirement(selector) : null
     const flag = await request(flagUrl(ref))
-    if (!flag) return
+    if (!flag) {
+      if (executionFence) await executionFence.finishRetirement(selector, retiringRelease)
+      return
+    }
     if (flag.default_variation !== 'current' || flag.rules?.length || !flag.variations?.current || (flag.variations.current.selector !== selector && Object.keys(flag.variations.current).length !== 0)) throw new Error('Unexpected Flagship state before retirement')
     await request(flagUrl(ref), 'PUT', { key: installation().flagPrefix + 'branch-' + branchKey(ref), enabled: true, default_variation: 'current', rules: [], variations: { current: {} } })
+    if (executionFence) await executionFence.finishRetirement(selector, retiringRelease)
   }
   return {
     disableFlag,
@@ -67,9 +80,19 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
       const stem = installation().workerStem(selector, release.sha)
       const suffixes = Object.fromEntries(Object.entries(installation().manifest.components).map(([key, component]) => [key, component.suffix]))
       const workers = release.resources?.workers
+      // Optional private fixtures are owned only when their deterministic names
+      // were recorded as part of this release. Never accept arbitrary extras.
+      if (workers?.fixture) suffixes.fixture = 'fixture'
+      if (workers?.cas && workers?.fixture) suffixes.cas = 'cas'
+      if (workers?.fence && workers?.fixture) suffixes.fence = 'fence'
+      if (workers?.probeScheduler && workers?.fence && workers?.fixture) suffixes.probeScheduler = 'probe-scheduler'
+      if (workers?.mailer && workers?.fence && workers?.fixture) suffixes.mailer = 'mailer'
+      if (workers?.subscriberFeature && workers?.mailer && workers?.fence && workers?.fixture) suffixes.subscriberFeature = 'subscriber-feature'
+      if (workers?.subscriberScheduler && workers?.subscriberFeature && workers?.mailer && workers?.fence && workers?.fixture) suffixes.subscriberScheduler = 'subscriber-scheduler'
       if (!workers || Object.keys(workers).length !== Object.keys(suffixes).length || Object.entries(suffixes).some(([key, suffix]) => workers[key] !== `${stem}-${suffix}`) || release.resources.gateway !== workers.gateway) throw new Error('Worker ownership verification failed')
       // Delete in reverse service dependency order. Never use force.
-      for (const key of Object.keys(suffixes).reverse()) await request(`${base}/workers/scripts/${encodeURIComponent(workers[key])}`, 'DELETE')
+      const order = (workers.subscriberScheduler ? ['subscriberScheduler'] : []).concat(workers.probeScheduler ? ['probeScheduler'] : [], Object.keys(installation().manifest.components).reverse(), workers.subscriberFeature ? ['subscriberFeature'] : [], workers.mailer ? ['mailer'] : [], workers.cas ? ['cas'] : [], workers.fixture ? ['fixture'] : [], workers.fence ? ['fence'] : [])
+      for (const key of order) await request(`${base}/workers/scripts/${encodeURIComponent(workers[key])}`, 'DELETE')
       for (const database of [release.resources.database, release.resources.validationDatabase]) {
         if (database?.owned) await deleteOwnedDatabase({ database, config: databaseConfig, adapter: databaseAdapter, ref, sha: release.sha })
       }
