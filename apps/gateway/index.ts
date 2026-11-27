@@ -42,7 +42,7 @@ async function preview(request: Request, env: Env, selector: string): Promise<Re
   }
 
   // The baseline API validates the Access assertion before a client can select a build.
-  const identityUrl = new URL('/api/v1/auth/me', request.url)
+  const identityUrl = new URL('/api/v1/auth/preview-verify', request.url)
   let identity: Response
   try {
     identity = await env.API.fetch(new Request(identityUrl, { method: 'GET', headers: request.headers }))

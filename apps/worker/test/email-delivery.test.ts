@@ -31,7 +31,7 @@ const destinationConfig = JSON.stringify([{ id: 'ops', name: 'Operations', addre
 type EmailMessage = { from: string; to: string; subject: string; text: string; html: string }
 async function fixture(send?: (message: EmailMessage) => Promise<unknown>) {
   const local = new Database()
-  for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_actions.sql', '0009_channels.sql', '0010_notification_transition_state.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql']) {
+  for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_actions.sql', '0009_channels.sql', '0010_notification_transition_state.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql','0018_delivery_history.sql']) {
     local.sqlite.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
   }
   local.sqlite.prepare("INSERT INTO components (id,name,updated_at) VALUES ('component','Checkout <API>',0)").run()
@@ -184,7 +184,7 @@ test('Workerd D1 serializes concurrent email claims and persists the result', { 
   const runtime = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
   try {
     const db = await runtime.getD1Database('DB') as D1Database
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_actions.sql', '0009_channels.sql', '0010_notification_transition_state.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_actions.sql', '0009_channels.sql', '0010_notification_transition_state.sql', '0010_monitor_alert_links.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql','0018_delivery_history.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
