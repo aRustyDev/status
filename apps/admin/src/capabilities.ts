@@ -4,6 +4,8 @@ export interface Capabilities {
   supportedRoutes: string[]
   templates?: boolean
   notifications?: boolean
+  subscriptions?: boolean
+  subscriberDelivery?: boolean
   actions?: boolean
   recurringMaintenance?: boolean
   dependencies?: boolean

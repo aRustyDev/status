@@ -3,6 +3,7 @@ export interface MutationIdentity { id: string; version: number; role: string }
 export interface ReceiptContext {
   actor: MutationIdentity
   key: string
+  storageKey: string
   hash: string
   expiresAt: number
   method: string
@@ -53,7 +54,7 @@ export async function boundedBody(request: Request, clone = true, timeoutMs = 15
   return new TextDecoder().decode(bytes)
 }
 
-export async function receiptContext(request: Request, actor: MutationIdentity): Promise<ReceiptContext | null> {
+export async function receiptContext(request: Request, actor: MutationIdentity, previewScope: string | null = null): Promise<ReceiptContext | null> {
   const key = request.headers.get('Idempotency-Key')
   if (!key) return null
   const match = KEY.exec(key)
@@ -71,13 +72,15 @@ export async function receiptContext(request: Request, actor: MutationIdentity):
   const url = new URL(request.url), path = url.pathname
   const bytes = new TextEncoder().encode(`${request.method}\n${path}${url.search}\n${raw}`)
   const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(x => x.toString(16).padStart(2, '0')).join('')
-  return { actor, key, hash, expiresAt: created + TTL, method: request.method, path, body: body as Record<string, unknown> }
+  if (previewScope !== null && !/^[0-9a-f]{64}$/.test(previewScope)) throw new ReceiptError(503, 'Preview unavailable')
+  const storageKey = previewScope ? `preview:${previewScope}:${key}` : key
+  return { actor, key, storageKey, hash, expiresAt: created + TTL, method: request.method, path, body: body as Record<string, unknown> }
 }
 
 export async function findReceipt(db: D1Database, ctx: ReceiptContext): Promise<Receipt | null> {
   const row = await db.prepare(`SELECT r.request_hash,r.status,r.result_id,r.result_alias,r.result_version,
     u.version AS current_actor_version,u.role AS current_actor_role FROM mutation_receipts r JOIN users u ON u.id=r.actor_id
-    WHERE r.actor_id=? AND r.request_key=?`).bind(ctx.actor.id, ctx.key).first<Receipt & {current_actor_version:number;current_actor_role:string}>()
+    WHERE r.actor_id=? AND r.request_key=?`).bind(ctx.actor.id, ctx.storageKey).first<Receipt & {current_actor_version:number;current_actor_role:string}>()
   if (!row) return null
   if (row.current_actor_version !== ctx.actor.version || row.current_actor_role !== ctx.actor.role) throw new ReceiptError(403, 'Identity changed; refresh and try again')
   if (row.request_hash !== ctx.hash) throw new ReceiptError(409, 'Idempotency key was already used for a different request')
@@ -88,7 +91,7 @@ export async function findReceipt(db: D1Database, ctx: ReceiptContext): Promise<
 /** Prefix and suffix run in the same D1 batch as the mutation and its audit. */
 export function receiptClaim(db: D1Database, ctx: ReceiptContext, token: string): D1PreparedStatement {
   return db.prepare(`INSERT INTO mutation_receipts (actor_id,request_key,request_hash,actor_version,attempt_token,status,expires_at)
-    VALUES (?,?,?,?,?,0,?)`).bind(ctx.actor.id, ctx.key, ctx.hash, ctx.actor.version, token, ctx.expiresAt)
+    VALUES (?,?,?,?,?,0,?)`).bind(ctx.actor.id, ctx.storageKey, ctx.hash, ctx.actor.version, token, ctx.expiresAt)
 }
 
 export function receiptFinish(db: D1Database, ctx: ReceiptContext, token: string, status: number, resultId: string, resultVersion: number,
@@ -96,5 +99,5 @@ export function receiptFinish(db: D1Database, ctx: ReceiptContext, token: string
   const alias = aliasType ? '(SELECT alias FROM entity_aliases WHERE entity_type=? AND entity_id=?)' : 'NULL'
   return db.prepare(`UPDATE mutation_receipts SET status=CASE WHEN EXISTS (${guardSql}) THEN ? ELSE NULL END,
     result_id=?, result_version=?, result_alias=${alias} WHERE actor_id=? AND request_key=? AND attempt_token=?`)
-    .bind(...guardValues, status, resultId, resultVersion, ...(aliasType ? [aliasType, resultId] : []), ctx.actor.id, ctx.key, token)
+    .bind(...guardValues, status, resultId, resultVersion, ...(aliasType ? [aliasType, resultId] : []), ctx.actor.id, ctx.storageKey, token)
 }

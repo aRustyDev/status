@@ -45,6 +45,8 @@ assert.equal(response.status, 308)
 assert.equal(response.headers.get('location'), 'https://status.example/admin/')
 response = await gateway.fetch(request('/api/v1/public/status', '*/*'), env)
 assert.equal(await response.text(), 'status-api')
+response = await gateway.fetch(request('/api/v1/bsp/public/subscriptions/options', '*/*'), env)
+assert.equal(await response.text(), 'legacy:/api/v1/bsp/public/subscriptions/options')
 response = await gateway.fetch(request('/api/v1/bsp/admin/monitors/test', '*/*'), env)
 assert.equal(await response.text(), 'monitoring-api')
 

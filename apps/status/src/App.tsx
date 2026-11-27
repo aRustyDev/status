@@ -404,6 +404,11 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
                 <span id="subscriptions-unavailable" className="sr-only">Subscriptions are unavailable.</span>
               </span>
             )}
+            {subscriptionsEnabled && account && !previewMode && (
+              <button type="button" className="bsp-action" onClick={() => setSubscriptionLink({ mode: 'manage', token: '' })}>
+                Manage subscription
+              </button>
+            )}
             <LanguageSwitcher />
             {account && !previewMode && <AccountMenu email={account.email} role={account.role} />}
             {!brandingEnabled && (
@@ -633,10 +638,10 @@ function StatusPage({ account, subscriptionsEnabled, retentionDays }: {
       )}
 
       {showSubscribe && subscriptionOptions && subscribable && (
-        <SubscribeDialog options={subscriptionOptions} onClose={() => setShowSubscribe(false)} />
+        <SubscribeDialog options={subscriptionOptions} onClose={() => setShowSubscribe(false)} email={account?.email} />
       )}
       {subscriptionsEnabled && subscriptionLink && (
-        <SubscriptionLinkDialog link={subscriptionLink} options={subscriptionOptions} optionsFailed={subscriptionOptionsFailed} onClose={() => setSubscriptionLink(null)} />
+        <SubscriptionLinkDialog link={subscriptionLink} options={subscriptionOptions} optionsFailed={subscriptionOptionsFailed} onClose={() => setSubscriptionLink(null)} email={account?.email} />
       )}
     </div>
   )

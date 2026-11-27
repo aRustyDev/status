@@ -1,4 +1,5 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose'
+import { enqueueSubscriberDeliveries, flushSubscriberDeliveries } from './subscriber-delivery'
 import { endpointFingerprint, parseEndpoints, type Endpoint } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
 import { parsePersistedHttpConfig, parseVaultBasicAuth, requestAllowedForEndpoint } from '../../probe/src/http-monitor'
@@ -12,10 +13,20 @@ import { emailChannelFingerprint, emailDestinations, emailReady, type EmailChann
 import { resolveChannelCredential } from './vault-resolver'
 import { actionApi, ActionError } from './actions'
 import { actionEndpoints, type ActionEnvironment } from './actions-runtime'
+import { subscriberApi, SubscriberError, subscriberEmailReady, subscriberScope } from './subscribers'
 import { checkFallback, FallbackConflictError, getFallback, publishFallback, saveFallback } from './static-fallback'
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 
 interface Env extends EmailChannelEnv {
+  SUBSCRIBERS_READY?: string
+  PREVIEW_SUBSCRIBER_SCOPE?: string
+  PREVIEW_SUBSCRIBER_REQUIRED?: string
+  PREVIEW_BRANCH_DELIVERY_CONTEXT?: string
+  SUBSCRIBER_EMAIL_READY?: string
+  SUBSCRIBER_EMAIL_FROM?: string
+  SUBSCRIBER_EMAIL_DESTINATIONS?: string
+  SUBSCRIBER_EMAIL?: SendEmail
+  SUBSCRIBER_PUBLIC_URL?: string
   DB: D1Database
   VAULT_ENCRYPTION_KEY?: string
   MONITOR_AUTH_READY?: string
@@ -36,6 +47,20 @@ interface Env extends EmailChannelEnv {
   BACKUPS_READY?: string
   FALLBACK_BUCKET?: R2Bucket
   FALLBACK_READY?: string
+}
+
+async function subscriberDeliveryReady(env: Env): Promise<boolean> {
+  if (env.SUBSCRIBERS_READY !== 'true' || !subscriberEmailReady(env)) return false
+  const scope = subscriberScope(env)
+  const settings = scope
+    ? await env.DB.prepare("SELECT 1 FROM preview_subscription_settings WHERE scope=? AND enabled=1 AND allow_email=1 AND json_array_length(allowed_events)>0").bind(scope).first()
+    : await env.DB.prepare("SELECT 1 FROM subscription_settings WHERE id=1 AND enabled=1 AND allow_email=1 AND json_array_length(allowed_events)>0").first()
+  return !!settings
+}
+
+async function requireSubscriberDelivery(env: Env, requested: unknown): Promise<void> {
+  if (requested !== undefined && typeof requested !== 'boolean') throw new HttpError(400, 'Invalid subscriber notification setting')
+  if (requested === true && !await subscriberDeliveryReady(env)) throw new HttpError(503, 'Subscriber delivery is unavailable')
 }
 
 async function notificationsReady(env: Env): Promise<boolean> {
@@ -187,7 +212,13 @@ function safeAuditDetails(input: unknown): Json {
 function parsedAuditDetails(value: unknown): Json {
   try { return safeAuditDetails(JSON.parse(String(value))) } catch { return {} }
 }
-async function auditPage(db: D1Database, request: Request): Promise<Response> {
+function auditSource(scope: string | null): {sql:string; values:string[]} {
+  if (!scope) return {sql:'(SELECT id,actor_email,action,entity_type,entity_id,created_at,details,rowid AS sort_rowid,0 AS source_order,NULL AS previewScope FROM audit_events)',values:[]}
+  return {sql:`(SELECT id,actor_email,action,entity_type,entity_id,created_at,details,rowid AS sort_rowid,0 AS source_order,NULL AS previewScope FROM audit_events a
+    WHERE NOT EXISTS (SELECT 1 FROM preview_audit_events own WHERE own.preview_scope=? AND own.id=a.id)
+    UNION ALL SELECT id,actor_email,action,entity_type,entity_id,created_at,details,rowid AS sort_rowid,1 AS source_order,preview_scope AS previewScope FROM preview_audit_events WHERE preview_scope=?)`,values:[scope,scope]}
+}
+async function auditPage(db: D1Database, request: Request, scope: string | null): Promise<Response> {
   const params = new URL(request.url).searchParams
   const number = (key: string, fallback: number, min: number, max: number) => {
     const raw = params.get(key)
@@ -209,13 +240,18 @@ async function auditPage(db: D1Database, request: Request): Promise<Response> {
     else { clauses.push(`${column}=?`); values.push(value) }
   }
   const where = clauses.join(' AND ')
-  const count = await stmt(db, `SELECT COUNT(*) AS count FROM audit_events WHERE ${where}`, ...values).first<{count:number}>()
-  const rows = await stmt(db, `SELECT id, actor_email AS userEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS timestamp, details FROM audit_events WHERE ${where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`, ...values, limit, (page - 1) * limit).all<{id:string; userEmail:string; action:string; entityType:string; entityId:string; timestamp:number; details:string}>()
+  const source = auditSource(scope)
+  const count = await stmt(db, `SELECT COUNT(*) AS count FROM ${source.sql} WHERE ${where}`, ...source.values, ...values).first<{count:number}>()
+  const rows = await stmt(db, `SELECT id, actor_email AS userEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS timestamp, details, previewScope FROM ${source.sql} WHERE ${where} ORDER BY created_at DESC, source_order ASC, sort_rowid DESC LIMIT ? OFFSET ?`, ...source.values, ...values, limit, (page - 1) * limit).all<{id:string; userEmail:string; action:string; entityType:string; entityId:string; timestamp:number; details:string; previewScope:string | null}>()
   const total = count?.count ?? 0
-  return json({ entries: rows.results.map(({ details, ...row }) => ({ ...row, entityName: row.entityId, diff: parsedAuditDetails(details) })), total, page, limit, pages: Math.max(1, Math.ceil(total / limit)) })
+  return json({ entries: rows.results.map(({ details, previewScope, ...row }) => ({ ...row, entityName: row.entityId, diff: { ...parsedAuditDetails(details), ...(previewScope && /^[0-9a-f]{64}$/.test(previewScope) ? { previewScope } : {}) } })), total, page, limit, pages: Math.max(1, Math.ceil(total / limit)) })
 }
-function audit(db: D1Database, user: User, action: string, entityType: string, entityId: string, details: Json, guard?: { table: string; token: string; id?: string }): D1PreparedStatement {
+function audit(db: D1Database, user: User, action: string, entityType: string, entityId: string, details: Json, guard?: { table: string; token: string; id?: string }, previewScope: string | null = null): D1PreparedStatement {
   const values = [id(), user.email, action, entityType, entityId, Date.now(), JSON.stringify(safeAuditDetails(details))]
+  if (previewScope) {
+    if (!guard) return stmt(db, 'INSERT INTO preview_audit_events (id, actor_email, action, entity_type, entity_id, created_at, details, preview_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', ...values, previewScope)
+    return stmt(db, `INSERT INTO preview_audit_events (id, actor_email, action, entity_type, entity_id, created_at, details, preview_scope) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ${guard.table} WHERE id=? AND mutation_key=?)`, ...values, previewScope, guard.id ?? entityId, guard.token)
+  }
   if (!guard) return stmt(db, 'INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) VALUES (?, ?, ?, ?, ?, ?, ?)', ...values)
   return stmt(db, `INSERT INTO audit_events (id, actor_email, action, entity_type, entity_id, created_at, details) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ${guard.table} WHERE id=? AND mutation_key=?)`, ...values, guard.id ?? entityId, guard.token)
 }
@@ -397,8 +433,9 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
     if (resource === 'components' && !recordId) return json(await listComponents(db, await listIncidents(db, false), await listMaintenance(db, false), env))
     if (resource === 'users' && !recordId) return json((await db.prepare('SELECT id, email, role, version FROM users ORDER BY email').all()).results)
     if (resource === 'audit' && !recordId) {
-      const rows = await db.prepare('SELECT id, actor_email AS actorEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS createdAt, details FROM audit_events ORDER BY created_at DESC LIMIT 200').all<Row>()
-      return json(rows.results.map(row => ({ ...row, details: JSON.stringify(parsedAuditDetails(row.details)) })))
+      const source = auditSource(subscriberScope(env))
+      const rows = await stmt(db, `SELECT id, actor_email AS actorEmail, action, entity_type AS entityType, entity_id AS entityId, created_at AS createdAt, details, previewScope FROM ${source.sql} ORDER BY created_at DESC, source_order ASC, sort_rowid DESC LIMIT 200`, ...source.values).all<Row>()
+      return json(rows.results.map(({previewScope, ...row}) => ({ ...row, details: JSON.stringify(parsedAuditDetails(row.details)), ...(typeof previewScope === 'string' && /^[0-9a-f]{64}$/.test(previewScope) ? { previewScope } : {}) })))
     }
     if (resource === 'checks' && !recordId) {
       const checks = (await db.prepare('SELECT id, component_id AS componentId, endpoint_id AS endpointId, enabled, interval_minutes AS intervalMinutes, expected_status AS expectedStatus, config_version AS version, advanced_config AS advancedConfig FROM http_checks').all<Row>()).results
@@ -452,7 +489,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
       const replay = await commitMutation(db, [
         stmt(db,'INSERT INTO incidents (id,title,status,impact,draft,created_at,updated_at) VALUES (?,?,?,?,1,?,?)',incidentId,title,'investigating',impact,now,now),
         stmt(db,'INSERT INTO incident_updates (id,incident_id,body,status,posted_at) VALUES (?,?,?,?,?)',id(),incidentId,message,'investigating',now),
-        ...links(db,'incident_components','incident_id',incidentId,ids),audit(db,user,'create','incident',incidentId,{title,impact})
+        ...links(db,'incident_components','incident_id',incidentId,ids),audit(db,user,'create','incident',incidentId,{title,impact},undefined,subscriberScope(env))
       ], receipt, incidentId, 1, 201, 'SELECT 1 FROM incidents WHERE id=?', [incidentId])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({ id:incidentId,title,impact,status:'investigating',draft:true,componentIds:ids,version:1 },201)
@@ -492,7 +529,13 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
         extra.push(stmt(db,`DELETE FROM incident_components WHERE incident_id=? AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE value=incident_components.component_id) AND EXISTS (SELECT 1 FROM incidents WHERE id=? AND mutation_key=?)`,recordId,JSON.stringify(ids),recordId,token))
         extra.push(...links(db,'incident_components','incident_id',recordId,ids,'incidents',token))
       }
-      extra.push(audit(db,user,event,'incident',recordId,{title,status,impact},{table:'incidents',token}))
+      if (!draft && (event === 'publish' || event === 'timeline_update')) await requireSubscriberDelivery(env, body.notifySubscribers)
+      if (env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true && !draft && (event === 'publish' || event === 'timeline_update')) {
+        const linked = await stmt(db, 'SELECT component_id FROM incident_components WHERE incident_id=?',recordId).all<{component_id:string}>()
+        const eventType = event === 'publish' ? (status === 'resolved' ? 'incident.resolved' : 'incident.created') : (status === 'resolved' ? 'incident.resolved' : 'incident.updated')
+        extra.push(enqueueSubscriberDeliveries(db,token,eventType,linked.results.map(row => row.component_id),now,{table:'incidents',id:recordId,mutationKey:token},env))
+      }
+      extra.push(audit(db,user,event,'incident',recordId,{title,status,impact},{table:'incidents',token},subscriberScope(env)))
       const replay = await mutate(db,stmt(db,'UPDATE incidents SET title=?,impact=?,status=?,draft=?,resolved_at=?,updated_at=?,version=version+1,mutation_key=? WHERE id=? AND version=?',title,impact,status,draft,resolved,now,token,recordId,version(body)),extra,receipt,recordId,Number(body.version)+1,'SELECT 1 FROM incidents WHERE id=? AND mutation_key=?',[recordId,token])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:recordId,version:Number(body.version)+1})
@@ -501,13 +544,14 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
   if (resource === 'maintenance') {
     if (method === 'POST' && !recordId) {
       const maintenanceId = id()
+      await requireSubscriberDelivery(env, body.notifySubscribers)
       const name = string(body.name,'name',200)
       const description = body.description === undefined || body.description === '' ? '' : string(body.description,'description')
       const starts = timestamp(body.startsAt,'startsAt'), ends = timestamp(body.endsAt,'endsAt')
       if (ends <= starts) bad('End must be after start')
       const ids = componentIds(body.componentIds ?? [])
       await validateComponents(db,ids)
-      const replay = await commitMutation(db,[stmt(db,'INSERT INTO maintenance (id,name,description,starts_at,ends_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',maintenanceId,name,description,starts,ends,now,now),...links(db,'maintenance_components','maintenance_id',maintenanceId,ids),audit(db,user,'create','maintenance',maintenanceId,{name,startsAt:starts,endsAt:ends})],receipt,maintenanceId,1,201,'SELECT 1 FROM maintenance WHERE id=?',[maintenanceId])
+      const replay = await commitMutation(db,[stmt(db,'INSERT INTO maintenance (id,name,description,starts_at,ends_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',maintenanceId,name,description,starts,ends,now,now),...links(db,'maintenance_components','maintenance_id',maintenanceId,ids),audit(db,user,'create','maintenance',maintenanceId,{name,startsAt:starts,endsAt:ends},undefined,subscriberScope(env)),...(env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,maintenanceId,'maintenance.scheduled',ids,now,undefined,env)] : [])],receipt,maintenanceId,1,201,'SELECT 1 FROM maintenance WHERE id=?',[maintenanceId])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:maintenanceId,name,description,startsAt:starts,endsAt:ends,componentIds:ids,version:1},201)
     }
@@ -538,7 +582,7 @@ async function api(request: Request, env: Env, user: User, path: string, receipt
         extra.push(stmt(db,`DELETE FROM maintenance_components WHERE maintenance_id=? AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE value=maintenance_components.component_id) AND EXISTS (SELECT 1 FROM maintenance WHERE id=? AND mutation_key=?)`,recordId,JSON.stringify(ids),recordId,token))
         extra.push(...links(db,'maintenance_components','maintenance_id',recordId,ids,'maintenance',token))
       }
-      extra.push(audit(db,user,event,'maintenance',recordId,{name,startsAt:starts,endsAt:ends},{table:'maintenance',token}))
+      extra.push(audit(db,user,event,'maintenance',recordId,{name,startsAt:starts,endsAt:ends},{table:'maintenance',token},subscriberScope(env)))
       const replay = await mutate(db,stmt(db,'UPDATE maintenance SET name=?,description=?,starts_at=?,ends_at=?,cancelled=?,updated_at=?,version=version+1,mutation_key=? WHERE id=? AND version=?',name,description,starts,ends,cancelled,now,token,recordId,version(body)),extra,receipt,recordId,Number(body.version)+1,'SELECT 1 FROM maintenance WHERE id=? AND mutation_key=?',[recordId,token])
       if (replay) return replayReceipt(db, receipt!, replay)
       return json({id:recordId,version:Number(body.version)+1})
@@ -634,6 +678,11 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   const db = env.DB
   const method = request.method
   const route = path.slice('/api/v1/bsp'.length)
+  if (route === '/public/subscriptions' || route.startsWith('/public/subscriptions/') || route === '/admin/subscribers' || route.startsWith('/admin/subscribers/')) {
+    if (route.startsWith('/admin/')) requireRole(user, 'operator')
+    if (env.SUBSCRIBERS_READY !== 'true') throw new HttpError(503, 'Subscriptions are unavailable')
+    return subscriberApi(request, env, user, route)
+  }
   if (route === '/admin/static-mirror' || route === '/admin/static-mirror/check' || route === '/admin/static-mirror/test') {
     requireRole(user, 'admin')
     if (!env.FALLBACK_BUCKET || env.FALLBACK_READY !== 'true') throw new HttpError(503, 'Static fallback is unavailable')
@@ -739,7 +788,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   }
   if (route === '/admin/audit-log' && method === 'GET') {
     requireRole(user, 'admin')
-    return auditPage(db, request)
+    return auditPage(db, request, subscriberScope(env))
   }
   const aliasRows = await db.prepare('SELECT alias, entity_type, entity_id FROM entity_aliases').all<{alias:number;entity_type:string;entity_id:string}>()
   const aliases = aliasRows.results
@@ -994,7 +1043,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const notificationsAvailable = await notificationsReady(env)
     const historyAvailable = await deliveryHistoryAvailable(db)
     const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
-    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(historyAvailable ? ['/admin/delivery-history'] : []), ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.SUBSCRIBERS_READY === 'true' ? ['/admin/subscribers'] : []), ...(historyAvailable ? ['/admin/delivery-history'] : []), ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: env.SUBSCRIBERS_READY === 'true', subscriberDelivery: await subscriberDeliveryReady(env), notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
@@ -1069,6 +1118,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     const status = choice(body.status ?? 'investigating', 'status', incidentStatuses.slice(0, 3))
     const message = string(body.body, 'body')
     if (typeof body.draft !== 'boolean') bad('Invalid draft')
+    if (!body.draft) await requireSubscriberDelivery(env, body.notifySubscribers)
     const ids = componentUuids(body.monitorIds ?? [])
     await validateComponents(db, ids)
     const now = Date.now()
@@ -1076,8 +1126,9 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
       stmt(db, 'INSERT INTO incidents (id,title,status,impact,draft,created_at,updated_at) VALUES (?,?,?,?,?,?,?)', incidentId,title,status,impact,body.draft ? 1 : 0,now,now),
       stmt(db, 'INSERT INTO incident_updates (id,incident_id,body,status,posted_at) VALUES (?,?,?,?,?)', id(),incidentId,message,status,now),
       ...links(db,'incident_components','incident_id',incidentId,ids),
-      audit(db,user,'create','incident',incidentId,{title,impact}),
-      ...(!body.draft ? [audit(db,user,'publish','incident',incidentId,{title,status,impact})] : []),
+      audit(db,user,'create','incident',incidentId,{title,impact},undefined,subscriberScope(env)),
+      ...(!body.draft ? [audit(db,user,'publish','incident',incidentId,{title,status,impact},undefined,subscriberScope(env))] : []),
+      ...(!body.draft && env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env) && body.notifySubscribers === true ? [enqueueSubscriberDeliveries(db,incidentId,'incident.created',ids,now,undefined,env)] : []),
     ], receipt, incidentId, 1, 201, "SELECT 1 FROM incidents i JOIN entity_aliases a ON a.entity_id=i.id AND a.entity_type='incident' WHERE i.id=?", [incidentId], 'incident')
     if (replay) return replayReceipt(db, receipt!, replay)
     const alias = await stmt(db, 'SELECT alias FROM entity_aliases WHERE entity_type=? AND entity_id=?', 'incident', incidentId).first<{alias:number}>()
@@ -1122,6 +1173,10 @@ async function buildFallbackSnapshot(env: Env, intervalSeconds: number) {
 }
 
 export async function scheduledFallback(env: Env): Promise<void> {
+  if (env.SUBSCRIBERS_READY === 'true' && subscriberEmailReady(env)) {
+    try { await flushSubscriberDeliveries(env) }
+    catch { console.error(JSON.stringify({ event: 'subscriber_dispatch_failed' })) }
+  }
   if (env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true') {
     try { await publishFallback(env.FALLBACK_BUCKET, interval => buildFallbackSnapshot(env, interval), true) }
     catch (error) { if (!(error instanceof FallbackConflictError)) throw error }
@@ -1167,7 +1222,7 @@ export default {
         const resource = /^\/api\/v1\/admin\/([^/]+)/.exec(normalized)?.[1]
         if (!resource || !['components','incidents','maintenance','checks','users','monitors'].includes(resource)) throw new HttpError(400, 'Idempotency is not available for this route')
         requireRole(user, ['checks','users'].includes(resource) ? 'admin' : 'operator')
-        receipt = await receiptContext(request, user)
+        receipt = await receiptContext(request, user, subscriberScope(env))
         if (receipt) {
           const existing = await findReceipt(env.DB, receipt)
           if (existing) return replayReceipt(env.DB, receipt, existing)
@@ -1191,6 +1246,7 @@ export default {
     } catch (error) {
       if (error instanceof FallbackConflictError) return json({error:'Static fallback changed. Reload and try again.'},409)
       if (error instanceof ActionError) return json({error:error.message},error.status)
+      if (error instanceof SubscriberError) return json({error:error.message},error.status)
       if (error instanceof ChannelError) return json({error:error.message},error.status)
       if (error instanceof VaultError) return json({error:error.message},error.status)
       if (error instanceof ReceiptError) return json({error:error.message,...(error.code ? {code:error.code} : {})},error.status)

@@ -59,7 +59,8 @@ export default function IncidentsPage() {
   const [updateBody, setUpdateBody] = useState('')
   const [updateVersion, setUpdateVersion] = useState<number | null>(null)
   const [updateStatus, setUpdateStatus] = useState('monitoring')
-  const [updateNotify, setUpdateNotify] = useState(false)
+  const [updateNotify, setUpdateNotify] = useState(true)
+  const [publishNotify, setPublishNotify] = useState<Record<number, boolean>>({})
 
   const { data: incidents = [], isPending, isError, refetch } = useQuery<VersionedIncident[]>({
     queryKey: ['incidents'],
@@ -73,7 +74,7 @@ export default function IncidentsPage() {
 
   const postUpdateMutation = useMutation({
     mutationFn: ({ id, version, body, status, notifySubscribers }: { id: number; version: number; body: string; status: string; notifySubscribers: boolean }) =>
-      api.post(`/admin/incidents/${id}/updates`, { version, body, status, ...(capabilities.notifications ? { notifySubscribers } : {}) }),
+      api.post(`/admin/incidents/${id}/updates`, { version, body, status, ...(capabilities.subscriberDelivery ? { notifySubscribers } : {}) }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['incidents'] })
       setUpdateBody('')
@@ -105,7 +106,7 @@ export default function IncidentsPage() {
   })
 
   const publishMutation = useMutation({
-    mutationFn: (incident: VersionedIncident) => api.post(`/admin/incidents/${incident.id}/publish`, { version: incident.version }),
+    mutationFn: (incident: VersionedIncident) => api.post(`/admin/incidents/${incident.id}/publish`, { version: incident.version, ...(capabilities.subscriberDelivery ? { notifySubscribers: publishNotify[incident.id] ?? true } : {}) }),
     onSuccess: (_data, incident) => {
       qc.invalidateQueries({ queryKey: ['incidents'] })
       toast.success(`Published "${incident.title}"`)
@@ -199,6 +200,7 @@ export default function IncidentsPage() {
                     {formatDate(incident.startedAt)}
                   </span>
                 </button>
+                {incident.draft && capabilities.subscriberDelivery && <NotifySubscribersCheckbox checked={publishNotify[incident.id] ?? true} onChange={(checked) => setPublishNotify(current => ({ ...current, [incident.id]: checked }))} />}
                 {incident.draft && (
                   <button
                     type="button"
@@ -388,7 +390,7 @@ export default function IncidentsPage() {
                         >
                           Post Update
                         </button>
-                        {capabilities.notifications ? <NotifySubscribersCheckbox checked={updateNotify} onChange={setUpdateNotify} /> : <span className="text-sm" aria-disabled="true">Subscriber notifications are unavailable</span>}
+                        {capabilities.subscriberDelivery ? <NotifySubscribersCheckbox checked={updateNotify} onChange={setUpdateNotify} /> : <span className="text-sm" aria-disabled="true">Subscriber notifications are unavailable</span>}
                       </div>
                       {postUpdateMutation.isError && (
                         <Alert tone="error">
@@ -543,7 +545,7 @@ function EditIncidentModal({ incident, monitors, onClose, onSaved }: { incident:
 
 function CreateIncidentModal({ monitors, onClose, onSaved }: { monitors: Monitor[]; onClose: () => void; onSaved: () => void }) {
   const capabilities = useCapabilities()
-  const [notifySubscribers, setNotifySubscribers] = useState(false)
+  const [notifySubscribers, setNotifySubscribers] = useState(true)
   const [title, setTitle] = useState('')
   const [status, setStatus] = useState('investigating')
   const [impact, setImpact] = useState('minor')
@@ -573,7 +575,7 @@ function CreateIncidentModal({ monitors, onClose, onSaved }: { monitors: Monitor
     setError('')
     try {
       // Monitors go in the same request so component-scoped subscribers are matched.
-      await api.post<Incident>('/admin/incidents', { title, status, impact, body: opening, monitorIds: selectedMonitors, draft, ...(capabilities.notifications ? { notifySubscribers } : {}) })
+      await api.post<Incident>('/admin/incidents', { title, status, impact, body: opening, monitorIds: selectedMonitors, draft, ...(capabilities.subscriberDelivery ? { notifySubscribers } : {}) })
       onSaved()
     } catch (err) {
       setError(err instanceof Error && err.message ? err.message : 'Failed to create the incident. Please try again.')
@@ -630,7 +632,7 @@ function CreateIncidentModal({ monitors, onClose, onSaved }: { monitors: Monitor
           <input type="checkbox" checked={draft} onChange={(e) => setDraft(e.target.checked)} />
           Save as draft (visible only here until published)
         </label>
-        {capabilities.notifications ? <NotifySubscribersCheckbox checked={notifySubscribers} onChange={setNotifySubscribers} /> : <span className="text-sm" aria-disabled="true">Subscriber notifications are unavailable</span>}
+        {capabilities.subscriberDelivery ? <NotifySubscribersCheckbox checked={notifySubscribers} onChange={setNotifySubscribers} /> : <span className="text-sm" aria-disabled="true">Subscriber notifications are unavailable</span>}
 
         {error && <Alert tone="error">{error}</Alert>}
         </div>
