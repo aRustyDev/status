@@ -223,6 +223,31 @@ test('retiring an absent fence and recovering after a tombstone are idempotent',
   h.db.close()
 })
 
+test('release reservation cleanup waits for inactive drained Workers, preserves other releases and permits same-SHA recreation', async () => {
+  const h=harness()
+  const otherSelector='branch-'+'d'.repeat(24)
+  h.db.prepare("INSERT INTO preview_execution_fences(selector,active_release,state) VALUES (?,?,'active')").run(h.selector,h.old)
+  h.db.prepare('INSERT INTO preview_mail_reservations(selector,release,kind,item) VALUES (?,?,?,?)').run(h.selector,h.old,'delivery','1')
+  h.db.prepare('INSERT INTO preview_mail_reservations(selector,release,kind,item) VALUES (?,?,?,?)').run(h.selector,h.next,'delivery','1')
+  h.db.prepare('INSERT INTO preview_mail_reservations(selector,release,kind,item) VALUES (?,?,?,?)').run(otherSelector,h.old,'delivery','1')
+  h.db.prepare('INSERT INTO preview_email_quota(selector,sent_at) VALUES (?,?)').run(h.selector,Date.now())
+  await assert.rejects(h.controller.assertReleaseQuiescent(h.selector,h.old),/still in use/)
+  await assert.rejects(h.controller.deleteReleaseReservations(h.selector,h.old),/still in use/)
+  h.db.prepare("UPDATE preview_execution_fences SET active_release=NULL,state='draining' WHERE selector=?").run(h.selector)
+  h.db.prepare('INSERT INTO preview_execution_leases(lease_id,selector,release) VALUES (?,?,?)').run('outstanding',h.selector,h.old)
+  await assert.rejects(h.controller.deleteReleaseReservations(h.selector,h.old),/still in use/)
+  h.db.prepare('DELETE FROM preview_execution_leases WHERE selector=? AND release=?').run(h.selector,h.old)
+  await h.controller.deleteReleaseReservations(h.selector,h.old)
+  await h.controller.deleteReleaseReservations(h.selector,h.old)
+  assert.equal(h.db.prepare('SELECT count(*) n FROM preview_mail_reservations').get().n,2)
+  assert.equal(h.db.prepare('SELECT count(*) n FROM preview_email_quota').get().n,1)
+  // Once deletion is complete, the same branch and SHA can create a fresh
+  // isolated DB and reserve the same release-local delivery ID.
+  h.db.prepare("UPDATE preview_execution_fences SET active_release=?,state='active' WHERE selector=?").run(h.old,h.selector)
+  assert.equal(h.db.prepare('INSERT OR IGNORE INTO preview_mail_reservations(selector,release,kind,item) VALUES (?,?,?,?)').run(h.selector,h.old,'delivery','1').changes,1)
+  h.db.close()
+})
+
 test('stale expected release, failed query and malformed identity fail closed', async () => {
   const h = harness()
   h.db.prepare("INSERT INTO preview_execution_fences(selector,active_release,state) VALUES (?,?,'active')").run(h.selector,h.old)

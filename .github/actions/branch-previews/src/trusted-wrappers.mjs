@@ -59,10 +59,10 @@ export async function buildTrustedPreviewWrappers({ control, branchDir, dir, fix
       `export default wrapBranchSubscriberApi(app)`,
     ].join('\n'))
     await compile('subscriberFeature', [
-      `import { PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT, flushPreviewSubscriberDeliveries } from ${JSON.stringify(featureSubscriber)}`,
+      `import { PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT, PREVIEW_BRANCH_DELIVERY_CONTEXT_CONTRACT, flushPreviewSubscriberDeliveries } from ${JSON.stringify(featureSubscriber)}`,
       `import { dispatchBranchSubscribers } from ${JSON.stringify(subscriberDispatch)}`,
       `export default { fetch(request, env) {`,
-      `return dispatchBranchSubscribers(request, env, flushPreviewSubscriberDeliveries, PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT) } }`,
+      `return dispatchBranchSubscribers(request, env, flushPreviewSubscriberDeliveries, PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT, PREVIEW_BRANCH_DELIVERY_CONTEXT_CONTRACT) } }`,
     ].join('\n'))
     await compile('subscriberScheduler', `export { default } from ${JSON.stringify(path.join(runtime,'preview-subscriber-scheduler.mjs'))}`)
     await compile('mailer', [

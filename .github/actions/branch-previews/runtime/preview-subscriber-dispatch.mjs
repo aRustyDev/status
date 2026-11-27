@@ -22,9 +22,9 @@ async function boundedJson(request) {
 
 // Runs in a private feature-dispatch Worker. It receives only the preview-owned
 // application D1 and the restricted mailer service, never the central fence.
-export async function dispatchBranchSubscribers(request, env, dispatch, contract) {
+export async function dispatchBranchSubscribers(request, env, dispatch, contract, contextContract) {
   const {PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_SCHEDULE_SECRET:secret,PREVIEW_MAILER:mailer,DB}=env
-  if (request.method!=='POST' || new URL(request.url).pathname!=='/__preview/scheduled' || contract!==2 || typeof dispatch!=='function' ||
+  if (request.method!=='POST' || new URL(request.url).pathname!=='/__preview/scheduled' || contract!==2 || contextContract!==1 || env.PREVIEW_BRANCH_DELIVERY_CONTEXT!=='true' || typeof dispatch!=='function' ||
       !/^branch-[a-f0-9]{24}$/.test(selector||'') || !/^[a-f0-9]{40}$/.test(release||'') || !/^[a-f0-9]{64}$/.test(scope||'') ||
       env.PREVIEW_DATABASE_ISOLATED!=='true' || typeof secret!=='string' || secret.length<32 || !DB || !mailer || env.PREVIEW_FENCE || env.INVENTORY || env.FLAGS || env.EMAIL) return new Response(null,{status:403})
   const digest=await crypto.subtle.digest('SHA-256',encoder.encode(selector))

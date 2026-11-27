@@ -40,6 +40,7 @@ const enrollment = { type:'email', email:owner.email, events:['incident.created'
 test('approved identity enrolls, confirms once, manages and unsubscribes even when sending is unavailable', async () => {
   const { env, messages, local } = fixture()
   assert.equal((await subscriberApi(request('POST',enrollment),env,owner,'/public/subscriptions')).status,202)
+  assert.equal(Object.hasOwn(messages[0]!, 'previewConfirmation'), false)
   const token = /token=([0-9a-f]+)/.exec(messages[0]!.text)![1]!
   assert.notEqual((local.db.prepare('SELECT confirmation_hash FROM subscribers').get() as {confirmation_hash:string}).confirmation_hash, token)
   await assert.rejects(() => subscriberApi(request('POST',{token}),env,other,'/public/subscriptions/confirm'), (error:unknown) => error instanceof SubscriberError && error.status === 404)
@@ -133,6 +134,25 @@ test('preview leases isolate settings, enrollments, confirmations and admin oper
   assert.equal((local.db.prepare('SELECT count(*) AS n FROM subscribers').get() as {n:number}).n,0)
   await assert.rejects(() => subscriberApi(request('GET'),{...env,PREVIEW_SUBSCRIBER_REQUIRED:'true'},operator,'/admin/subscribers/settings'), /Missing preview subscriber scope/)
   await assert.rejects(() => subscriberApi(request('GET'),{...first,PREVIEW_SUBSCRIBER_SCOPE:'bad'},operator,'/admin/subscribers/settings'), /Invalid preview subscriber scope/)
+})
+
+test('confirmation adds trusted preview context only when explicitly enabled', async () => {
+  for (const flag of ['true', 'false', undefined]) {
+    const {env, local} = fixture(), scope = 'a'.repeat(64)
+    const messages: Array<Record<string, unknown>> = []
+    const preview = {...env, PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:scope, PREVIEW_BRANCH_DELIVERY_CONTEXT:flag,
+      SUBSCRIBER_EMAIL:{send:async (message: Record<string, unknown>) => {messages.push(message); return {messageId:'ok'}}} as unknown as SendEmail}
+    await subscriberApi(request('PUT',{enabled:true,allowEmail:true,allowComponentScope:true,allowedEvents:['incident.created']}),preview,operator,'/admin/subscribers/settings')
+    assert.equal((await subscriberApi(request('POST',enrollment),preview,owner,'/public/subscriptions')).status,202)
+    assert.equal(messages.length,1)
+    if (flag === 'true') assert.deepEqual(messages[0]!.previewConfirmation,{scope,userId:owner.id})
+    else assert.equal(Object.hasOwn(messages[0]!, 'previewConfirmation'),false)
+    assert.equal(typeof messages[0]!.text,'string')
+    local.db.close()
+  }
+  const {env, messages} = fixture()
+  await assert.rejects(() => subscriberApi(request('POST',enrollment),{...env,PREVIEW_BRANCH_DELIVERY_CONTEXT:'true'},owner,'/public/subscriptions'), (error:unknown) => error instanceof SubscriberError && error.status === 503)
+  assert.equal(messages.length,0)
 })
 
 test('schema confirmation requires a live trusted authorization and release-local lease', async () => {

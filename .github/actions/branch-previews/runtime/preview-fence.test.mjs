@@ -114,6 +114,59 @@ test('email claims require the held lease and are limited across releases to fou
   h.db.close()
 })
 
+test('trusted mail reservations are single-use across concurrent calls within a release', async () => {
+  const h=harness()
+  await withActiveBranchExecution(h.env,async (_current,_quota,_token,reserve)=>{
+    const results=await Promise.all([reserve('delivery','1'),reserve('delivery','1')])
+    assert.deepEqual(results.sort(),[false,true])
+    assert.equal(await reserve('confirmation','f'.repeat(64)),true)
+    assert.equal(await reserve('confirmation','f'.repeat(64)),false)
+    assert.equal(await reserve('confirmation','not-a-token-hash'),false)
+    assert.equal(await reserve('unknown','delivery-id'),false)
+  })
+  const held=await h.env.PREVIEW_FENCE.fetch('https://preview-fence.internal/acquire',{method:'POST',body:'{}'})
+  const oldToken=(await held.json()).token
+  const oldEnv={...h.svcEnv}
+  const replacement='c'.repeat(40)
+  h.db.prepare('UPDATE preview_execution_fences SET active_release=? WHERE selector=?').run(replacement,h.selector)
+  h.svcEnv.PREVIEW_RELEASE=replacement; h.route.release=replacement
+  const oldReservation=await service.fetch(new Request('https://preview-fence.internal/claim-reservation',{method:'POST',body:JSON.stringify({token:oldToken,kind:'delivery',item:'2'})}),oldEnv)
+  assert.equal(oldReservation.status,409,'a prior release cannot reserve after the switch')
+  const oldRelease=await service.fetch(new Request('https://preview-fence.internal/release',{method:'POST',body:JSON.stringify({token:oldToken})}),oldEnv)
+  assert.equal(oldRelease.status,204)
+  await withActiveBranchExecution(h.env,async (_current,_quota,_token,reserve)=>{
+    assert.equal(await reserve('delivery','1'),true)
+    assert.equal(await reserve('confirmation','f'.repeat(64)),true)
+  })
+  const rows=h.db.prepare('SELECT selector,release,kind,item FROM preview_mail_reservations ORDER BY release,kind').all().map(x=>({...x}))
+  assert.deepEqual(rows,[
+    {selector:h.selector,release:h.release,kind:'confirmation',item:'f'.repeat(64)},
+    {selector:h.selector,release:h.release,kind:'delivery',item:'1'},
+    {selector:h.selector,release:replacement,kind:'confirmation',item:'f'.repeat(64)},
+    {selector:h.selector,release:replacement,kind:'delivery',item:'1'},
+  ])
+  h.db.close()
+})
+
+test('reservation rejects another selector lease, draining state and expired approval', async () => {
+  const h=harness()
+  const other='branch-'+'d'.repeat(24)
+  h.db.prepare("INSERT INTO preview_execution_fences(selector,active_release,state) VALUES (?,?,'active')").run(other,h.release)
+  const flags={async getBooleanDetails(){return {value:true}},async getObjectDetails(){return {value:{selector:other,release:h.release}}}}
+  const otherEnv={...h.svcEnv,PREVIEW_SELECTOR:other,FLAGS:flags}
+  const call=(env,path,body)=>service.fetch(new Request(`https://preview-fence.internal/${path}`,{method:'POST',body:JSON.stringify(body)}),env)
+  await withActiveBranchExecution(h.env,async (_current,_quota,token,reserve)=>{
+    assert.equal((await call(otherEnv,'claim-reservation',{token,kind:'delivery',item:'delivery-id'})).status,409)
+    h.db.prepare("UPDATE preview_execution_fences SET state='draining' WHERE selector=?").run(h.selector)
+    assert.equal(await reserve('delivery','delivery-id'),false)
+    h.db.prepare("UPDATE preview_execution_fences SET state='active' WHERE selector=?").run(h.selector)
+    h.svcEnv.PREVIEW_FIXTURE_EXPIRES_AT=String(Date.now()-1)
+    assert.equal(await reserve('delivery','delivery-id'),false)
+  })
+  assert.equal(h.db.prepare('SELECT count(*) AS n FROM preview_mail_reservations').get().n,0)
+  h.db.close()
+})
+
 test('unavailable Flagship or control database fails closed without executing the callback', async () => {
   const h = harness()
   h.svcEnv.FLAGS.getBooleanDetails = async () => { throw new Error('offline') }

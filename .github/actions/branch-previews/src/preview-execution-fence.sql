@@ -18,3 +18,12 @@ CREATE TABLE IF NOT EXISTS preview_email_quota (
   sent_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS preview_email_quota_recent ON preview_email_quota(selector, sent_at);
+-- Only the trusted per-release fence service can access this control D1.
+-- Never delete a reservation after an ambiguous provider result.
+CREATE TABLE IF NOT EXISTS preview_mail_reservations (
+  selector TEXT NOT NULL,
+  release TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('delivery','confirmation')),
+  item TEXT NOT NULL,
+  PRIMARY KEY(selector, release, kind, item)
+);

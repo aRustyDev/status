@@ -1,14 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { branchPreviewEmailProxy, handleBranchPreviewMail } from './preview-mailer.mjs'
 
 const from = 'preview@example.test', to = 'test@example.test', origin = 'https://status.example.test'
-const confirmation = { from, to, subject: 'Confirm your status subscription', text: `Confirm your subscription: ${origin}/#subscription=confirm&token=${'a'.repeat(64)}` }
-const update = { from, to, subject: 'Status page update', text: `A status update has been published. Visit ${origin} to view it or manage your subscription.` }
-function harness({ current = [true,true], quota = true, failure = false } = {}) {
+const selector='branch-'+'b'.repeat(24), scope=createHash('sha256').update(selector).digest('hex')
+const confirmation = { from, to, previewConfirmation:{scope,userId:'user'}, subject: 'Confirm your status subscription', text: `Confirm your subscription: ${origin}/#subscription=confirm&token=${'a'.repeat(64)}` }
+const update = { from, to, previewDelivery:{id:'delivery',scope,leaseToken:'claim'}, subject: 'Status page update', text: `A status update has been published. Visit ${origin} to view it or manage your subscription.` }
+function harness({ current = [true,true,true], quota = true, failure = false } = {}) {
   const sent = [], claims = []
-  const env = { PREVIEW_MAIL_FROM: from, PREVIEW_MAIL_TO: to, PREVIEW_MAIL_PUBLIC_URL: origin, EMAIL: { async send(value) { if (failure) throw Error('failure'); sent.push(value) } } }
-  const fence = async (_env, fn) => fn(async () => current.shift() ?? false, async () => { claims.push(1); return quota })
+  const DB={prepare(){return {bind(){return this},async run(){return {meta:{changes:1}}},async first(){return {lease_expires_at:Date.now()+60000,item_expires_at:Date.now()+60000}}}}}
+  const env = { PREVIEW_FIXTURE_EXPIRES_AT:String(Date.now()+60000), DB, PREVIEW_SELECTOR:selector, PREVIEW_RELEASE:'c'.repeat(40), PREVIEW_SUBSCRIBER_SCOPE:scope, PREVIEW_DATABASE_ISOLATED:'true', PREVIEW_MAIL_FROM: from, PREVIEW_MAIL_TO: to, PREVIEW_MAIL_PUBLIC_URL: origin, EMAIL: { async send(value) { if (failure) throw Error('failure'); sent.push(value) } } }
+  const fence = async (_env, fn) => fn(async () => current.shift() ?? false, async () => { claims.push(1); return quota },'private-token',async()=>true)
   const request = value => new Request('https://preview-mailer.invalid/send', { method:'POST', body:JSON.stringify(value) })
   return { env, sent, claims, fence, request }
 }
@@ -17,7 +20,7 @@ test('permits only the two fixed templates to the approved addresses', async () 
   for (const message of [confirmation, update]) {
     const h = harness()
     assert.equal((await handleBranchPreviewMail(h.request(message), h.env, h.fence)).status, 204)
-    assert.deepEqual(h.sent, [message])
+    assert.deepEqual(h.sent, [{from,to,subject:message.subject,text:message.text}])
     assert.equal(h.claims.length, 1)
   }
 })

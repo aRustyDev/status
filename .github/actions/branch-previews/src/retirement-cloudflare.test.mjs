@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { newRelease } from './release-contract.mjs'
 import { createRetirementAdapter } from './retirement-cloudflare.mjs'
+import { installation } from './installation.mjs'
 
 test('retirement drains the flag, preserves other bindings and removes only owned workers', async () => {
   const directory = mkdtempSync(path.join(tmpdir(), 'retirement-test-'))
@@ -18,7 +19,7 @@ test('retirement drains the flag, preserves other bindings and removes only owne
   const workers = Object.fromEntries(Object.entries({ gateway: 'gateway', api: 'operations', statusApi: 'status-api', monitoring: 'monitoring-api', status: 'status-ui', admin: 'admin-ui', probe: 'probe' }).map(([key, suffix]) => [key, `${targetStem}-${suffix}`]))
   const release = { sha: target.desiredSha, resources: { gateway: workers.gateway, workers, database: { id: 'dev', owned: false } } }
   let flag = { enabled: true, default_variation: 'current', rules: [], variations: { current: { selector: target.selector, release: release.sha } } }
-  const adapter = createRetirementAdapter({ accountId: 'account', appId: 'app', token: 'token', store: { read: async () => ({record:target}), list: async () => [{ record: target }, { record: other }] }, dispatcherName: 'dispatcher', dispatcherSource: '/dispatcher.ts', dispatcherVars: { ACCESS_AUD: 'aud' }, directory, databaseConfig: {}, databaseAdapter: {}, now: () => 3_600_000,
+  const adapter = createRetirementAdapter({ accountId: 'account', appId: 'app', token: 'token', store: { read: async () => ({record:target}), list: async () => [{ record: target }, { record: other }] }, dispatcherName: 'dispatcher', dispatcherSource: '/dispatcher.ts', dispatcherVars: { ACCESS_AUD: 'aud' }, directory, databaseConfig: {dev:{id:'dev'},stage:{id:'stage'},prod:{id:'prod'}}, databaseAdapter: {async deleteDatabase(){calls.push(['DELETE_DATABASE'])}}, executionFence:{async readState(){return null},async beginRetirement(){return null},async finishRetirement(){},async assertReleaseQuiescent(){},async deleteReleaseReservations(){calls.push(['DELETE_RESERVATIONS'])}}, now: () => 3_600_000,
     run: async args => calls.push(args), fetcher: async (url, options) => {
       if (url.includes('/flagship/')) {
         if (options.method === 'PUT') flag = JSON.parse(options.body)
@@ -65,13 +66,15 @@ test('retirement drains the flag, preserves other bindings and removes only owne
     const withSubscriber = { ...scheduled, mailer:`${targetStem}-mailer`, subscriberFeature:`${targetStem}-subscriber-feature`, subscriberScheduler:`${targetStem}-subscriber-scheduler`, authorization:`${targetStem}-authorization` }
     await assert.rejects(adapter.deleteOwnedResources({ ref:target.ref, release:{ ...release, resources:{ ...release.resources, workers:{...withSubscriber, subscriber:`${targetStem}-subscriber`} } } }), /Conflicting legacy/)
     const beforeSubscriber = calls.length
-    await adapter.deleteOwnedResources({ ref: target.ref, release: { ...release, resources: { ...release.resources, workers: withSubscriber } } })
+    const subscriberDb={id:'owned',name:installation().schemaStem(target.ref,release.sha)+'-upgrade',owned:true}
+    await adapter.deleteOwnedResources({ ref: target.ref, release: { ...release, resources: { ...release.resources, database:subscriberDb, workers: withSubscriber } } })
     const subscriberDeletes = calls.slice(beforeSubscriber).filter(call => call[0] === 'DELETE')
     assert.equal(subscriberDeletes.length,15)
     assert.match(subscriberDeletes[0][1], /-subscriber-scheduler$/)
     assert.match(subscriberDeletes[1][1], /-probe-scheduler$/)
     assert.match(subscriberDeletes.at(-1)[1], /-fence$/)
     assert.ok(subscriberDeletes.findIndex(call=>/-mailer$/.test(call[1])) > subscriberDeletes.findIndex(call=>/-subscriber-feature$/.test(call[1])))
+    assert.deepEqual(calls.slice(-2).map(call=>call[0]),['DELETE_DATABASE','DELETE_RESERVATIONS'])
   } finally { rmSync(directory, { recursive: true, force: true }) }
 })
 
@@ -87,6 +90,32 @@ test('retirement drains active execution before tombstoning', async t => {
   })
   await adapter.disableFlag({ref:target.ref,selector:target.selector})
   assert.deepEqual(events,['drain','tombstone','retire'])
+})
+
+test('reservation cleanup waits for quiescence and all owned resource deletion, and retries after partial failure', async t => {
+  const directory=mkdtempSync(path.join(tmpdir(),'retirement-reservations-'))
+  t.after(()=>rmSync(directory,{force:true,recursive:true}))
+  const target=newRelease({ref:'refs/heads/schema/one',sha:'a'.repeat(40)})
+  const stem=installation().workerStem(target.selector,target.desiredSha)
+  const workers=Object.fromEntries(Object.entries({...Object.fromEntries(Object.entries(installation().manifest.components).map(([k,v])=>[k,v.suffix])),fixture:'fixture',fence:'fence',mailer:'mailer'}).map(([k,v])=>[k,`${stem}-${v}`]))
+  const database={id:'owned',name:installation().schemaStem(target.ref,target.desiredSha)+'-upgrade',owned:true}
+  const release={sha:target.desiredSha,resources:{gateway:workers.gateway,workers,database}}
+  let blocked=true, failDatabase=true
+  const events=[]
+  const adapter=createRetirementAdapter({accountId:'account',appId:'app',token:'token',store:{list:async()=>[]},dispatcherName:'dispatcher',dispatcherSource:'/dispatcher.ts',directory,run:async()=>{},databaseConfig:{dev:{id:'dev'},stage:{id:'stage'},prod:{id:'prod'}},
+    databaseAdapter:{async deleteDatabase(){events.push('database');if(failDatabase)throw new Error('D1 unavailable')}},
+    executionFence:{async assertReleaseQuiescent(){events.push('quiescent');if(blocked)throw new Error('lease active')},async deleteReleaseReservations(){events.push('reservations')}},
+    fetcher:async()=>{events.push('worker');return {ok:true,status:204}},
+  })
+  await assert.rejects(adapter.deleteOwnedResources({ref:target.ref,release}),/lease active/)
+  assert.deepEqual(events,['quiescent'])
+  blocked=false
+  await assert.rejects(adapter.deleteOwnedResources({ref:target.ref,release}),/D1 unavailable/)
+  assert.equal(events.at(-1),'database')
+  assert.equal(events.includes('reservations'),false)
+  failDatabase=false
+  await adapter.deleteOwnedResources({ref:target.ref,release})
+  assert.deepEqual(events.slice(-2),['database','reservations'])
 })
 
 test('retirement refuses a missing or mismatched active fixture fence', async t => {

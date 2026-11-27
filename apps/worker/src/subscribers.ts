@@ -1,6 +1,9 @@
 import { emailDestinations, validEmailAddress } from './email-channel'
 import { boundedBody } from './idempotency'
 
+export type PreviewDeliveryContext = { id: string; scope: string; leaseToken: string }
+export type PreviewConfirmationContext = { scope: string; userId: string }
+
 export interface SubscriberEnv {
   DB: D1Database
   PREVIEW_SUBSCRIBER_SCOPE?: string
@@ -9,6 +12,7 @@ export interface SubscriberEnv {
   PREVIEW_TARGET?: string
   PREVIEW_RELEASE?: string
   PREVIEW_BRANCH_MODE?: string
+  PREVIEW_BRANCH_DELIVERY_CONTEXT?: string
   PREVIEW_SUBSCRIBER_AUTHORIZE?: () => Promise<boolean>
   SUBSCRIBER_EMAIL_READY?: string
   SUBSCRIBER_EMAIL_FROM?: string
@@ -169,6 +173,7 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
   }
   if (route === '/public/subscriptions' && method === 'POST') {
     const input = await body(request)
+    if (env.PREVIEW_BRANCH_DELIVERY_CONTEXT === 'true' && !scope) return fail(503, 'Subscriptions unavailable')
     if (!current.enabled || !current.allow_email || !subscriberEmailReady(env)) return fail(503, 'Subscriptions unavailable')
     if (input.type !== 'email' || typeof input.email !== 'string' || input.email.toLowerCase() !== user.email.toLowerCase() || !subscriberAddressApproved(env, user.email) || input.website) return fail(400, 'Invalid subscription')
     const selection = await validateScope(env, input, current)
@@ -190,7 +195,8 @@ export async function subscriberApi(request: Request, env: SubscriberEnv, user: 
       return fail(503, 'Subscriptions unavailable')
     }
     try {
-      await env.SUBSCRIBER_EMAIL!.send({ from: env.SUBSCRIBER_EMAIL_FROM!, to: user.email, subject: 'Confirm your status subscription', text: `Confirm your subscription: ${link}` })
+      await env.SUBSCRIBER_EMAIL!.send({ from: env.SUBSCRIBER_EMAIL_FROM!, to: user.email, subject: 'Confirm your status subscription', text: `Confirm your subscription: ${link}`,
+        ...(env.PREVIEW_BRANCH_DELIVERY_CONTEXT === 'true' && scope ? { previewConfirmation: { scope, userId: user.id } satisfies PreviewConfirmationContext } : {}) })
     } catch { return fail(503, 'Confirmation could not be sent. Try again in 10 minutes.') }
     return json({ ok: true }, 202)
   }

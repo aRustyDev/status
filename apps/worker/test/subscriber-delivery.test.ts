@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { enqueueSubscriberDeliveries, flushSubscriberDeliveries } from '../src/subscriber-delivery.ts'
-import { flushPreviewSubscriberDeliveries } from '../src/preview-subscriber-scheduler.ts'
+import { flushPreviewSubscriberDeliveries, PREVIEW_BRANCH_DELIVERY_CONTEXT_CONTRACT, PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT } from '../src/preview-subscriber-scheduler.ts'
 
 class Statement {
   private values: unknown[] = []
@@ -138,6 +138,31 @@ test('preview dispatch and maintenance isolate leases and baseline deliveries', 
   await assert.rejects(() => flushPreviewSubscriberDeliveries({...first, PREVIEW_SUBSCRIBER_SCOPE:undefined},async () => true), /Missing preview subscriber scope/)
   await assert.rejects(() => flushPreviewSubscriberDeliveries(first), /Missing preview send authorization/)
   await assert.rejects(() => flushSubscriberDeliveries(first), /fenced preview scheduler/)
+})
+
+test('preview send carries the exact live claim only when context is enabled', async () => {
+  assert.equal(PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT,2)
+  assert.equal(PREVIEW_BRANCH_DELIVERY_CONTEXT_CONTRACT,1)
+  for (const flag of ['true', 'false', undefined]) {
+    const x=fixture(), scope='a'.repeat(64), release='b'.repeat(40), now=Date.now()
+    x.local.sqlite.prepare("INSERT INTO preview_subscription_settings(scope,enabled,allow_email,allowed_events,updated_at) VALUES (?,1,1,'[\"incident.created\"]',0)").run(scope)
+    x.local.sqlite.prepare("INSERT INTO preview_subscribers(scope,user_id,email,status,events,monitor_ids,created_at,updated_at) VALUES (?,'owner','test@example.test','active','[\"incident.created\"]','[]',0,0)").run(scope)
+    x.local.sqlite.prepare("INSERT INTO preview_subscriber_leases(scope,slot,target,release,expires_at) VALUES (?,1,'a',?,?)").run(scope,release,now+60_000)
+    const messages:Array<Record<string,unknown>>=[]
+    const preview={...x.env,PREVIEW_SUBSCRIBER_REQUIRED:'true',PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_SLOT:'1',PREVIEW_TARGET:'a',PREVIEW_RELEASE:release,SUBSCRIBERS_READY:'true',PREVIEW_BRANCH_DELIVERY_CONTEXT:flag,
+      SUBSCRIBER_EMAIL:{send:async (message:Record<string,unknown>) => {
+        messages.push(message)
+        const claimed=x.local.sqlite.prepare("SELECT id,scope,lease_token FROM preview_subscriber_deliveries WHERE state='sending'").get() as {id:string;scope:string;lease_token:string}
+        if(flag==='true') assert.deepEqual(message.previewDelivery,{id:claimed.id,scope:claimed.scope,leaseToken:claimed.lease_token})
+        else assert.equal(Object.hasOwn(message,'previewDelivery'),false)
+        return {messageId:'ok'}
+      }} as unknown as SendEmail}
+    await enqueueSubscriberDeliveries(preview.DB,'event','incident.created',[],now,undefined,preview).run()
+    await flushPreviewSubscriberDeliveries(preview,async () => true)
+    assert.equal(messages.length,1)
+    assert.equal((x.local.sqlite.prepare('SELECT state FROM preview_subscriber_deliveries').get() as {state:string}).state,'delivered')
+    x.local.sqlite.close()
+  }
 })
 
 test('branch schema dispatch uses an isolated release fence and stops after revocation', async () => {

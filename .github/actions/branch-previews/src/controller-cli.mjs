@@ -17,7 +17,7 @@ import { createInventoryStore } from './release-inventory.mjs'
 import { createActivationAdapter } from './release-activation.mjs'
 import { reconcile } from './reconcile-cli.mjs'
 import { createSchemaFence, schemaSubscriberSettings } from './schema-subscriber.mjs'
-import { fixturePolicy, preserveIsolatedHistory, isolatedWorkerSecrets, isolatedFallbackSettings } from './fixture-policy.mjs'
+import { fixturePolicy, preserveIsolatedHistory, isolatedWorkerSecrets, settingsForFixture } from './fixture-policy.mjs'
 import { fixtureRegistryStatements } from './fixture-catalog.mjs'
 import { createCloudflareExecutionFence, executionFenceFor, initializeExecutionFenceIfNeeded } from './execution-fence.mjs'
 import { createFixtureSchedulingConfigs } from './fixture-scheduling-config.mjs'
@@ -110,7 +110,7 @@ export async function main(env = process.env) {
   const access = object(secrets.accessHeaders, 'Access headers')
   if (Object.keys(access).length === 0 || Object.values(access).some(value => typeof value !== 'string' || !value)) throw new Error('Invalid Access headers')
   const selectedSettings = object(object(config.environments, 'environment configuration')[fixture.environment], 'selected preview environment')
-  const settings = fixture.isolatedFallback ? isolatedFallbackSettings(selectedSettings) : selectedSettings
+  const settings = settingsForFixture(selectedSettings, fixture)
   const previewUrl = new URL(text(config.previewUrl, 'preview URL'))
   if (previewUrl.protocol !== 'https:' || previewUrl.username || previewUrl.password) throw new Error('Invalid preview URL')
   const executionFence = await initializeExecutionFenceIfNeeded({ store, ref, fixtureEnabled:fixture.enabled || fixture.isolatedFallback, createFence:() => createCloudflareExecutionFence({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token }) })

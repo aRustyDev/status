@@ -70,9 +70,9 @@ test('actual subscriber feature completes fenced scheduled delivery through the 
   const fenceEnv={PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_FLAG_PREFIX:'status-preview-',PREVIEW_FIXTURE_EXPIRES_AT:String(Date.now()+60000),INVENTORY:controlDb,FLAGS}
   const PREVIEW_FENCE={fetch:(url,init)=>fenceWorker.fetch(new Request(url,init),fenceEnv)}
   const sent=[]
-  const mailEnv={PREVIEW_MAIL_FROM:from,PREVIEW_MAIL_TO:to,PREVIEW_MAIL_PUBLIC_URL:origin,PREVIEW_FENCE,EMAIL:{send:async message=>{sent.push(message)}}}
+  const mailEnv={PREVIEW_FIXTURE_EXPIRES_AT:String(Date.now()+60000),DB:appDb,PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_DATABASE_ISOLATED:'true',PREVIEW_MAIL_FROM:from,PREVIEW_MAIL_TO:to,PREVIEW_MAIL_PUBLIC_URL:origin,PREVIEW_FENCE,EMAIL:{send:async message=>{sent.push(message)}}}
   const PREVIEW_MAILER={fetch:(url,init)=>mailer.fetch(new Request(url,init),mailEnv)}
-  const common={DB:appDb,PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_SUBSCRIBER_REQUIRED:'true',PREVIEW_DATABASE_ISOLATED:'true',SUBSCRIBERS_READY:'true',SUBSCRIBER_EMAIL_READY:'true',SUBSCRIBER_EMAIL_FROM:from,SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'test',name:'Test',address:to}]),SUBSCRIBER_PUBLIC_URL:origin}
+  const common={DB:appDb,PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_SUBSCRIBER_REQUIRED:'true',PREVIEW_DATABASE_ISOLATED:'true',PREVIEW_BRANCH_DELIVERY_CONTEXT:'true',SUBSCRIBERS_READY:'true',SUBSCRIBER_EMAIL_READY:'true',SUBSCRIBER_EMAIL_FROM:from,SUBSCRIBER_EMAIL_DESTINATIONS:JSON.stringify([{id:'test',name:'Test',address:to}]),SUBSCRIBER_PUBLIC_URL:origin}
   const authEnv={...common,PREVIEW_FENCE}
   const PREVIEW_AUTHORIZATION={fetch:(url,init)=>authorization.fetch(new Request(url,init),authEnv)}
   const ops={...common,PREVIEW_AUTHORIZATION,PREVIEW_MAILER}

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { fixturePolicy, preserveIsolatedHistory, fixtureVaultKey, fixtureScheduleKey, isolatedFallbackSettings, isolatedWorkerSecrets } from './fixture-policy.mjs'
+import { fixturePolicy, preserveIsolatedHistory, fixtureVaultKey, fixtureScheduleKey, isolatedFallbackSettings, isolatedWorkerSecrets, settingsForFixture } from './fixture-policy.mjs'
 import { newRelease } from './release-contract.mjs'
 
 const sha = 'a'.repeat(40)
@@ -34,6 +34,19 @@ test('isolated fallback discards shared resource bindings and all side-effect re
   assert.deepEqual(result.resourceBindings,{})
   assert.deepEqual(result.vpcServices,[])
   for (const key of ['apiVars','statusApiVars','monitoringVars','probeVars']) assert.deepEqual(result[key],{})
+})
+
+test('enabled fixtures and fallback use sanitized settings while ordinary previews are unchanged', () => {
+  const settings={accessTeamDomain:'access',accessAud:'aud',adminVars:{UI_TITLE:'Preview'},extraServices:{probe:[{binding:'GATUS',service:'shared'}]},resourceBindings:{api:{send_email:[{name:'EMAIL'}]},probe:{r2_buckets:[{binding:'SHARED'}]}}}
+  assert.equal(settingsForFixture(settings,{enabled:false}),settings)
+  for (const fixture of [{enabled:true},{enabled:false,isolatedFallback:true}]) {
+    const safe=settingsForFixture(settings,fixture)
+    assert.deepEqual(safe.extraServices,{})
+    assert.deepEqual(safe.resourceBindings,{})
+    assert.equal(safe.accessTeamDomain,'access')
+    assert.equal(safe.accessAud,'aud')
+    assert.deepEqual(safe.adminVars,{UI_TITLE:'Preview'})
+  }
 })
 
 test('fallback discards every shared secret and uses only its release-specific Vault key', () => {

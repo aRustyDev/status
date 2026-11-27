@@ -18,22 +18,22 @@ async function harness() {
   const scope=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(selector)))].map(x=>x.toString(16).padStart(2,'0')).join('')
   control.prepare("INSERT INTO preview_execution_fences(selector,active_release,state) VALUES (?,?,'active')").run(selector,release)
   const INVENTORY={prepare(sql){return {bind(...args){return {async first(){return control.prepare(sql).get(...args)||null}}}}}}
-  const DB={prepare(sql){return {bind(...args){return {async run(){return {meta:{changes:db.prepare(sql).run(...args).changes}}}}}}}}
+  const DB={prepare(sql){let args=[];return {bind(...values){args=values;return this},async run(){return {meta:{changes:db.prepare(sql).run(...args).changes}}},async first(){return {lease_expires_at:Date.now()+60000,item_expires_at:Date.now()+60000}}}}}
   const FLAGS={async getBooleanDetails(){return {value:true}},async getObjectDetails(){return {value:{selector,release}}}}
   const fenceEnv={INVENTORY,FLAGS,PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_FLAG_PREFIX:'status-preview-',PREVIEW_FIXTURE_EXPIRES_AT:String(Date.now()+60000)}
   const PREVIEW_FENCE={fetch(url,init){return fenceService.fetch(new Request(url,init),fenceEnv)}}
   let send=async()=>{}
-  const mailEnv={PREVIEW_FENCE,PREVIEW_MAIL_FROM:'status@example.test',PREVIEW_MAIL_TO:'owner@example.test',PREVIEW_MAIL_PUBLIC_URL:'https://example.test/',EMAIL:{send:async message=>send(message)}}
+  const mailEnv={PREVIEW_FIXTURE_EXPIRES_AT:String(Date.now()+60000),DB,PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_DATABASE_ISOLATED:'true',PREVIEW_FENCE,PREVIEW_MAIL_FROM:'status@example.test',PREVIEW_MAIL_TO:'owner@example.test',PREVIEW_MAIL_PUBLIC_URL:'https://example.test/',EMAIL:{send:async message=>send(message)}}
   const PREVIEW_MAILER={fetch(url,init){return handleBranchPreviewMail(new Request(url,init),mailEnv,withActiveBranchExecution)}}
   const secret='s'.repeat(32)
-  const featureEnv={PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_DATABASE_ISOLATED:'true',PREVIEW_SCHEDULE_SECRET:secret,DB,PREVIEW_MAILER}
-  const message={from:'status@example.test',to:'owner@example.test',subject:'Status page update',text:'A status update has been published. Visit https://example.test to view it or manage your subscription.'}
+  const featureEnv={PREVIEW_BRANCH_DELIVERY_CONTEXT:'true',PREVIEW_SELECTOR:selector,PREVIEW_RELEASE:release,PREVIEW_SUBSCRIBER_SCOPE:scope,PREVIEW_DATABASE_ISOLATED:'true',PREVIEW_SCHEDULE_SECRET:secret,DB,PREVIEW_MAILER}
+  const message={previewDelivery:{scope,id:'delivery',leaseToken:'claim'},from:'status@example.test',to:'owner@example.test',subject:'Status page update',text:'A status update has been published. Visit https://example.test to view it or manage your subscription.'}
   let dispatch=async(env,authorize)=>{
     assert.equal(await authorize(),true)
     for (const key of ['PREVIEW_FENCE','INVENTORY','PREVIEW_MAILER','PREVIEW_SCHEDULE_SECRET','EMAIL','FLAGS']) assert.equal(key in env,false)
     await env.SUBSCRIBER_EMAIL.send(message)
   }
-  const SUBSCRIBER_FEATURE={fetch(url,init){return dispatchBranchSubscribers(new Request(url,init),featureEnv,dispatch,2)}}
+  const SUBSCRIBER_FEATURE={fetch(url,init){return dispatchBranchSubscribers(new Request(url,init),featureEnv,dispatch,2,1)}}
   const env={PREVIEW_FENCE,SUBSCRIBER_FEATURE,PREVIEW_SCHEDULE_SECRET:secret}
   const query=async(sql,params)=>control.prepare(sql).all(...params)
   const controller=createExecutionFenceController({query,attempts:1,wait:async()=>{}})
@@ -74,8 +74,9 @@ test('drain waits for both scheduler and in-flight mailer, while preventing new 
 test('feature dispatch rejects unsigned invocation and accidental privileged bindings', async () => {
   const h=await harness()
   const request=()=>new Request('https://preview-subscriber.internal/__preview/scheduled',{method:'POST',body:JSON.stringify({scheduledTime:Date.now()})})
-  assert.equal((await dispatchBranchSubscribers(request(),h.featureEnv,async()=>assert.fail('unsigned'),2)).status,403)
-  assert.equal((await dispatchBranchSubscribers(request(),{...h.featureEnv,INVENTORY:{}},async()=>assert.fail('privileged'),2)).status,403)
+  assert.equal((await dispatchBranchSubscribers(request(),h.featureEnv,async()=>assert.fail('unsigned'),2,1)).status,403)
+  assert.equal((await dispatchBranchSubscribers(request(),h.featureEnv,async()=>assert.fail('unapproved context contract'),2,undefined)).status,403)
+  assert.equal((await dispatchBranchSubscribers(request(),{...h.featureEnv,INVENTORY:{}},async()=>assert.fail('privileged'),2,1)).status,403)
   assert.equal(h.db.prepare('SELECT count(*) n FROM preview_subscriber_leases').get().n,0)
   h.control.close();h.db.close()
 })

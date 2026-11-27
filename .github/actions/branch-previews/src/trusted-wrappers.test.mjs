@@ -21,7 +21,7 @@ test('builds trusted wrappers without executing feature code and hides privilege
   writeFileSync(path.join(h.workers,'api.mjs'), `throw new Error('legacy wrapped API must not execute')`)
   writeFileSync(path.join(h.workers,'api-feature.mjs'), `globalThis.__fixtureExecuted = true; export default { fetch(_request, env) { return new Response(JSON.stringify({keys:Object.keys(env),send:typeof env.SUBSCRIBER_EMAIL?.send})) } }`)
   writeFileSync(path.join(h.workers,'probe.mjs'), `export default { fetch(_r,env) { return new Response(JSON.stringify(Object.keys(env))) }, async scheduled(_e,env) { globalThis.__scheduledBindings=Object.keys(env) } }`)
-  writeFileSync(path.join(h.workers,'subscriber-feature.mjs'), `export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT=2; export async function flushPreviewSubscriberDeliveries() {}`)
+  writeFileSync(path.join(h.workers,'subscriber-feature.mjs'), `export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT=2; export const PREVIEW_BRANCH_DELIVERY_CONTEXT_CONTRACT=1; export async function flushPreviewSubscriberDeliveries() {}`)
   const fixtureSource=path.join(control,'apps/preview-fixture/index.mjs')
   const files = await buildTrustedPreviewWrappers({ control, branchDir:h.branchDir, dir:h.output, fixtureSource, probe:true, subscriber:true })
   assert.equal(globalThis.__fixtureExecuted, undefined)
@@ -45,6 +45,13 @@ test('refuses imports from a feature artifact into privileged controller files',
   const secret = path.join(h.dir, 'controller-secret.mjs')
   writeFileSync(secret, 'export default "PRIVATE-CONTROLLER-SECRET"')
   writeFileSync(path.join(h.workers,'api-feature.mjs'), `import secret from ${JSON.stringify(secret)}; export default secret`)
-  writeFileSync(path.join(h.workers,'subscriber-feature.mjs'), 'export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT=2; export function flushPreviewSubscriberDeliveries() {}')
+  writeFileSync(path.join(h.workers,'subscriber-feature.mjs'), 'export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT=2; export const PREVIEW_BRANCH_DELIVERY_CONTEXT_CONTRACT=1; export function flushPreviewSubscriberDeliveries() {}')
   await assert.rejects(buildTrustedPreviewWrappers({control,branchDir:h.branchDir,dir:h.output,subscriber:true}), /unresolved import/)
+})
+
+test('refuses a feature scheduler without the delivery context contract', async t => {
+  const h=fixture(t)
+  writeFileSync(path.join(h.workers,'api-feature.mjs'),'export default {fetch() {return new Response()}}')
+  writeFileSync(path.join(h.workers,'subscriber-feature.mjs'),'export const PREVIEW_SUBSCRIBER_SCHEDULER_CONTRACT=2; export function flushPreviewSubscriberDeliveries() {}')
+  await assert.rejects(buildTrustedPreviewWrappers({control,branchDir:h.branchDir,dir:h.output,subscriber:true}),/PREVIEW_BRANCH_DELIVERY_CONTEXT_CONTRACT/)
 })
