@@ -63,7 +63,15 @@ export function createActivationAdapter({ store, appId, accountId, token, dispat
     const flagKey = `status-preview-branch-${key}`
     const flagUrl = `${apiBase}/${flagKey}`
     const flag = await request(flagUrl)
-    if (flag && (flag.default_variation !== 'current' || flag.enabled !== true || flag.rules?.length || flag.variations?.current?.selector !== selector || (flag.variations.current.release !== sha && (!active || flag.variations.current.release !== active.sha)))) throw new Error('Unexpected existing Flagship state')
+    // A fully retired branch leaves an empty JSON variation. It is safe to
+    // reuse only when the inventory has no active release and the flag still
+    // exactly matches the retirement tombstone.
+    const variation = flag?.variations?.current
+    const cleared = !active && flag?.type === 'json' && flag.enabled === true && flag.default_variation === 'current' &&
+      Array.isArray(flag.rules) && flag.rules.length === 0 && flag.variations && typeof flag.variations === 'object' &&
+      !Array.isArray(flag.variations) && Object.keys(flag.variations).length === 1 &&
+      variation !== null && typeof variation === 'object' && !Array.isArray(variation) && Object.keys(variation).length === 0
+    if (flag && !cleared && (flag.default_variation !== 'current' || flag.enabled !== true || flag.rules?.length || flag.variations?.current?.selector !== selector || (flag.variations.current.release !== sha && (!active || flag.variations.current.release !== active.sha)))) throw new Error('Unexpected existing Flagship state')
     if (!flag && active) throw new Error('Active inventory has no Flagship flag')
     const payload = { key: flagKey, enabled: true, default_variation: 'current', rules: [], variations: { current: { selector, release: sha } } }
     if (flag?.variations?.current?.release !== sha) await request(flag ? flagUrl : apiBase, { method: flag ? 'PUT' : 'POST', body: JSON.stringify(payload) })
