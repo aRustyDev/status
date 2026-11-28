@@ -1,3 +1,5 @@
+import { URL } from 'node:url'
+
 /**
  * Lets the guides in docs/src/ stay plain GitHub-readable Markdown:
  * - drops the leading `# Title` (the layout renders the title itself),
