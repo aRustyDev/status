@@ -124,7 +124,7 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Headless preview browser pilot
-        run: node --test .github/workflows/branch-previews/test/preview-browser.e2e.mjs
+        run: node --test .agents/skills/preview-browser/scripts/cli.e2e.mjs
 
       - name: End-to-end tests
         run: npm run test:e2e
@@ -174,7 +174,7 @@ jobs:
         run: node --import tsx --test apps/gateway/test/*.test.mts
 
       - name: Staging preview tests
-        run: node --test .github/actions/branch-previews/preview-browser.test.mjs scripts/preview-browser.test.mjs .agents/skills/preview-browser/scripts/provider.test.mjs
+        run: node --test .github/actions/branch-previews/preview-browser.test.mjs .github/workflows/branch-previews/test/runner-auth.test.mjs .agents/skills/preview-browser/scripts/*.test.mjs
 
       - name: Branch preview controller tests
         run: |

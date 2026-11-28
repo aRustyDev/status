@@ -3,11 +3,12 @@ import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { createInterface } from 'node:readline'
 import { setTimeout as delay } from 'node:timers/promises'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import test from 'node:test'
 
 const exec = promisify(execFile)
-const entry = 'scripts/preview-browser.mjs'
+const entry = fileURLToPath(new URL('./cli.mjs', import.meta.url))
 function start(args, env) {
   const child = spawn(process.execPath, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
   const exit = once(child, 'exit')
