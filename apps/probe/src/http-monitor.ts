@@ -13,6 +13,7 @@ export type HttpAssertion =
   | { type: 'json'; path: string; op: 'exists' | 'equals' | 'not-equals' | 'contains' | 'lt' | 'gt'; value?: string | number; onFail?: 'down' | 'degraded' }
 export type StatusRange = { min: number; max: number }
 export type VaultBasicAuth = { type: 'basic'; basic: { vault: { vaultId: number; secretId: number } } }
+export type VaultHttpAuth = VaultBasicAuth | { type: 'oauth2'; oauth2: { providerId: string; vault: { vaultId: number; secretId: number }; scope?: string } } | { type: 'cas'; cas: { providerId: string; vault: { vaultId: number; secretId: number } } }
 
 /** Only Vault references are persisted; credential values are never configuration. */
 export function parseVaultBasicAuth(value: unknown): VaultBasicAuth | null {
@@ -26,9 +27,33 @@ export function parseVaultBasicAuth(value: unknown): VaultBasicAuth | null {
   return { type: 'basic', basic: { vault: { vaultId: Number(v.vaultId), secretId: Number(v.secretId) } } }
 }
 
+/** Parse only metadata references for all supported authentication modes. */
+export function parseVaultHttpAuth(value: unknown): VaultHttpAuth | null {
+  const basic = parseVaultBasicAuth(value)
+  if (basic) return basic
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const auth = value as Record<string, unknown>
+  const type = auth.type
+  if (type !== 'oauth2' && type !== 'cas') return null
+  if (Object.keys(auth).some(key => key !== 'type' && key !== type)) return null
+  const data = auth[type]
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const section = data as Record<string, unknown>
+  if (Object.keys(section).some(key => key !== 'providerId' && key !== 'vault' && !(type === 'oauth2' && key === 'scope'))) return null
+  if (typeof section.providerId !== 'string' || !section.providerId || section.providerId.length > 200) return null
+  if (section.scope !== undefined && (typeof section.scope !== 'string' || section.scope.length > 1024 || Array.from(section.scope).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127))) return null
+  const vault = section.vault
+  if (!vault || typeof vault !== 'object' || Array.isArray(vault)) return null
+  const ref = vault as Record<string, unknown>
+  if (Object.keys(ref).some(key => key !== 'vaultId' && key !== 'secretId') || !Number.isSafeInteger(ref.vaultId) || Number(ref.vaultId) < 1 || !Number.isSafeInteger(ref.secretId) || Number(ref.secretId) < 1) return null
+  const safeRef = { vaultId: Number(ref.vaultId), secretId: Number(ref.secretId) }
+  if (type === 'cas') return { type, cas: { providerId: section.providerId, vault: safeRef } }
+  return { type, oauth2: { providerId: section.providerId, vault: safeRef, ...(section.scope !== undefined ? { scope: section.scope as string } : {}) } }
+}
+
 export type HttpMonitorConfig = {
   endpointId: string
-  auth?: VaultBasicAuth
+  auth?: VaultHttpAuth
   /** Fingerprint of this endpoint from the deployment-controlled D1 registry. */
   registryFingerprint: string
   /** Valid methods are case-insensitive; sent in upper case. */
@@ -79,7 +104,7 @@ export function isBlockedRedirect(response: Response): boolean {
 }
 function validate(config: HttpMonitorConfig): boolean {
   if (!config || typeof config !== 'object' || Array.isArray(config) || Object.keys(config).some(key => !CONFIG_FIELDS.has(key)) || typeof config.endpointId !== 'string' || !config.endpointId || typeof config.registryFingerprint !== 'string') return false
-  if (config.auth !== undefined && !parseVaultBasicAuth(config.auth)) return false
+  if (config.auth !== undefined && !parseVaultHttpAuth(config.auth)) return false
   if (config.method !== undefined && (typeof config.method !== 'string' || !['GET', 'POST', 'HEAD'].includes(config.method.toUpperCase()))) return false
   if (config.expectedStatus !== undefined && !validStatus(config.expectedStatus)) return false
   if (config.expectedStatus !== undefined && config.acceptedStatusRanges !== undefined) return false
@@ -171,6 +196,12 @@ function validRequestSettings(config: HttpMonitorConfig): boolean {
 /** Enforce the deployment-approved target and request policy at each send. */
 export function requestAllowedForEndpoint(config: HttpMonitorConfig, endpoint: Endpoint): boolean {
   if (!validRequestSettings(config)) return false
+  if (config.auth && config.auth.type !== 'basic') {
+    const mode = config.auth.type
+    const providerId = config.auth.type === 'oauth2' ? config.auth.oauth2.providerId : config.auth.cas.providerId
+    if (endpoint.authProviders?.[mode]?.id !== providerId) return false
+    if (mode === 'cas' && ((config.method ?? 'GET').toUpperCase() !== 'GET' || config.body !== undefined || Object.keys(config.headers ?? {}).length || Object.keys(config.vaultHeaders ?? {}).length)) return false
+  }
   const method = (config.method ?? 'GET').toUpperCase()
   const headers = Object.keys(config.headers ?? {})
   const vaultHeaders = Object.keys(config.vaultHeaders ?? {})

@@ -1041,3 +1041,119 @@ test('disabled and stale dependency checks cannot suppress a fresh outage', asyn
     assert.equal(sqlite.prepare("SELECT dependency_affected FROM http_checks WHERE id='check-0'").get()?.dependency_affected, 0)
   } finally { Date.now = realNow; sqlite.close() }
 })
+
+test('saved OAuth2 and CAS checks share manual and scheduled execution and redact credentials', async () => {
+  const { sqlite, now, env } = fixture()
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0008_vault.sql', import.meta.url), 'utf8'))
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0015_monitor_request.sql', import.meta.url), 'utf8'))
+  sqlite.exec(readFileSync(new URL('../../worker/migrations/0018_monitor_auth_providers.sql', import.meta.url), 'utf8'))
+  const keyHex = 'ab'.repeat(32)
+  const { vaultKeyReady } = await import('../../worker/src/vault.ts')
+  const { endpointFingerprint } = await import('../../worker/src/endpoint-config.ts')
+  const casWorker = (await import('../src/cas-worker.ts')).default
+  assert.equal(await vaultKeyReady(env.DB as never, keyHex), true)
+  sqlite.prepare('INSERT INTO vaults(id,name,created_at,updated_at) VALUES (1,?,?,?)').run('fixture', now, now)
+  const key = await crypto.subtle.importKey('raw', new Uint8Array(32).fill(0xab), 'AES-GCM', false, ['encrypt'])
+  const nonce = crypto.getRandomValues(new Uint8Array(12))
+  const ciphertext = await crypto.subtle.encrypt({ name:'AES-GCM', iv:nonce, additionalData:new TextEncoder().encode('status-vault-v1:1:2:userpass') }, key, new TextEncoder().encode(JSON.stringify({ username: 'fixture-user', password: 'fixture-secret' })))
+  const b64 = (value: Uint8Array) => btoa(Array.from(value, byte => String.fromCharCode(byte)).join(''))
+  sqlite.prepare("INSERT INTO vault_secrets(id,vault_id,name,type,ciphertext,nonce,created_at,updated_at) VALUES (2,1,'fixture','userpass',?,?,?,?)").run(b64(new Uint8Array(ciphertext)), b64(nonce), now, now)
+  const endpoint = { id: 'endpoint-0', name: 'Fixture', url: 'https://target.example/health', authProviders: { oauth2: { id: 'oauth', name: 'OAuth', url: 'https://auth.example/token' }, cas: { id: 'cas', name: 'CAS', url: 'https://auth.example/v1/tickets' } } }
+  sqlite.prepare('UPDATE endpoint_registry SET fingerprint=? WHERE endpoint_id=?').run(await endpointFingerprint(endpoint), endpoint.id)
+  const runtime = { ...env, ENDPOINTS: JSON.stringify([endpoint]), VAULT_ENCRYPTION_KEY: keyHex, MONITOR_AUTH_READY: 'true', MONITOR_OAUTH2_READY: 'true', MONITOR_CAS_READY: 'true' }
+  const connected = { ...runtime, CAS_PROBE: { fetch: (request: Request) => casWorker.fetch(request, runtime as never) } }
+  let calls: string[] = []
+  const spans: { name: string; attributes: Record<string, unknown> }[] = []
+  const tracing = { enterSpan: async (name: string, work: (span: unknown) => Promise<unknown>) => {
+    const attributes: Record<string, unknown> = {}
+    spans.push({ name, attributes })
+    return work({ setAttribute: (key: string, value: unknown) => { attributes[key] = value }, setAttributes: (values: Record<string, unknown>) => { Object.assign(attributes, values) } })
+  } }
+  globalThis.fetch = async (url, init) => {
+    const target = String(url)
+    calls.push(target)
+    if (target === 'https://auth.example/token') {
+      assert.match(String(init?.body), /grant_type=client_credentials/)
+      return Response.json({ access_token: 'fixture-token' })
+    }
+    if (target === 'https://auth.example/v1/tickets') return new Response(null, { status: 201, headers: { location: 'https://auth.example/v1/tickets/TGT-fixture' } })
+    if (target === 'https://auth.example/v1/tickets/TGT-fixture') return new Response('ST-fixture')
+    if (target.includes('ticket=ST-fixture')) return new Response(null, { status: 302, headers: { location: endpoint.url, 'set-cookie': 'session=fixture-cookie; Secure; Path=/' } })
+    if (new Headers(init?.headers).has('authorization')) assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer fixture-token')
+    else assert.equal(new Headers(init?.headers).get('cookie'), 'session=fixture-cookie')
+    return new Response('healthy', { status: 200 })
+  }
+  for (const type of ['oauth2', 'cas'] as const) {
+    const auth = type === 'oauth2' ? { type, oauth2: { providerId: 'oauth', vault: { vaultId: 1, secretId: 2 } } } : { type, cas: { providerId: 'cas', vault: { vaultId: 1, secretId: 2 } } }
+    sqlite.prepare('UPDATE http_checks SET advanced_config=?,last_scheduled_at=NULL WHERE id=?').run(JSON.stringify({ auth, timeoutMs: 5000, attempts: 1 }), 'check-0')
+    const checkVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+    const response = await worker.fetch(new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify({ checkId:'check-0', checkVersion }) }), connected as never, { tracing } as never)
+    const result = await response.text()
+    assert.match(result, /HTTP check passed/)
+    assert.doesNotMatch(result, /fixture-secret|fixture-token|fixture-cookie|ST-fixture/)
+    await runChecks(now, connected as never, tracing as never)
+    const checkSpans = spans.filter(span => span.name === 'monitor.check')
+    assert.deepEqual(checkSpans.map(span => span.attributes['monitor.execution']), ['manual', 'scheduled'])
+    assert.ok(checkSpans.every(span => span.attributes['monitor.check_id'] === 'check-0' && span.attributes['monitor.revision'] === checkVersion && span.attributes['monitor.outcome'] === 'up'))
+    if (type === 'cas') assert.ok(spans.some(span => span.name === 'monitor.cas' && typeof span.attributes['monitor.cas.ticket_ms'] === 'number'))
+    assert.doesNotMatch(JSON.stringify(spans), /fixture-secret|fixture-token|fixture-cookie|ST-fixture/)
+    spans.length = 0
+    assert.equal(sqlite.prepare('SELECT last_status FROM http_checks WHERE id=?').get('check-0')?.last_status, 'up')
+    assert.equal(calls.filter(value => value === endpoint.url).length, 2)
+    calls = []
+  }
+  sqlite.prepare('UPDATE http_checks SET advanced_config=?,last_scheduled_at=NULL WHERE id=?').run(JSON.stringify({ auth: { type: 'oauth2', oauth2: { providerId: 'oauth', vault: { vaultId: 1, secretId: 2 } } }, timeoutMs: 5000, attempts: 1 }), 'check-0')
+  const oauthVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+  let oauthCalls = 0
+  globalThis.fetch = async () => { oauthCalls++; return new Response('fixture-secret', { status: 401 }) }
+  const oauthFailure = await worker.fetch(new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify({checkId:'check-0',checkVersion:oauthVersion}) }), connected as never, { tracing } as never)
+  const oauthFailureBody = await oauthFailure.text()
+  assert.match(oauthFailureBody, /HTTP check failed/)
+  assert.doesNotMatch(oauthFailureBody, /fixture-secret/)
+  await runChecks(now + 60_000, connected as never, tracing as never)
+  const failedSpans = spans.filter(span => span.name === 'monitor.check')
+  assert.deepEqual(failedSpans.map(span => span.attributes['monitor.reason']), ['request_failed', 'request_failed'])
+  assert.equal(sqlite.prepare('SELECT last_status FROM http_checks WHERE id=?').get('check-0')?.last_status, 'down')
+  assert.equal(oauthCalls, 2)
+  sqlite.prepare('UPDATE http_checks SET advanced_config=?,last_scheduled_at=NULL WHERE id=?').run(JSON.stringify({ auth: { type: 'cas', cas: { providerId: 'cas', vault: { vaultId: 1, secretId: 2 } } }, timeoutMs: 5000, attempts: 1 }), 'check-0')
+  let rejectedCalls = 0
+  globalThis.fetch = async () => {
+    rejectedCalls++
+    return new Response(null, { status: 201, headers: { location: 'https://attacker.example/v1/tickets/TGT-secret' } })
+  }
+  const casVersion = Number(sqlite.prepare('SELECT config_version FROM http_checks WHERE id=?').get('check-0')?.config_version)
+  for (const field of ['secretId', 'nonce'] as const) {
+    const tampered = { ...connected, CAS_PROBE: { fetch: async (request: Request) => {
+      const body = await request.json() as { credential: Record<string, unknown> }
+      body.credential[field] = field === 'secretId' ? 99 : 'changed-nonce'
+      return casWorker.fetch(new Request(request.url, { method: 'POST', body: JSON.stringify(body) }), runtime as never)
+    } } }
+    const result = await worker.fetch(new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify({checkId:'check-0',checkVersion:casVersion}) }), tampered as never)
+    assert.match(await result.text(), /credential_unavailable/)
+    assert.equal(rejectedCalls, 0)
+  }
+  globalThis.fetch = async () => {
+    rejectedCalls++
+    sqlite.prepare('UPDATE vault_secrets SET nonce=? WHERE id=2').run('rotated-nonce')
+    return new Response(null, { status: 201, headers: { location: 'https://auth.example/v1/tickets/TGT-fixture' } })
+  }
+  const raced = await worker.fetch(new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify({checkId:'check-0',checkVersion:casVersion}) }), connected as never)
+  const racedBody = await raced.text()
+  assert.match(racedBody, /credential_unavailable/)
+  assert.doesNotMatch(racedBody, /fixture-secret|rotated-nonce|TGT-fixture/)
+  assert.equal(rejectedCalls, 1)
+  sqlite.prepare('UPDATE vault_secrets SET nonce=? WHERE id=2').run(b64(nonce))
+  rejectedCalls = 0
+  globalThis.fetch = async () => {
+    rejectedCalls++
+    return new Response(null, { status: 201, headers: { location: 'https://attacker.example/v1/tickets/TGT-secret' } })
+  }
+  const rejected = await worker.fetch(new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify({checkId:'check-0',checkVersion:casVersion}) }), connected as never)
+  assert.match(await rejected.text(), /HTTP check failed/)
+  assert.equal(rejectedCalls, 1)
+  sqlite.prepare('DELETE FROM vault_secrets WHERE id=2').run()
+  const missing = await worker.fetch(new Request('https://probe.internal/test', { method:'POST', body:JSON.stringify({checkId:'check-0',checkVersion:casVersion}) }), connected as never)
+  assert.match(await missing.text(), /credential_unavailable/)
+  assert.equal(rejectedCalls, 1)
+  sqlite.close()
+})
