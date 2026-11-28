@@ -188,7 +188,7 @@ test('the preview browser is a read-only viewer on its configured origin through
   const origin = 'https://status.example'
   const clientId = 'preview-browser.access'
   const token = await signService(clientId)
-  const selector = '1.' + 'a'.repeat(32)
+  const selector = 'branch-' + 'a'.repeat(24)
   const release = 'b'.repeat(40)
   const settings = { ...env, DEPLOYMENT_ENVIRONMENT: 'staging', PREVIEW_BROWSER_ORIGIN: origin, PREVIEW_BROWSER_CLIENT_ID: clientId }
   const api = { fetch: (req: Request) => {
@@ -200,8 +200,15 @@ test('the preview browser is a read-only viewer on its configured origin through
   let dispatches = 0
   const baseline = {
     API: { fetch: (req: Request) => worker.fetch(req, { ...settings, DB: { prepare() { throw new Error('Baseline D1 was accessed') } } } as never) },
-    FLAGS: { getBooleanDetails: () => ({ value: true }), getObjectDetails: () => ({ value: { selector, release, target: 'a', expiresAt: Date.now() + 60_000 } }) },
-    PREVIEW_1_A: { fetch: (req: Request) => { dispatches++; return gateway.fetch(req, target as never) } },
+    PREVIEW_DISPATCHER: { fetch: async (req: Request) => {
+      dispatches++
+      const headers = new Headers(req.headers)
+      headers.set('X-Status-Preview-Release', release)
+      const response = await gateway.fetch(new Request(req, { headers }), target as never)
+      const resultHeaders = new Headers(response.headers)
+      resultHeaders.set('X-Status-Preview-Commit', release)
+      return new Response(response.body, { status: response.status, headers: resultHeaders })
+    } },
   }
   const makeRequest = (path: string, method = 'GET') => new Request(origin + path, {
     method, headers: { 'Cf-Access-Jwt-Assertion': token, 'CF-Access-Client-Secret': 'fixture', 'CF-Access-Client-Id': clientId, 'X-Status-Preview': selector, 'X-Status-Identity-Method': 'GET', accept: 'text/html' },

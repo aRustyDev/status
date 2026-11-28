@@ -12,7 +12,7 @@
   },
   "compatibilityDate": "2026-11-23",
   "smokePath": "/",
-  "launcher": "scripts/preview-browser.mjs",
+  "launcher": ".github/actions/branch-previews/preview-browser.mjs",
   "database": {
     "migrations": "apps/worker/migrations",
     "seed": ".github/previews/seed.sql"
