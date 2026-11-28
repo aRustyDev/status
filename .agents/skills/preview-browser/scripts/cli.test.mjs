@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { projectSettings } from './variant.mjs'
+import { openVariant, projectSettings } from './variant.mjs'
 
 const config = {
   origin: 'https://preview.example.org', backend: 'cloudflare', auth: 'access',
@@ -20,6 +20,33 @@ test('credentials are pinned independently of the project configuration', () => 
   assert.throws(() => projectSettings(config, { ...vars, CF_ACCESS_CLIENT_SECRET: '' }))
   assert.throws(() => projectSettings({ ...config, allowSelfSignedLoopback: true }, vars))
   assert.throws(() => projectSettings({ ...config, identity: { ...config.identity, path: '//example.org/' } }, vars))
+  assert.throws(() => projectSettings({ ...config, requiredPaths: ['//example.org/'] }, vars))
+  assert.throws(() => projectSettings({ ...config, requiredPaths: 'invalid' }, vars))
+})
+
+test('a failing required API check closes its browser context before reporting readiness', async () => {
+  let closed = false
+  const visits = []
+  const page = {
+    context: () => context,
+    on: () => {},
+    goto: async url => {
+      visits.push(new URL(url).pathname)
+      return {
+        ok: () => !url.endsWith('/locales'), url: () => url,
+        headerValue: async () => 'v1', json: async () => ({ role: 'viewer' }),
+      }
+    },
+  }
+  const context = {
+    newPage: async () => page,
+    newCDPSession: async () => ({ on: () => {}, send: async () => {} }),
+    on: () => {}, close: async () => { closed = true },
+  }
+  const settings = { ...config, headers: {}, requiredPaths: ['/locales'] }
+  await assert.rejects(openVariant({ newContext: async () => context }, settings, 'branch-1', 'v1', '/'), /readiness check failed for \/locales/)
+  assert.deepEqual(visits, ['/me', '/locales'])
+  assert.equal(closed, true)
 })
 
 test('the installed CLI loads the optional Access adapter only from the working checkout', async t => {

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { activationIdentity, main, selectWorkerSecrets, redactSubscriberAddresses } from './controller-cli.mjs'
+import { activationIdentity, browserViewerSettings, main, selectWorkerSecrets, redactSubscriberAddresses } from './controller-cli.mjs'
 
 test('schema diagnostics redact approved sender and recipient regardless of case', () => {
   const redacted = redactSubscriberAddresses('Sender@Example.com -> recipient@example.com', {sender:'sender@example.com',recipient:'RECIPIENT@example.com'})
@@ -23,6 +23,23 @@ test('activation uses staging gateway Access identity for all preview environmen
   const config = { environments: { stage: { accessTeamDomain: 'stage.cloudflareaccess.com', accessAud: 'stage-aud' }, dev: { accessTeamDomain: 'dev.cloudflareaccess.com', accessAud: 'dev-aud' } } }
   assert.deepEqual(activationIdentity(config, { 'cf-access-client-id': 'service.access' }), { accessTeamDomain: 'stage.cloudflareaccess.com', accessAud: 'stage-aud', serviceTokenId: 'service.access' })
   assert.throws(() => activationIdentity(config, {}), /client ID/)
+})
+
+test('viewer settings preserve protected branch settings and require a matching HTTPS origin', () => {
+  const existing = { endpoints:'[]', previewBrowserClientId:'old.access' }
+  const url = new URL('https://stage.example/preview')
+  assert.equal(browserViewerSettings(existing, url, {}), existing)
+  const env = { PREVIEW_BROWSER_ORIGIN:'https://stage.example', PREVIEW_BROWSER_CLIENT_ID:'viewer.access' }
+  assert.deepEqual(browserViewerSettings(existing, url, env), { ...existing, previewBrowserOrigin:'https://stage.example', previewBrowserClientId:'viewer.access' })
+  assert.equal(existing.previewBrowserClientId, 'old.access')
+  for (const invalid of [
+    { ...env, PREVIEW_BROWSER_CLIENT_ID:'' },
+    { ...env, PREVIEW_BROWSER_ORIGIN:'' },
+    { ...env, PREVIEW_BROWSER_CLIENT_ID:'viewer access' },
+    { ...env, PREVIEW_BROWSER_ORIGIN:'http://stage.example' },
+    { ...env, PREVIEW_BROWSER_ORIGIN:'https://elsewhere.example' },
+    { ...env, PREVIEW_BROWSER_ORIGIN:'https://stage.example/path' },
+  ]) assert.throws(() => browserViewerSettings(existing, url, invalid), /preview browser/i)
 })
 
 test('invalid reconciliation and deploy inputs fail before cloud access', async () => {
