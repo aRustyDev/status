@@ -1,0 +1,46 @@
+{
+  "account_id": "REPLACE_ACCOUNT_ID",
+  "compatibility_date": "2026-11-23",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": false
+    }
+  },
+  "name": "REPLACE_MONITORING_API_WORKER_NAME",
+  "main": "../../apps/gateway/api.ts",
+  "assets": {
+    "directory": "../../apps/board/dist",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "REPLACE_ACCESS_TEAM_DOMAIN",
+    "ACCESS_AUD": "REPLACE_PRIVATE_ACCESS_AUDIENCE",
+    "ENDPOINTS": "[]",
+    "API_SCOPE": "monitoring",
+    "GATUS_REQUIRED": "true"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "status-board-production",
+      "database_id": "REPLACE_PRODUCTION_D1_ID",
+      "migrations_dir": "../../apps/worker/migrations"
+    }
+  ],
+  "vpc_services": [
+    {
+      "binding": "GATUS",
+      "service_id": "REPLACE_GATUS_VPC_SERVICE_ID"
+    }
+  ],
+  "services": [
+    {
+      "binding": "PROBE",
+      "service": "REPLACE_PROBE_WORKER_NAME"
+    }
+  ]
+}

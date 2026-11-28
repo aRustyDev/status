@@ -1,0 +1,19 @@
+{
+  "account_id": "REPLACE_ACCOUNT_ID",
+  "compatibility_date": "2026-11-23",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": false
+    }
+  },
+  "name": "REPLACE_STATUS_UI_WORKER_NAME",
+  "main": "../../apps/gateway/assets.ts",
+  "assets": {
+    "directory": "../../apps/status/dist",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  }
+}

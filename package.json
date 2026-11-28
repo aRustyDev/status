@@ -41,6 +41,7 @@
     "check:kit": "node scripts/check-kit.mjs"
   },
   "devDependencies": {
+    "@cloudflare/zt-types": "^2026.10.1",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.61.1",
     "@testing-library/jest-dom": "^6.9.1",
