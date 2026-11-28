@@ -10,11 +10,6 @@ on:
         description: Exact tested commit
         required: false
         type: string
-      staging_lock:
-        description: Temporarily reserve the dispatcher controller for staging verification
-        required: false
-        default: false
-        type: boolean
   schedule:
     - cron: 17 * * * *
   workflow_run:
@@ -32,20 +27,8 @@ permissions:
   contents: read
   actions: read
 jobs:
-  staging-dispatcher-lock:
-    if: github.event_name == 'workflow_dispatch' && inputs.staging_lock && github.repository == 'aRustyDev/status' && github.ref == 'refs/heads/codex/preview-deleted-selector-404'
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    concurrency:
-      group: ${{ format('{0}-branch-preview-controller', github.event.repository.name) }}
-      queue: max
-    steps:
-      - name: Hold the dispatcher deployment lock
-        run: |
-          echo 'STAGING_DISPATCHER_LOCK_READY'
-          sleep 360
   deploy:
-    if: inputs.staging_lock != true && vars.PREVIEW_AUTO_ENABLED == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.branch != '' && inputs.sha != '') || (github.event_name == 'workflow_run' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') && github.event.workflow_run.conclusion == 'success'))
+    if: vars.PREVIEW_AUTO_ENABLED == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.branch != '' && inputs.sha != '') || (github.event_name == 'workflow_run' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') && github.event.workflow_run.conclusion == 'success'))
     secrets: inherit
     uses: aRustyDev/status/.github/workflows/deploy.yml@a8fdae8cf348638724d1e4acc0c0b8b1795970fb
     with:
@@ -53,7 +36,7 @@ jobs:
       branch: ${{ github.event.workflow_run.head_branch || inputs.branch }}
       sha: ${{ github.event.workflow_run.head_sha || inputs.sha }}
   reconcile:
-    if: inputs.staging_lock != true && vars.PREVIEW_AUTO_ENABLED == 'true' && vars.PREVIEW_RECONCILE_ENABLED == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.branch == '') || (github.event_name == 'delete' && github.event.ref_type == 'branch'))
+    if: vars.PREVIEW_AUTO_ENABLED == 'true' && vars.PREVIEW_RECONCILE_ENABLED == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.branch == '') || (github.event_name == 'delete' && github.event.ref_type == 'branch'))
     permissions:
       contents: read
       actions: write
