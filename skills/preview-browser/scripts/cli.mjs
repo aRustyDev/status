@@ -52,7 +52,7 @@ async function command(id, action, args, control) {
   return bytes
 }
 
-async function ownRun(settings, pairs, path) {
+async function ownRun(settings, pairs, path, env) {
   for (const [selector, revision] of pairs) checkVariant(settings, selector, revision)
   const require = createRequire(resolve('package.json'))
   const { chromium } = require('playwright')
@@ -90,7 +90,7 @@ async function ownRun(settings, pairs, path) {
     timer = setTimeout(stop, 120_000)
   }
   try {
-    provider = await startBrowser({ chromium, backend: settings.backend })
+    provider = await startBrowser({ chromium, backend: settings.backend, env })
     provider.browser.on('disconnected', stop)
     for (const [selector, revision] of pairs) variants.push(await openVariant(provider.browser, settings, selector, revision, path))
     server = createServer(async (req, res) => {
@@ -148,7 +148,7 @@ async function ownRun(settings, pairs, path) {
   }
 }
 
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), ownerEnvironment = () => process.env) {
   const { values, positionals: [action, ...args] } = parseArgs({ args: argv, allowPositionals: true, options: {
     config: { type: 'string', default: 'preview-browser.config.json' }, path: { type: 'string', default: '/' },
     control: { type: 'boolean', default: false }, help: { type: 'boolean' },
@@ -158,8 +158,10 @@ export async function main(argv = process.argv.slice(2)) {
     if (args.length !== (action === 'open' ? 2 : 4)) throw new Error(usage)
     const pairs = [args.slice(0,2)]
     if (action === 'compare') pairs.push(args.slice(2,4))
-    const settings = projectSettings(JSON.parse(await readFile(values.config, 'utf8')))
-    await ownRun(settings, pairs, values.path)
+    const config = JSON.parse(await readFile(values.config, 'utf8'))
+    const env = await ownerEnvironment(config)
+    const settings = projectSettings(config, env)
+    await ownRun(settings, pairs, values.path, env)
     return
   }
   const counts = { close: 1, resume: 1, inspect: 2, screenshot: 3, goto: 3, click: 4, fill: 4, show: 2 }

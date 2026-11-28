@@ -7,7 +7,7 @@ function localBrowserEnv() {
   return Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.test(key)))
 }
 
-export async function startBrowser({ chromium, backend }) {
+export async function startBrowser({ chromium, backend, env = process.env }) {
   if (backend === 'local') {
     const browser = await chromium.launch({ headless: true, env: localBrowserEnv() })
     return {
@@ -17,8 +17,8 @@ export async function startBrowser({ chromium, backend }) {
     }
   }
   if (backend !== 'cloudflare') throw new Error('Expected a local or cloudflare browser backend.')
-  const account = process.env.BROWSER_RUN_ACCOUNT_ID
-  const token = process.env.BROWSER_RUN_API_TOKEN
+  const account = env.BROWSER_RUN_ACCOUNT_ID
+  const token = env.BROWSER_RUN_API_TOKEN
   if (!/^[a-f0-9]{32}$/i.test(account ?? '') || !token) {
     throw new Error('Set BROWSER_RUN_ACCOUNT_ID and BROWSER_RUN_API_TOKEN for the Cloudflare backend.')
   }

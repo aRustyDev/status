@@ -67,7 +67,11 @@ test('remote views are opt-in, target-specific, short-lived and readonly by defa
     assert.equal(method, 'DELETE')
     return { status: 'closed' }
   })
-  const session = await startBrowser({ chromium, backend: 'cloudflare' })
+  const env = { BROWSER_RUN_ACCOUNT_ID: account, BROWSER_RUN_API_TOKEN: 'fixture' }
+  // The owner resolves credentials in memory; they are absent from a cold shell.
+  delete process.env.BROWSER_RUN_ACCOUNT_ID
+  delete process.env.BROWSER_RUN_API_TOKEN
+  const session = await startBrowser({ chromium, backend: 'cloudflare', env })
   assert.equal(calls.length, 1)
   assert.equal(await session.liveView(page), liveUrl)
   assert.equal(await session.liveView(page, { control: true }), liveUrl)
