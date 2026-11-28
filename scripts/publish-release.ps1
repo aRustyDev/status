@@ -110,9 +110,7 @@ try {
 
   Write-Step 'Updating GHCR image versions and removing "Not released yet" callouts in documentation'
   $documentationFiles = @(
-    Get-Item -LiteralPath 'README.md'
-    Get-Item -LiteralPath 'README.pl.md'
-    Get-ChildItem -LiteralPath 'docs' -Filter '*.md' -File -Recurse
+    Get-ChildItem -LiteralPath 'docs/src' -Filter '*.md' -File -Recurse
   )
   $imagePattern = 'ghcr\.io/belluu/better-status-page:(?:v)?\d+\.\d+\.\d+'
   $imageReplacement = "${image}:$Version"
@@ -128,7 +126,7 @@ try {
   }
 
   Write-Step 'Dating the changelog release section'
-  $changelogPath = Join-Path $repoRoot 'docs/changelog.md'
+  $changelogPath = Join-Path $repoRoot 'docs/src/changelog.md'
   $changelog = [IO.File]::ReadAllText($changelogPath, $utf8NoBom)
   if ($changelog -match "(?m)^## \[$([regex]::Escape($Version))\]") {
     Write-Host "Changelog already has a section for $Version; skipping."
@@ -136,7 +134,7 @@ try {
     $releaseHeading = "## [$Version] - $(Get-Date -Format 'yyyy-MM-dd')"
     $unreleasedPattern = '(?m)^## \[Unreleased\][ \t]*\r?$'
     if ($changelog -notmatch $unreleasedPattern) {
-      throw 'docs/changelog.md has no "## [Unreleased]" heading to turn into a release section'
+      throw 'docs/src/changelog.md has no "## [Unreleased]" heading to turn into a release section'
     }
     $changelog = [regex]::Replace($changelog, $unreleasedPattern, "## [Unreleased]`n`n$releaseHeading", 1)
     [IO.File]::WriteAllText($changelogPath, $changelog, $utf8NoBom)
@@ -162,8 +160,6 @@ try {
     'apps/status/package.json',
     'apps/status-node/package.json',
     'packages/shared/package.json',
-    'README.md',
-    'README.pl.md',
     'docs'
   )
 

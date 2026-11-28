@@ -83,9 +83,9 @@ Keep Vite's base at `/admin/`. Have the gateway redirect `/admin` to `/admin/` a
 
 ## Rollout and completion
 
-1. Build both frontends and compare their supported screens with the pinned upstream version using matching desktop and mobile fixtures. Check keyboard access and the explanations for disabled controls. [Pinned upstream version](../../UPSTREAM.md#L3)
+1. Build both frontends and compare their supported screens with the pinned upstream version using matching desktop and mobile fixtures. Check keyboard access and the explanations for disabled controls. [Pinned upstream version](../../docs/src/UPSTREAM.md#L3)
 2. Record the staging gateway/board and probe versions, current D1 migration, endpoint registry, and representative component, incident, maintenance, user, audit, and probe records. Apply additive migrations through the existing migration owner. Deploy the internal Workers and the gateway serving the legacy HTML with both API contracts.
-3. Switch staging to the upstream HTML and run checks 1–8, including the rollback and switch forward in check 4. Confirm the baseline records still resolve, the public and private scheduled checks still record samples, and a failed probe alone does not publish an incident. Follow the existing staging runbook for Access and probe verification. [Cloudflare deployment and operations](../../docs/cloudflare-deployment.md#staging-verification)
+3. Switch staging to the upstream HTML and run checks 1–8, including the rollback and switch forward in check 4. Confirm the baseline records still resolve, the public and private scheduled checks still record samples, and a failed probe alone does not publish an incident. Follow the existing staging runbook for Access and probe verification. [Cloudflare deployment and operations](../../docs/src/cloudflare-deployment.md#staging-verification)
 4. Keep the upstream HTML active when all eight checks pass and the results are recorded. If a check fails, switch staging HTML back to the board, retain both API routes, and repeat the staging rehearsal with the fix.
 
 ## Staging rehearsal record — November 23, 2026

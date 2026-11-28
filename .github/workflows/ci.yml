@@ -1,6 +1,6 @@
 name: CI
 
-# Documentation-only changes skip CI. docs/changelog.md is baked into the image and parsed by the
+# Documentation-only changes skip CI. docs/src/changelog.md is baked into the image and parsed by the
 # app, and docs/public/openapi.yaml is checked by an API test, so both still trigger it.
 on:
   push:
@@ -9,10 +9,8 @@ on:
     paths-ignore:
       - 'docs/**/*.md'
       - 'docs/src/**'
-      - 'README*.md'
-      - 'SECURITY.md'
       - 'LICENSE'
-      - '!docs/changelog.md'
+      - '!docs/src/changelog.md'
   workflow_dispatch:
 
 permissions:

@@ -18,7 +18,7 @@ RUN npm ci
 COPY tsconfig.base.json ./
 COPY packages/ ./packages/
 COPY apps/     ./apps/
-COPY docs/changelog.md ./docs/changelog.md
+COPY docs/src/changelog.md ./docs/src/changelog.md
 
 RUN npm run build
 
@@ -69,7 +69,7 @@ ENV BACKUP_DIR=/app/backups
 
 # Run unprivileged. The writable directories belong to the built-in "node" user; a fresh named
 # volume inherits this ownership. Volumes created by older images that ran as root need a one-off
-# `chown -R 1000:1000` (see docs/deployment.md).
+# `chown -R 1000:1000` (see docs/src/deployment.md).
 RUN mkdir -p /app/backups && chown -R node:node /app/data /app/backups
 
 USER node

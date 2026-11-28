@@ -146,5 +146,5 @@ Found a bug or have an idea? Pull requests are welcome. Open an issue first for 
 1. Fork the repository and create a branch (`git checkout -b feature/your-idea`).
 2. Make the change, with tests.
 3. Run `npm run lint && npm run typecheck && npm test && npm run build`.
-4. Update `docs/` and `docs/changelog.md` if behaviour changed.
+4. Update `docs/` and `docs/src/changelog.md` if behaviour changed.
 5. Open a pull request.
