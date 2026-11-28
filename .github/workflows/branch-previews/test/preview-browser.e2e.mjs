@@ -20,7 +20,7 @@ function start(args, env) {
 }
 
 test('two flag contexts, on-request viewer, redirect scoping and owner cleanup', { timeout: 60_000 }, async t => {
-  const fixture = start(['--import','tsx','scripts/preview/test-support/browser-pilot.mjs'], process.env)
+  const fixture = start(['--import','tsx','.github/workflows/branch-previews/test/browser-pilot.mjs'], process.env)
   t.after(async () => { fixture.child.kill(); await fixture.exit })
   const { variants, configPath, fixtureEnv } = await fixture.ready
   const env = { ...process.env, ...fixtureEnv }
