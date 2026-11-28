@@ -7,3 +7,5 @@ The preview Operations Worker recognizes only this branch's controller-generated
 The Operations Worker exposes a single synthetic destination for editor and CRUD testing. Its named service binding is deliberately absent. The branch-only probe entrypoints force Actions disabled even if deployment settings drift, and the preview probe has no cron; no Action delivery is expected. Do not enter real secrets or use this preview to test execution.
 
 Use the `preview-browser` skill from a trusted checkout with the selector and exact commit from the successful Branch previews deployment summary. Close the headless run after testing. A future change to the trusted preview controller's scope or schema-secret configuration may require this fixture to be updated.
+
+The branch has a scoped digest fallback for the configured headless viewer when schema settings omit its client ID and origin. If that viewer is rotated, update the digest or configure both viewer settings for schema previews.

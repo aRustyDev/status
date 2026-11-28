@@ -8,6 +8,21 @@ export type Issue14PreviewScope = { API_SCOPE?: string; PREVIEW_SUBSCRIBER_REQUI
 export function isIssue14Preview(env: Issue14PreviewScope): boolean {
   return env.API_SCOPE === 'operations' && env.PREVIEW_SUBSCRIBER_REQUIRED === 'true' && env.PREVIEW_SUBSCRIBER_SCOPE === isolatedScope && /^[0-9a-f]{40}$/.test(env.PREVIEW_RELEASE ?? '')
 }
+
+// Only this disposable preview may identify the configured read-only browser
+// when the schema deployment lacks the optional viewer settings. A digest
+// avoids storing the Access service token's client ID in the branch.
+const viewerClientDigest = '1b9cd395a5c85a3f1075180faf1ef920cdd86382154ec9ccfc8a2a6eb430abaa'
+export async function isIssue14PreviewViewer(
+  env: Issue14PreviewScope & { DEPLOYMENT_ENVIRONMENT?: string; PREVIEW_BROWSER_CLIENT_ID?: string; PREVIEW_BROWSER_ORIGIN?: string },
+  url: URL, identity: { common_name?: unknown; type?: unknown }, expectedDigest = viewerClientDigest,
+): Promise<boolean> {
+  if (!isIssue14Preview(env) || env.DEPLOYMENT_ENVIRONMENT !== 'staging' || env.PREVIEW_BROWSER_CLIENT_ID || env.PREVIEW_BROWSER_ORIGIN ||
+      url.origin !== 'https://status.sow.foo' || identity.type !== 'app' || typeof identity.common_name !== 'string') return false
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity.common_name))
+  const digest = [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+  return digest === expectedDigest
+}
 export function issue14PreviewEnvironment<T extends Issue14PreviewScope>(env: T): T {
   if (!isIssue14Preview(env)) return env
   // Deliberately remove the binding, even if one was supplied. The Action

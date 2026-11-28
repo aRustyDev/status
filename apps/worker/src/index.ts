@@ -16,7 +16,7 @@ import { checkFallback, FallbackConflictError, getFallback, publishFallback, sav
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 import { bootstrapPreviewUser } from './issue14-preview-user'
 import { ensureIssue14VaultFixture } from '../../gateway/issue14-vault-fixture'
-import { isIssue14Preview } from '../../gateway/issue14-preview'
+import { isIssue14Preview, isIssue14PreviewViewer } from '../../gateway/issue14-preview'
 
 interface Env extends EmailChannelEnv {
   API_SCOPE?: string
@@ -166,8 +166,10 @@ async function accessIdentity(request: Request, env: Env): Promise<AccessIdentit
   } catch { throw new HttpError(401, 'Invalid Access identity') }
   if (payload.common_name !== undefined) {
     const url = new URL(request.url)
-    if (env.DEPLOYMENT_ENVIRONMENT !== 'staging' || !env.PREVIEW_BROWSER_CLIENT_ID || payload.common_name !== env.PREVIEW_BROWSER_CLIENT_ID ||
-        payload.type !== 'app' || url.protocol !== 'https:' || url.origin !== env.PREVIEW_BROWSER_ORIGIN) {
+    if (typeof payload.common_name !== 'string') throw new HttpError(401, 'Invalid Access identity')
+    const configuredViewer = env.DEPLOYMENT_ENVIRONMENT === 'staging' && !!env.PREVIEW_BROWSER_CLIENT_ID && payload.common_name === env.PREVIEW_BROWSER_CLIENT_ID &&
+      payload.type === 'app' && url.protocol === 'https:' && url.origin === env.PREVIEW_BROWSER_ORIGIN
+    if (!configuredViewer && !await isIssue14PreviewViewer(env, url, { common_name: payload.common_name, type: payload.type })) {
       throw new HttpError(401, 'Invalid Access identity')
     }
     // A gateway identity subrequest is a GET even when the original request would mutate.
