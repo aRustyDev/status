@@ -77,6 +77,20 @@ export function activationIdentity(config, access) {
   }
 }
 
+// These optional protected environment variables let operators provision the
+// browser viewer without replacing the encrypted branch configuration.
+export function browserViewerSettings(settings, previewUrl, env) {
+  const origin = env.PREVIEW_BROWSER_ORIGIN || ''
+  const clientId = env.PREVIEW_BROWSER_CLIENT_ID || ''
+  if (!origin && !clientId) return settings
+  let url
+  try { url = new URL(origin) } catch { throw new Error('Invalid preview browser origin') }
+  if (!clientId || clientId.trim() !== clientId || /\s/.test(clientId) || url.protocol !== 'https:' || url.origin !== origin || url.origin !== previewUrl.origin) {
+    throw new Error('Invalid preview browser viewer settings')
+  }
+  return { ...settings, previewBrowserOrigin: origin, previewBrowserClientId: clientId }
+}
+
 export async function main(env = process.env) {
   const action = text(env.PREVIEW_ACTION, 'preview action')
   if (action === 'reconcile') return reconcile(env)
@@ -110,9 +124,9 @@ export async function main(env = process.env) {
   const access = object(secrets.accessHeaders, 'Access headers')
   if (Object.keys(access).length === 0 || Object.values(access).some(value => typeof value !== 'string' || !value)) throw new Error('Invalid Access headers')
   const selectedSettings = object(object(config.environments, 'environment configuration')[fixture.environment], 'selected preview environment')
-  const settings = settingsForFixture(selectedSettings, fixture)
   const previewUrl = new URL(text(config.previewUrl, 'preview URL'))
   if (previewUrl.protocol !== 'https:' || previewUrl.username || previewUrl.password) throw new Error('Invalid preview URL')
+  const settings = browserViewerSettings(settingsForFixture(selectedSettings, fixture), previewUrl, env)
   const executionFence = await initializeExecutionFenceIfNeeded({ store, ref, fixtureEnabled:fixture.enabled || fixture.isolatedFallback, createFence:() => createCloudflareExecutionFence({ accountId, databaseId: text(config.inventoryDatabaseId, 'inventory database'), token }) })
   const branches = githubBranches({ repository: text(env.PREVIEW_SOURCE_REPOSITORY || env.GITHUB_REPOSITORY, 'GitHub repository'), defaultBranch: env.PREVIEW_DEFAULT_BRANCH || 'main', dispatchRepository: env.GITHUB_REPOSITORY, dispatchToken: env.GH_TOKEN, dispatchBranch: env.PREVIEW_HOST_BRANCH || 'main', token: text(env.PREVIEW_SOURCE_TOKEN || env.GH_TOKEN, 'GitHub token'), apiUrl: env.GITHUB_API_URL })
   const root = fileURLToPath(new URL('../', import.meta.url))
