@@ -28,6 +28,10 @@ Open a preview enrollment confirmation link in a browser using that slot's selec
 
 Release and expiry do not delete preview subscription data. For intentional cleanup, identify the old lease selector from its protected deployment record and calculate its SHA-256 locally. Confirm that the scope is no longer in `preview_subscriber_leases`, that no delivery for that scope is `sending`, and that its data is no longer needed. Then remove only rows matching that exact scope from `preview_subscriber_deliveries`, `preview_subscribers`, and `preview_subscription_settings`, in that order. Do not remove other scopes or baseline subscriber tables. Coordinate cleanup with the slot owner; pending deliveries will be discarded by this deletion.
 
+## Browser viewer identity
+
+The staging operations, status, and monitoring API Workers accept a dedicated Access service token for viewer requests when their trusted deployment sets `DEPLOYMENT_ENVIRONMENT=staging`, `PREVIEW_BROWSER_ORIGIN` to the exact HTTPS origin, and `PREVIEW_BROWSER_CLIENT_ID` to its client ID. In each protected branch environment or manual slot configuration, use `previewBrowserOrigin` and `previewBrowserClientId` to populate new releases. The staging deployment templates set the environment marker. Keep the client secret in the launcher's secret store. The deployment-verification token has a separate purpose and identity.
+
 ## Branch preview controller prerequisites
 
 Branch automation remains disabled until the repository variable `PREVIEW_AUTO_ENABLED` is set to `true`. The implementation requires a dedicated D1 control database with `.github/actions/branch-previews/src/release-inventory.sql` applied, a private dispatcher bound to the authenticated baseline gateway, a Flagship app, and Cloudflare permissions to create and manage the branch Workers, schema D1 databases and flags. The current slot-scoped token does not necessarily grant these permissions. A protected GitHub environment must restrict the deployment job to trusted main-branch controller code.
