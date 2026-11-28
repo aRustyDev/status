@@ -15,13 +15,16 @@ type FixtureEnv = {
   PREVIEW_RELEASE?: string
   VAULT_ENCRYPTION_KEY?: string
 }
-type Actor = { id: string; role: string; version: number }
+type Actor = { id: string; role: string; version: number; previewBrowser?: true }
 
 /** Initialize once only, after an authorized admin has been authenticated. */
 export async function ensureIssue14VaultFixture(env: FixtureEnv, actor: Actor): Promise<boolean> {
-  if (!isIssue14Preview(env) || actor.role !== 'admin') return false
+  if (!isIssue14Preview(env)) return false
+  // This marker exists only after the caller verifies the Access app JWT.
+  const testViewer = actor.id === 'preview-browser' && actor.role === 'viewer' && actor.previewBrowser === true
+  if (!testViewer && actor.role !== 'admin') return false
   try {
-    const authorized = await env.DB.prepare("SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?").bind(actor.id, actor.version).first()
+    const authorized = testViewer || await env.DB.prepare("SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?").bind(actor.id, actor.version).first()
     if (!authorized) return false
     const existing = await env.DB.prepare('SELECT entity_id FROM audit_events WHERE id=?').bind(marker).first()
     if (existing) return true
@@ -43,7 +46,7 @@ export async function ensureIssue14VaultFixture(env: FixtureEnv, actor: Actor): 
       env.DB.prepare(`INSERT OR IGNORE INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details)
         SELECT ?, 'preview-fixture@invalid', 'initialize', 'preview_fixture', ?, ?, '{}'
         WHERE NOT EXISTS (SELECT 1 FROM vaults) AND NOT EXISTS (SELECT 1 FROM vault_secrets)
-          AND EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?)`).bind(marker, runId, now, actor.id, actor.version),
+          AND (?=1 OR EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?))`).bind(marker, runId, now, testViewer ? 1 : 0, actor.id, actor.version),
       env.DB.prepare(`INSERT INTO vaults (id,name,created_at,updated_at)
         SELECT ?, 'Issue 14 isolated preview', ?, ? WHERE EXISTS (SELECT 1 FROM audit_events WHERE id=? AND entity_id=?)`).bind(vaultId, now, now, marker, runId),
       env.DB.prepare(`INSERT INTO vault_secrets (id,vault_id,name,type,ciphertext,nonce,created_at,updated_at)

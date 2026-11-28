@@ -23,6 +23,27 @@ beforeEach(()=>{
  })
 })
 describe('Cloudflare actions',()=>{
+ it('lets a preview viewer inspect the editor without enabling mutation',async()=>{
+  const client=new QueryClient({defaultOptions:{queries:{retry:false}}})
+  vi.mocked(api.get).mockImplementation(async path=>{
+   if(path==='/admin/actions') return [action]
+   if(path==='/admin/actions/destinations') return [{id:'issue14-isolated-sink',name:'Issue 14 isolated sink'}]
+   if(path==='/admin/actions/checks') return [{id:checkId,name:'Service',componentId:'component',configVersion:7}]
+   if(path==='/admin/vaults') return [{id:1,name:'Operations'}]
+   if(path==='/admin/vaults/1/secrets') return [{id:2,name:'Token',type:'value'}]
+   return []
+  })
+  render(<MemoryRouter><QueryClientProvider client={client}><CapabilitiesContext.Provider value={{supportedRoutes:[]}}><CloudflareActions readOnly /></CapabilitiesContext.Provider></QueryClientProvider></MemoryRouter>)
+  const user=userEvent.setup()
+  expect(await screen.findByText(/Read-only isolated preview/)).toHaveTextContent('Saving and Action execution are disabled')
+  expect(await screen.findByRole('button',{name:'Delete action Recover'})).toBeDisabled()
+  await user.click(screen.getByRole('button',{name:'Edit'}))
+  const form=screen.getByRole('dialog')
+  await user.clear(within(form).getByLabelText('Action name'))
+  await user.type(within(form).getByLabelText('Action name'),'Inspect only')
+  expect(within(form).getByRole('button',{name:'Save Action'})).toBeDisabled()
+  expect(api.patch).not.toHaveBeenCalled()
+ })
  it('warns when the isolated fixture destination is configured',async()=>{
   vi.mocked(api.get).mockImplementation(async path=>path==='/admin/actions/destinations'?[{id:'issue14-isolated-sink',name:'Issue 14 isolated sink'}]:[])
   setup()

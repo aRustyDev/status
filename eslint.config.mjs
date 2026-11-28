@@ -38,7 +38,7 @@ export default tseslint.config(
     },
   },
   // Maintenance scripts run in Node.
-  { files: ['scripts/**/*.mjs', '.github/actions/branch-previews/**/*.mjs'], languageOptions: { globals: { ...globals.node } } },
+  { files: ['scripts/**/*.mjs', '.agents/skills/preview-browser/scripts/**/*.mjs', '.github/actions/branch-previews/**/*.mjs', '.github/workflows/branch-previews/**/*.mjs'], languageOptions: { globals: { ...globals.node } } },
   {
     files: ['scripts/attestation-recovery/**/*.cjs'],
     languageOptions: { globals: { ...globals.node } },

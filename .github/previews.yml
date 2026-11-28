@@ -12,10 +12,11 @@
   },
   "compatibilityDate": "2026-11-23",
   "smokePath": "/",
-  "launcher": "scripts/preview-browser.mjs",
+  "launcher": ".github/actions/branch-previews/preview-browser.mjs",
   "schemaSubscriber": {
     "entry": "apps/worker/src/preview-subscriber-scheduler.ts"
   },
+  "fixtures": { "casEntry": "apps/probe/src/cas-worker.ts", "subscriberEntry": "apps/worker/src/preview-subscriber-scheduler.ts" },
   "database": {
     "migrations": "apps/worker/migrations",
     "seed": ".github/previews/seed.sql"
@@ -74,10 +75,15 @@
       "fromSettings": {
         "ACCESS_TEAM_DOMAIN": "accessTeamDomain",
         "ACCESS_AUD": "accessAud",
+        "PREVIEW_BROWSER_ORIGIN": "previewBrowserOrigin",
+        "PREVIEW_BROWSER_CLIENT_ID": "previewBrowserClientId",
         "ENDPOINTS": "endpoints"
       },
       "services": {},
       "vars": {
+        "DEPLOYMENT_ENVIRONMENT": "staging",
+        "PREVIEW_BROWSER_ORIGIN": "",
+        "PREVIEW_BROWSER_CLIENT_ID": "",
         "API_SCOPE": "operations",
         "PREVIEW_SUBSCRIBER_REQUIRED": "true",
         "SUBSCRIBERS_READY": "false",
@@ -95,10 +101,15 @@
       "fromSettings": {
         "ACCESS_TEAM_DOMAIN": "accessTeamDomain",
         "ACCESS_AUD": "accessAud",
+        "PREVIEW_BROWSER_ORIGIN": "previewBrowserOrigin",
+        "PREVIEW_BROWSER_CLIENT_ID": "previewBrowserClientId",
         "ENDPOINTS": "endpoints"
       },
       "services": {},
       "vars": {
+        "DEPLOYMENT_ENVIRONMENT": "staging",
+        "PREVIEW_BROWSER_ORIGIN": "",
+        "PREVIEW_BROWSER_CLIENT_ID": "",
         "API_SCOPE": "status",
         "PREVIEW_SUBSCRIBER_REQUIRED": "true",
         "SUBSCRIBERS_READY": "false",
@@ -116,12 +127,17 @@
       "fromSettings": {
         "ACCESS_TEAM_DOMAIN": "accessTeamDomain",
         "ACCESS_AUD": "accessAud",
+        "PREVIEW_BROWSER_ORIGIN": "previewBrowserOrigin",
+        "PREVIEW_BROWSER_CLIENT_ID": "previewBrowserClientId",
         "ENDPOINTS": "endpoints"
       },
       "services": {
         "PROBE": "probe"
       },
       "vars": {
+        "DEPLOYMENT_ENVIRONMENT": "staging",
+        "PREVIEW_BROWSER_ORIGIN": "",
+        "PREVIEW_BROWSER_CLIENT_ID": "",
         "API_SCOPE": "monitoring",
         "PREVIEW_SUBSCRIBER_REQUIRED": "true",
         "SUBSCRIBERS_READY": "false",

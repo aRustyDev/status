@@ -6,8 +6,8 @@ import { deleteOwnedDatabase } from './database.mjs'
 
 // All callers share the deployment workflow's concurrency group. A timed-out
 // flag update stays in the inventory's disabling phase for operator recovery.
-export function createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars = {}, directory, run, databaseConfig, databaseAdapter, fetcher = fetch, now = Date.now, drainMs = 3600_000, subscriberFence }) {
-  if (!accountId || !appId || !token || !store || !dispatcherName || !dispatcherSource || !directory || typeof run !== 'function' || !databaseConfig || !databaseAdapter || !Number.isSafeInteger(drainMs) || drainMs < 3600_000) throw new Error('Invalid retirement configuration')
+export function createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars = {}, directory, run, databaseConfig, databaseAdapter, fetcher = fetch, now = Date.now, drainMs = 0, subscriberFence, executionFence }) {
+  if (!accountId || !appId || !token || !store || !dispatcherName || !dispatcherSource || !directory || typeof run !== 'function' || !databaseConfig || !databaseAdapter || !Number.isSafeInteger(drainMs) || drainMs < 0) throw new Error('Invalid retirement configuration')
   const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`
   async function request(url, method = 'GET', body) {
     const response = await fetcher(url, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) })
@@ -21,16 +21,38 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
   const flagUrl = ref => `${base}/flagship/apps/${encodeURIComponent(appId)}/flags/${installation().flagPrefix}branch-${branchKey(ref)}`
   async function disableFlag({ ref, selector }) {
     const snapshot = await store.read(ref)
-    for (const release of [snapshot?.record?.active, snapshot?.record?.previous, ...(snapshot?.record?.retained || [])].filter(Boolean)) {
+    const releases = [snapshot?.record?.active, snapshot?.record?.previous, ...(snapshot?.record?.retained || [])].filter(Boolean)
+    const errors = []
+    let retiringRelease = null
+    if (executionFence) {
+      try {
+        if (!snapshot?.record || snapshot.record.selector !== selector) throw new Error('Preview inventory changed before retirement')
+        const active = snapshot.record.active
+        const state = await executionFence.readState(selector)
+        if (releases.some(release => release?.resources?.workers?.fence) && !state) throw new Error('Recorded fixture release has no execution fence')
+        if (state && state.activeRelease !== (active?.sha ?? null) && !(state.state === 'draining' && state.activeRelease === null)) throw new Error('Execution fence does not match preview inventory')
+        retiringRelease = await executionFence.beginRetirement(selector)
+      } catch (error) { errors.push(error.message) }
+    } else if (releases.some(release => release?.resources?.workers?.fence)) {
+      errors.push('Missing execution fence')
+    }
+    for (const release of releases) {
       if (release.resources?.workers?.subscriber) {
-        if (!subscriberFence) throw new Error('Missing schema subscriber fence')
-        await subscriberFence.revoke({ref, selector, release})
+        try {
+          if (!subscriberFence) throw new Error('Missing schema subscriber fence')
+          await subscriberFence.revoke({ref, selector, release})
+        } catch (error) { errors.push(error.message) }
       }
     }
+    if (errors.length) throw new Error(errors.join('; '))
     const flag = await request(flagUrl(ref))
-    if (!flag) return
+    if (!flag) {
+      if (executionFence) await executionFence.finishRetirement(selector, retiringRelease)
+      return
+    }
     if (flag.default_variation !== 'current' || flag.rules?.length || !flag.variations?.current || (flag.variations.current.selector !== selector && Object.keys(flag.variations.current).length !== 0)) throw new Error('Unexpected Flagship state before retirement')
     await request(flagUrl(ref), 'PUT', { key: installation().flagPrefix + 'branch-' + branchKey(ref), enabled: true, default_variation: 'current', rules: [], variations: { current: {} } })
+    if (executionFence) await executionFence.finishRetirement(selector, retiringRelease)
   }
   return {
     disableFlag,
@@ -68,29 +90,47 @@ export function createRetirementAdapter({ accountId, appId, token, store, dispat
       await run(['deploy', '--dry-run', '--config', configPath])
       await run(['deploy', '--config', configPath])
     },
-    async deleteOwnedResources({ ref, release }) {
+    async deleteOwnedResources({ ref, release, deferReservationCleanup = false }) {
       const selector = `branch-${branchKey(ref)}`
       if (!/^[a-f0-9]{40}$/.test(release.sha)) throw new Error('Invalid release SHA')
       const stem = installation().workerStem(selector, release.sha)
       const suffixes = Object.fromEntries(Object.entries(installation().manifest.components).map(([key, component]) => [key, component.suffix]))
       const workers = release.resources?.workers
+      if (workers?.subscriber && workers?.fixture) throw new Error('Conflicting legacy and isolated subscriber resources')
       if (workers?.subscriber) suffixes.subscriber = 'subscriber'
+      // Optional private fixtures are owned only when their deterministic names
+      // were recorded as part of this release. Never accept arbitrary extras.
+      if (workers?.fixture) suffixes.fixture = 'fixture'
+      if (workers?.cas && workers?.fixture) suffixes.cas = 'cas'
+      if (workers?.fence && workers?.fixture) suffixes.fence = 'fence'
+      if (workers?.probeScheduler && workers?.fence && workers?.fixture) suffixes.probeScheduler = 'probe-scheduler'
+      if (workers?.mailer && workers?.fence && workers?.fixture) suffixes.mailer = 'mailer'
+      if (workers?.subscriberFeature && workers?.mailer && workers?.fence && workers?.fixture) suffixes.subscriberFeature = 'subscriber-feature'
+      if (workers?.subscriberScheduler && workers?.subscriberFeature && workers?.mailer && workers?.fence && workers?.fixture) suffixes.subscriberScheduler = 'subscriber-scheduler'
+      if (workers?.authorization && workers?.mailer && workers?.fence && workers?.fixture) suffixes.authorization = 'authorization'
       if (!workers || Object.keys(workers).length !== Object.keys(suffixes).length || Object.entries(suffixes).some(([key, suffix]) => workers[key] !== `${stem}-${suffix}`) || release.resources.gateway !== workers.gateway) throw new Error('Worker ownership verification failed')
+      if (workers.fence && (!executionFence || typeof executionFence.assertReleaseQuiescent !== 'function' || typeof executionFence.deleteReleaseReservations !== 'function')) throw new Error('Missing execution fence for fixture cleanup')
+      if (workers.mailer && !deferReservationCleanup && release.resources.database?.owned !== true) throw new Error('Missing owned preview database for reservation cleanup')
+      if (workers.fence) await executionFence.assertReleaseQuiescent(selector, release.sha)
       // Delete in reverse service dependency order. Never use force.
-      for (const key of Object.keys(suffixes).reverse()) await request(`${base}/workers/scripts/${encodeURIComponent(workers[key])}`, 'DELETE')
+      const order = (workers.subscriber ? ['subscriber'] : []).concat(workers.subscriberScheduler ? ['subscriberScheduler'] : [], workers.probeScheduler ? ['probeScheduler'] : [], Object.keys(installation().manifest.components).reverse(), workers.subscriberFeature ? ['subscriberFeature'] : [], workers.authorization ? ['authorization'] : [], workers.mailer ? ['mailer'] : [], workers.cas ? ['cas'] : [], workers.fixture ? ['fixture'] : [], workers.fence ? ['fence'] : [])
+      for (const key of order) await request(`${base}/workers/scripts/${encodeURIComponent(workers[key])}`, 'DELETE')
       for (const database of [release.resources.database, release.resources.validationDatabase]) {
         if (database?.owned) await deleteOwnedDatabase({ database, config: databaseConfig, adapter: databaseAdapter, ref, sha: release.sha })
       }
+      if (workers.mailer && !deferReservationCleanup) await executionFence.deleteReleaseReservations(selector, release.sha)
     },
     async deleteAbandonedResources({ ref, release }) {
       const resources = release.resources || {}
-      if (resources.workers) await this.deleteOwnedResources({ ref, release: { ...release, resources: { ...resources, database: null, validationDatabase: null } } })
+      if (resources.workers) await this.deleteOwnedResources({ ref, release: { ...release, resources: { ...resources, database: null, validationDatabase: null } }, deferReservationCleanup:true })
       for (const database of [resources.database, resources.validationDatabase]) {
         if (database?.owned) await deleteOwnedDatabase({ database, config: databaseConfig, adapter: databaseAdapter, ref, sha: release.sha })
       }
       // Intent alone is not proof of a database's identity. Keep the record
       // for an operator rather than deleting a potentially unrelated D1.
-      return { unresolved: Boolean((resources.databaseIntent && !resources.database) || (resources.validationDatabaseIntent && !resources.validationDatabase)) }
+      const unresolved = Boolean((resources.databaseIntent && !resources.database) || (resources.validationDatabaseIntent && !resources.validationDatabase))
+      if (!unresolved && resources.workers?.mailer) await executionFence.deleteReleaseReservations(`branch-${branchKey(ref)}`, release.sha)
+      return { unresolved }
     },
   }
 }

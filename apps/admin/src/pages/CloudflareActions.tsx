@@ -15,7 +15,7 @@ type Vault = {id:number;name:string}
 type Secret = {id:number;name:string;type:string}
 type Delivery = {actionId:string;checkId:string;status:string;state:string;updatedAt:number}
 
-export default function CloudflareActions() {
+export default function CloudflareActions({readOnly=false}: {readOnly?:boolean}) {
   const capabilities = useCapabilities()
   const qc=useQueryClient(), [editing,setEditing]=useState<Action|'new'|null>(null), [removing,setRemoving]=useState<Action|null>(null)
   const [busy,setBusy]=useState(false), [message,setMessage]=useState('')
@@ -40,7 +40,7 @@ export default function CloudflareActions() {
       <button type="button" className="btn btn-primary" onClick={() => setEditing('new')}><span className="material-symbols-outlined" aria-hidden="true">add</span> Add Action</button>
     </>} />
     {destinations.data?.some(destination => destination.id === 'issue14-isolated-sink')
-      ? <Alert tone="warning">Isolated preview for editor testing only. Actions do not execute here. Use only synthetic Vault values; do not enter real secrets.</Alert>
+      ? <Alert tone="warning">{readOnly ? 'Read-only isolated preview for editor testing. Saving and Action execution are disabled. Use only synthetic Vault values; do not enter real secrets.' : 'Isolated preview for editor testing only. Actions do not execute here. Use only synthetic Vault values; do not enter real secrets.'}</Alert>
       : <Alert tone="info">Actions send approved HTTPS requests using Vault credentials. Link actions to monitors and configure delays and cooldowns in the monitor editor. Each event is attempted at most once.</Alert>}
     {message && !removing && <p role="alert">{message}</p>}
     {actions.isLoading ? <LoadingState label="Loading actions…" /> : actions.isError ? <ErrorState message="Could not load actions." onRetry={() => void actions.refetch()} /> :
@@ -63,7 +63,7 @@ export default function CloudflareActions() {
               <td className="px-4 py-3">{action.enabled ? 'Enabled' : 'Disabled'}</td>
               <td className="px-4 py-3 text-right"><div className="flex justify-end gap-2">
                 <button type="button" className="btn btn-secondary btn-sm" onClick={() => setEditing(action)}>Edit</button>
-                <button type="button" className="btn-icon" aria-label={`Delete action ${action.name}`} onClick={() => { setMessage(''); setRemoving(action) }}>×</button>
+                <button type="button" className="btn-icon" disabled={readOnly} aria-label={`Delete action ${action.name}`} onClick={() => { setMessage(''); setRemoving(action) }}>×</button>
               </div></td>
             </tr>)}
           </tbody>
@@ -74,12 +74,12 @@ export default function CloudflareActions() {
       {deliveries.data?.length===0 && <p>No action runs yet.</p>}
       {deliveries.data?.map((delivery,index)=><p key={`${delivery.actionId}-${delivery.checkId}-${delivery.updatedAt}-${index}`} className="text-sm">{actions.data?.find(c=>c.id===delivery.actionId)?.name ?? 'Action'}: {delivery.status}, {delivery.state}</p>)}
     </section>
-    {editing && <ActionForm action={editing==='new'?null:editing} onClose={()=>setEditing(null)} onSaved={async()=>{setEditing(null);await qc.invalidateQueries({queryKey:['worker-actions']})}} />}
+    {editing && <ActionForm readOnly={readOnly} action={editing==='new'?null:editing} onClose={()=>setEditing(null)} onSaved={async()=>{setEditing(null);await qc.invalidateQueries({queryKey:['worker-actions']})}} />}
     {removing && <ConfirmModal title="Delete action" message={`Delete "${removing.name}"? Its pending runs and history will also be removed.${message ? ` ${message}` : ''}`} confirmLabel="Delete" pending={busy} pendingLabel="Deleting…" onConfirm={() => void remove()} onCancel={() => { if (!busy) setRemoving(null) }} />}
   </PageContainer>
 }
 
-function ActionForm({action,onClose,onSaved}:{action:Action|null;onClose:()=>void;onSaved:()=>Promise<void>}) {
+function ActionForm({action,onClose,onSaved,readOnly}:{action:Action|null;onClose:()=>void;onSaved:()=>Promise<void>;readOnly:boolean}) {
   const titleId = useId()
   const [name,setName]=useState(action?.name??''), [endpointId,setEndpointId]=useState(action?.endpointId??''), [vaultId,setVaultId]=useState(action?.vaultId??0), [secretId,setSecretId]=useState(action?.secretId??0)
   const [triggerStatus,setTriggerStatus]=useState(action?.triggerStatus??'down')
@@ -123,5 +123,5 @@ function ActionForm({action,onClose,onSaved}:{action:Action|null;onClose:()=>voi
       {checkIds.filter(id=>checks.isFetchedAfterMount && !checks.isError && !checks.data?.some(check=>check.id===id)).map(id=><p key={id} role="alert">A selected monitor is unavailable. <button type="button" className="underline" onClick={()=>{setCheckIds(current=>current.filter(value=>value!==id));setCheckSnapshots(current=>current.filter(snapshot=>snapshot.id!==id))}}>Remove unavailable monitor</button></p>)}
     </fieldset>
     {(destinations.isError||checks.isError||vaults.isError||secrets.isError) && <p role="alert">Could not load action choices. Close and try again.</p>}{error && <p role="alert">{error}</p>}
-  </div></fieldset><ModalFooter><button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="btn btn-primary" disabled={busy||!checks.isFetchedAfterMount||checks.isError||missingCheckSnapshots.length>0||destinations.isLoading||destinations.isError||vaults.isLoading||vaults.isError||secrets.isLoading||secrets.isError||!endpointId||!vaultId||!secretId}>{action?'Save Action':'Create Action'}</button></ModalFooter></form></div></ModalShell>
+  </div></fieldset><ModalFooter><button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="btn btn-primary" disabled={readOnly||busy||!checks.isFetchedAfterMount||checks.isError||missingCheckSnapshots.length>0||destinations.isLoading||destinations.isError||vaults.isLoading||vaults.isError||secrets.isLoading||secrets.isError||!endpointId||!vaultId||!secretId}>{action?'Save Action':'Create Action'}</button></ModalFooter></form></div></ModalShell>
 }

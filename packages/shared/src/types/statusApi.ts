@@ -1,7 +1,7 @@
 /**
  * Public, read-only status API (`/api/v1/public/summary.json`, `/api/v1/public/components.json`).
  * Field names are part of a public contract — change them only together with the "Status API"
- * section of docs/subscriptions.md.
+ * section of docs/src/subscriptions.md.
  */
 
 export type ApiPageStatus = 'operational' | 'has_issues' | 'under_maintenance'

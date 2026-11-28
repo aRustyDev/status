@@ -1,6 +1,0 @@
-services:
-  app:
-    image: better-status-page:local
-    build:
-      context: .
-    pull_policy: never

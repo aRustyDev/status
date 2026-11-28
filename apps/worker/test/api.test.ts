@@ -79,6 +79,7 @@ const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
 let sign: (subject: string, email: string, aud?: string, expires?: string) => Promise<string>
+let signService: (clientId: string, aud?: string, expires?: string, type?: string) => Promise<string>
 let adminToken: string, operatorToken: string, viewerToken: string
 
 async function request(path: string, token?: string, method = 'GET', body?: unknown, origin = 'https://status.example', idempotencyKey?: string, idempotencyActor?: string) {
@@ -146,6 +147,7 @@ before(async () => {
     return Response.json({ keys: available })
   }
   sign = (subject, email, aud = audience, expires = '5m') => new SignJWT({ email }).setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).setIssuer(issuer).setAudience(aud).setSubject(subject).setIssuedAt().setExpirationTime(expires).sign(keys.privateKey)
+  signService = (clientId, aud = audience, expires = '5m', type = 'app') => new SignJWT({ common_name: clientId, type }).setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).setIssuer(issuer).setAudience(aud).setSubject('').setIssuedAt().setExpirationTime(expires).sign(keys.privateKey)
   adminToken = await sign('admin-id', 'admin@example.com')
   operatorToken = await sign('operator-id', 'operator@example.com')
   viewerToken = await sign('viewer-id', 'viewer@example.com')
@@ -180,6 +182,94 @@ test('preview identity verification authenticates without reading or writing use
   assert.equal((await verify(await sign('expired', 'expired@example.com', audience, '-1m'))).status, 401)
   assert.equal((await verify(await sign('missing-email', ''))).status, 401)
   assert.equal((await verify(newIdentity, 'POST')).status, 405)
+})
+
+test('the preview browser is a read-only viewer on its configured origin through both gateways', async () => {
+  const origin = 'https://status.example'
+  const clientId = 'preview-browser.access'
+  const token = await signService(clientId)
+  const selector = 'branch-' + 'a'.repeat(24)
+  const release = 'b'.repeat(40)
+  const settings = { ...env, DEPLOYMENT_ENVIRONMENT: 'staging', PREVIEW_BROWSER_ORIGIN: origin, PREVIEW_BROWSER_CLIENT_ID: clientId }
+  const api = { fetch: (req: Request) => {
+    assert.equal(req.headers.has('CF-Access-Client-Secret'), false)
+    assert.equal(req.headers.has('CF-Access-Client-Id'), false)
+    return worker.fetch(req, settings as never)
+  } }
+  const target = { API: api, STATUS_API: api, MONITORING_API: api, STATUS_UI: env.ASSETS, PREVIEW_SELECTOR: selector, PREVIEW_RELEASE: release }
+  let dispatches = 0
+  const baseline = {
+    API: { fetch: (req: Request) => worker.fetch(req, { ...settings, DB: { prepare() { throw new Error('Baseline D1 was accessed') } } } as never) },
+    PREVIEW_DISPATCHER: { fetch: async (req: Request) => {
+      dispatches++
+      const headers = new Headers(req.headers)
+      headers.set('X-Status-Preview-Release', release)
+      const response = await gateway.fetch(new Request(req, { headers }), target as never)
+      const resultHeaders = new Headers(response.headers)
+      resultHeaders.set('X-Status-Preview-Commit', release)
+      return new Response(response.body, { status: response.status, headers: resultHeaders })
+    } },
+  }
+  const makeRequest = (path: string, method = 'GET') => new Request(origin + path, {
+    method, headers: { 'Cf-Access-Jwt-Assertion': token, 'CF-Access-Client-Secret': 'fixture', 'CF-Access-Client-Id': clientId, 'X-Status-Preview': selector, 'X-Status-Identity-Method': 'GET', accept: 'text/html' },
+  })
+  for (const path of ['/', '/asset.js', '/api/v1/auth/me', '/api/v1/bsp/public/status']) {
+    const response = await gateway.fetch(makeRequest(path), baseline as never)
+    assert.equal(response.status, 200, path)
+    assert.equal(response.headers.get('X-Status-Preview-Commit'), release)
+    if (path === '/api/v1/auth/me') {
+      const user = await response.json() as {id: string; role: string}
+      assert.equal(user.id, 'preview-browser')
+      assert.equal(user.role, 'viewer')
+    }
+  }
+  assert.equal((await gateway.fetch(makeRequest('/admin/'), baseline as never)).status, 403)
+  const beforeWrites = dispatches
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+    assert.equal((await gateway.fetch(makeRequest('/api/v1/admin/components', method), baseline as never)).status, 403)
+    assert.equal((await worker.fetch(makeRequest('/api/v1/admin/components', method), settings as never)).status, 403)
+  }
+  assert.equal(dispatches, beforeWrites)
+  assert.equal(await db.prepare('SELECT id FROM users WHERE subject=?').bind(clientId).first(), null)
+  const check = (jwt: string, url = origin, config: object = settings) => worker.fetch(new Request(url + '/api/v1/auth/me', { headers: { 'Cf-Access-Jwt-Assertion': jwt } }), config as never)
+  for (const rejected of [await signService('deployment-probe.access'), await signService(clientId, 'other'), await signService(clientId, audience, '-1m'), await signService(clientId, audience, '5m', 'org'), 'invalid']) {
+    assert.equal((await check(rejected)).status, 401)
+  }
+  assert.equal((await check(token, origin, env)).status, 401)
+  assert.equal((await check(token, origin, { ...settings, DEPLOYMENT_ENVIRONMENT: 'production' })).status, 401)
+  assert.equal((await check(token, 'https://production.example')).status, 401)
+  assert.equal((await check(token, 'http://status.example', { ...settings, PREVIEW_BROWSER_ORIGIN: 'http://status.example' })).status, 401)
+})
+
+test('only the isolated preview viewer can inspect the Actions editor without gaining write access', async () => {
+  const clientId = 'preview-browser.access'
+  const token = await signService(clientId)
+  const selector = 'branch-aab9808167c122b4aad83da7'
+  const release = 'b'.repeat(40)
+  const settings = { ...env, API_SCOPE: 'operations', PREVIEW_SUBSCRIBER_REQUIRED: 'true', PREVIEW_SUBSCRIBER_SCOPE: '737597c9ba1d3cc17826ea2f2b48a9d259e03dbf1acd241dc62d886da5c20511', PREVIEW_RELEASE: release, DEPLOYMENT_ENVIRONMENT: 'staging', PREVIEW_BROWSER_ORIGIN: 'https://status.example', PREVIEW_BROWSER_CLIENT_ID: clientId, VAULT_ENCRYPTION_KEY: 'ab'.repeat(32), ACTIONS_READY: 'true', ACTION_ENDPOINTS: JSON.stringify([{id:'sink',name:'Sink',url:'https://sink.invalid/',binding:'ABSENT',serviceId:'sink'}]) }
+  const fetchApi = (path:string, method = 'GET', config:object = settings) => worker.fetch(new Request('https://status.example' + path, {method,headers:{'Cf-Access-Jwt-Assertion':token,origin:'https://status.example'}}), config as never)
+  try {
+    const identity = await (await fetchApi('/api/v1/auth/me')).json() as {id:string;role:string;previewActionsEditor?:boolean}
+    assert.equal(identity.id, 'preview-browser'); assert.equal(identity.role, 'viewer'); assert.equal(identity.previewActionsEditor, true)
+    for (const path of ['/api/v1/bsp/admin/actions','/api/v1/bsp/admin/actions/destinations','/api/v1/bsp/admin/actions/checks','/api/v1/bsp/admin/actions/runs','/api/v1/bsp/admin/vaults','/api/v1/bsp/admin/vaults/238010605399733/secrets']) assert.equal((await fetchApi(path)).status,200,path)
+    for (const path of ['/api/v1/bsp/admin/vaults/1/secrets','/api/v1/bsp/admin/vaults/238010605399733/secrets/218386432287168','/api/v1/bsp/admin/actions/monitor/00000000-0000-4000-8000-000000000001','/api/v1/bsp/admin/actions/../users','/api/v1/bsp/admin/users']) assert.equal((await fetchApi(path)).status,403,path)
+    for (const method of ['POST','PATCH','DELETE']) assert.equal((await fetchApi('/api/v1/bsp/admin/actions', method)).status,403)
+    const otherScope = { ...settings, PREVIEW_SUBSCRIBER_SCOPE: 'wrong' }
+    assert.equal((await fetchApi('/api/v1/bsp/admin/actions','GET',otherScope)).status,403)
+    const otherIdentity = await (await fetchApi('/api/v1/auth/me','GET',otherScope)).json() as {previewActionsEditor?:boolean}
+    assert.equal(otherIdentity.previewActionsEditor,undefined)
+    const target = { API:{fetch:(req:Request)=>worker.fetch(req,settings as never)}, ADMIN_UI:env.ASSETS, STATUS_UI:env.ASSETS, PREVIEW_SELECTOR:selector, PREVIEW_RELEASE:release }
+    const navigation = (path:string) => new Request('https://status.example'+path,{headers:{'Cf-Access-Jwt-Assertion':token,'X-Status-Preview':selector,'X-Status-Preview-Release':release,accept:'text/html'}})
+    assert.equal((await gateway.fetch(navigation('/admin/actions'),target as never)).status,200)
+    assert.equal((await gateway.fetch(navigation('/admin/assets/app.js'),target as never)).status,200)
+    assert.equal((await gateway.fetch(navigation('/admin/users'),target as never)).status,403)
+    assert.equal(await db.prepare('SELECT id FROM users WHERE subject=?').bind(clientId).first(),null)
+  } finally {
+    await db.prepare('DELETE FROM vault_secrets WHERE id=218386432287168').run()
+    await db.prepare('DELETE FROM vaults WHERE id=238010605399733').run()
+    await db.prepare('DELETE FROM vault_key_verifier').run()
+    await db.prepare("DELETE FROM audit_events WHERE id='issue14-isolated-vault-fixture-v1'").run()
+  }
 })
 
 test('gateway checks authenticated preview navigation and API requests without touching baseline D1', async () => {

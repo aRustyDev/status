@@ -25,8 +25,14 @@ export function validateManifest(m) {
   if (!branches.length || branches.some(([key,value]) => !/^[a-z][a-z0-9-]*$/.test(key) || !['dev','stage','schema'].includes(value))) throw new Error('Invalid branch policy')
   relativePath(m.database?.migrations)
   relativePath(m.database?.seed)
+  if (m.fixtures?.casEntry) relativePath(m.fixtures.casEntry)
+  if (m.fixtures?.subscriberEntry) relativePath(m.fixtures.subscriberEntry)
   if (!Array.isArray(m.build) || m.build.some(cmd => !Array.isArray(cmd) || !cmd.length || cmd.some(arg => typeof arg !== 'string' || !arg))) throw new Error('Invalid build commands')
   if (!/^\d{4}-\d{2}-\d{2}$/.test(m.compatibilityDate || '')) throw new Error('Invalid compatibility date')
+  if (m.retirementDelaySeconds !== undefined &&
+      (!Number.isSafeInteger(m.retirementDelaySeconds) || m.retirementDelaySeconds < 0 || m.retirementDelaySeconds > Math.floor(Number.MAX_SAFE_INTEGER / 1000))) {
+    throw new Error('Invalid preview retirement delay')
+  }
   const seen = new Set(), suffixes = new Set()
   for (const [key, component] of Object.entries(map(m.components, 'components'))) {
     if (!/^[a-z][a-zA-Z0-9]{0,24}$/.test(key) || !/^[a-z][a-z0-9-]{0,24}$/.test(component.suffix) || suffixes.has(component.suffix)) throw new Error('Invalid or duplicate component')

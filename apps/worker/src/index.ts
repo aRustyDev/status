@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify } from 'jose'
+import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose'
 import { endpointFingerprint, parseEndpoints, type Endpoint } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
 import { parsePersistedHttpConfig, parseVaultBasicAuth, requestAllowedForEndpoint } from '../../probe/src/http-monitor'
@@ -16,6 +16,7 @@ import { checkFallback, FallbackConflictError, getFallback, publishFallback, sav
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 import { bootstrapPreviewUser } from './issue14-preview-user'
 import { ensureIssue14VaultFixture } from '../../gateway/issue14-vault-fixture'
+import { isIssue14Preview } from '../../gateway/issue14-preview'
 
 interface Env extends EmailChannelEnv {
   API_SCOPE?: string
@@ -35,6 +36,9 @@ interface Env extends EmailChannelEnv {
   MONITOR_MODAL?: string
   ACCESS_TEAM_DOMAIN: string
   ACCESS_AUD: string
+  PREVIEW_BROWSER_CLIENT_ID?: string
+  PREVIEW_BROWSER_ORIGIN?: string
+  DEPLOYMENT_ENVIRONMENT?: string
   ENDPOINTS: string
   GATUS?: GatusBinding
   GATUS_REQUIRED?: string
@@ -49,7 +53,7 @@ async function notificationsReady(env: Env): Promise<boolean> {
 }
 
 type Role = 'viewer' | 'operator' | 'admin'
-type User = { id: string; issuer: string; subject: string; email: string; role: Role; version: number }
+type User = { id: string; issuer: string; subject: string; email: string; role: Role; version: number; previewBrowser?: true }
 type Json = Record<string, unknown>
 type Row = Record<string, unknown>
 
@@ -149,22 +153,41 @@ function stableJson(value: unknown): string {
 function effectiveTestConfig(value: Json): Json {
   return { ...value, method: typeof value.method === 'string' ? value.method.toUpperCase() : 'GET', timeoutMs: value.timeoutMs ?? 10_000, attempts: value.attempts ?? 1 }
 }
-async function accessIdentity(request: Request, env: Env): Promise<{ issuer: string; subject: string; email: string }> {
+type AccessIdentity = Pick<User, 'issuer' | 'subject' | 'email'> & { previewBrowser?: true }
+
+async function accessIdentity(request: Request, env: Env): Promise<AccessIdentity> {
   const token = request.headers.get('Cf-Access-Jwt-Assertion')
   if (!token || !env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) throw new HttpError(401, 'Access authentication required')
   const issuer = `https://${env.ACCESS_TEAM_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '')}`
-  let subject: string
-  let email: string
+  let payload: JWTPayload
   try {
-    const { payload } = await jwtVerify(token, accessKeySet(issuer), { issuer, audience: env.ACCESS_AUD })
-    if (typeof payload.sub !== 'string' || typeof payload.email !== 'string' || !payload.email) throw new Error('Missing human identity')
-    subject = payload.sub
-    email = payload.email
+    const verified = await jwtVerify(token, accessKeySet(issuer), { issuer, audience: env.ACCESS_AUD, algorithms: ['RS256'], requiredClaims: ['exp'] })
+    payload = verified.payload
   } catch { throw new HttpError(401, 'Invalid Access identity') }
-  return { issuer, subject, email }
+  if (payload.common_name !== undefined) {
+    const url = new URL(request.url)
+    if (env.DEPLOYMENT_ENVIRONMENT !== 'staging' || !env.PREVIEW_BROWSER_CLIENT_ID || payload.common_name !== env.PREVIEW_BROWSER_CLIENT_ID ||
+        payload.type !== 'app' || url.protocol !== 'https:' || url.origin !== env.PREVIEW_BROWSER_ORIGIN) {
+      throw new HttpError(401, 'Invalid Access identity')
+    }
+    // A gateway identity subrequest is a GET even when the original request would mutate.
+    const originalMethod = request.headers.get('X-Status-Identity-Method') ?? request.method
+    if (!['GET', 'HEAD'].includes(request.method) || !['GET', 'HEAD'].includes(originalMethod)) {
+      throw new HttpError(403, 'Preview browser is read-only')
+    }
+    return { issuer, subject: payload.common_name, email: 'preview-browser@automation.invalid', previewBrowser: true }
+  }
+  if (typeof payload.sub !== 'string' || typeof payload.email !== 'string' || !payload.email) throw new HttpError(401, 'Invalid Access identity')
+  return { issuer, subject: payload.sub, email: payload.email }
 }
 async function authenticate(request: Request, env: Env): Promise<User> {
-  const { issuer, subject, email } = await accessIdentity(request, env)
+  const identity = await accessIdentity(request, env)
+  if (identity.previewBrowser) {
+    const user: User = { ...identity, id: 'preview-browser', role: 'viewer', version: 1 }
+    if (isIssue14Preview(env)) await ensureIssue14VaultFixture(env, user)
+    return user
+  }
+  const { issuer, subject, email } = identity
   await env.DB.prepare('INSERT INTO users (id, issuer, subject, email) VALUES (?, ?, ?, ?) ON CONFLICT(issuer, subject) DO UPDATE SET email=excluded.email').bind(id(), issuer, subject, email).run()
   let user = await env.DB.prepare('SELECT * FROM users WHERE issuer=? AND subject=?').bind(issuer, subject).first<User>()
   if (!user) throw new Error('User lookup failed')
@@ -174,6 +197,9 @@ async function authenticate(request: Request, env: Env): Promise<User> {
     await ensureIssue14VaultFixture(env, user)
   }
   return user
+}
+function previewActionsEditor(env: Env, user: User): boolean {
+  return isIssue14Preview(env) && user.id === 'preview-browser' && user.role === 'viewer' && user.previewBrowser === true
 }
 function requireRole(user: User, role: Role) {
   if (roles[user.role] < roles[role]) throw new HttpError(403, 'Insufficient role')
@@ -388,7 +414,7 @@ function approvedEndpoints(env: Env): Endpoint[] {
 async function api(request: Request, env: Env, user: User, path: string, receipt: ReceiptContext | null = null): Promise<Response> {
   const method = request.method
   const db = env.DB
-  if (path === '/api/v1/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now() })
+  if (path === '/api/v1/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now(), ...(previewActionsEditor(env, user) ? { previewActionsEditor: true } : {}) })
   if (path.startsWith('/api/v1/public/') && method === 'GET') {
     if (path === '/api/v1/public/incidents') return json(await listIncidents(db, false))
     if (path === '/api/v1/public/maintenances') return json(await listMaintenance(db, false))
@@ -693,7 +719,8 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     return deliveryHistoryApi(request, env, user, route)
   }
   if (route === '/admin/actions' || route.startsWith('/admin/actions/')) {
-    requireRole(user, 'admin')
+    const previewRead = previewActionsEditor(env, user) && method === 'GET' && ['/admin/actions', '/admin/actions/destinations', '/admin/actions/checks', '/admin/actions/runs'].includes(route)
+    if (!previewRead) requireRole(user, 'admin')
     if (env.ACTIONS_READY !== 'true' || !actionEndpoints(env.ACTION_ENDPOINTS).size || !await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Actions are unavailable')
     try { return await actionApi(request, env as unknown as ActionEnvironment, user, route) }
     catch (error) {
@@ -738,6 +765,10 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     }
   }
   if (route === '/admin/vaults' || route.startsWith('/admin/vaults/')) {
+    if (previewActionsEditor(env, user) && method === 'GET') {
+      if (route === '/admin/vaults') return json((await db.prepare("SELECT id,name,'local' AS type,created_at AS createdAt,updated_at AS updatedAt FROM vaults WHERE id=238010605399733").all()).results)
+      if (route === '/admin/vaults/238010605399733/secrets') return json((await db.prepare("SELECT id,vault_id AS vaultId,name,type,created_at AS createdAt,updated_at AS updatedAt,version FROM vault_secrets WHERE id=218386432287168 AND vault_id=238010605399733 AND type='value'").all()).results)
+    }
     requireRole(user, 'admin')
     try { return await vaultApi(request, db, env.VAULT_ENCRYPTION_KEY, user, route) }
     catch (error) {
@@ -999,7 +1030,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     if (!saved) throw new Error('Missing mutation receipt')
     return json({ id: saved.result_alias, version: saved.result_version }, saved.status)
   }
-  if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now() })
+  if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now(), ...(previewActionsEditor(env, user) ? { previewActionsEditor: true } : {}) })
   if (route === '/capabilities' && method === 'GET') {
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
     const notificationsAvailable = await notificationsReady(env)

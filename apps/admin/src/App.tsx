@@ -21,7 +21,7 @@ const Backups = lazy(() => import('./pages/Backups'))
 const SystemHealth = lazy(() => import('./pages/SystemHealth'))
 const StaticFallback = lazy(() => import('./pages/CloudflareStaticFallback'))
 
-type Identity = { id: string; email: string; role: 'viewer' | 'operator' | 'admin'; serverTime?: number }
+type Identity = { id: string; email: string; role: 'viewer' | 'operator' | 'admin'; serverTime?: number; previewActionsEditor?: boolean }
 
 function Shell({ identity, capabilities }: { identity: Identity; capabilities: Capabilities }) {
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -53,7 +53,7 @@ function Shell({ identity, capabilities }: { identity: Identity; capabilities: C
         <h2 className="px-4 pb-1 font-mono uppercase tracking-widest text-xs">{section.label}</h2>
         {section.items.map(item => (item.to === '/admin/delivery-history'
           ? identity.role === 'admin' && supported.has('/admin/actions')
-          : supported.has(item.to) && (item.minRole !== 'admin' || identity.role === 'admin'))
+          : supported.has(item.to) && (item.minRole !== 'admin' || identity.role === 'admin' || (item.to === '/admin/actions' && identity.previewActionsEditor === true)))
           ? <Link key={item.to} className="admin-nav-item" to={item.to} onClick={() => setDrawerOpen(false)}>
               <span className="material-symbols-outlined" aria-hidden="true">{item.icon}</span>{item.label}
             </Link>
@@ -104,7 +104,7 @@ export default function App() {
     try {
       const next = await api.get<Identity>('/auth/me')
       if (sequence !== reconnectSequence.current) return
-      if (next.role === 'viewer') {
+      if (next.role === 'viewer' && !next.previewActionsEditor) {
         window.location.assign('/')
         return
       }
@@ -142,7 +142,7 @@ export default function App() {
             <Route path="incidents" element={capabilities.supportedRoutes.includes("/admin/incidents") ? <Incidents /> : <Unavailable />} />
             <Route path="maintenance" element={capabilities.supportedRoutes.includes("/admin/maintenance") ? <Maintenance /> : <Unavailable />} />
             <Route path="delivery-history" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/delivery-history') ? <DeliveryHistory /> : <Unavailable />} />
-            <Route path="actions" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/actions') ? <Actions /> : <Unavailable />} />
+            <Route path="actions" element={(identity.role === 'admin' || identity.previewActionsEditor === true) && capabilities.supportedRoutes.includes('/admin/actions') ? <Actions readOnly={identity.previewActionsEditor === true} /> : <Unavailable />} />
             <Route path="delivery-history" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/actions') ? <DeliveryHistory /> : <Unavailable />} />
             <Route path="notifications" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/notifications') ? <Notifications /> : <Unavailable />} />
             <Route path="vault" element={identity.role === 'admin' && capabilities.supportedRoutes.includes("/admin/vault") ? <Vault /> : <Unavailable />} />
