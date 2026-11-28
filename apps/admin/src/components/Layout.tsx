@@ -1,5 +1,5 @@
 import { createAdminShell, type AdminShellConfig, type NavSection } from '@better-forge/ui'
-import changelogSource from '../../../../docs/changelog.md?raw'
+import changelogSource from '../../../../docs/src/changelog.md?raw'
 import packageMetadata from '../../package.json'
 import { DOCS_URL, statusPageUrl } from '../navigation'
 
@@ -22,7 +22,7 @@ export const ALL_SECTIONS: NavSection[] = [
     items: [
       { to: '/admin/notifications',    label: 'Notifications',    icon: 'notifications', minRole: 'admin' },
       { to: '/admin/actions',          label: 'Actions',          icon: 'bolt',          minRole: 'admin' },
-      { to: '/admin/delivery-history', label: 'Delivery history', icon: 'history',       minRole: 'operator' },
+      { to: '/admin/delivery-history', label: 'Delivery history', icon: 'history',       minRole: 'admin' },
     ],
   },
   {

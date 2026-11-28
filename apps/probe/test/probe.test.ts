@@ -17,7 +17,7 @@ function fixture(count = 1, withAutomation = true) {
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0006_advanced_http.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0005_gatus_sources.sql', import.meta.url), 'utf8'))
   sqlite.exec(readFileSync(new URL('../../worker/migrations/0009_monitor_auth.sql', import.meta.url), 'utf8'))
-  if (withAutomation) for (const file of ['0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql', '0017_monitor_action_links.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`, import.meta.url), 'utf8'))
+  if (withAutomation) for (const file of ['0009_channels.sql','0009_actions.sql','0010_monitor_alert_links.sql','0010_notification_transition_state.sql','0011_email_channels.sql','0012_notification_delivery_state.sql','0013_notification_unlink_cancel.sql','0015_monitor_dependencies.sql','0016_dependency_observations.sql', '0017_monitor_action_links.sql','0018_delivery_history.sql']) sqlite.exec(readFileSync(new URL(`../../worker/migrations/${file}`, import.meta.url), 'utf8'))
   const now = 1_800_000_000_000
   const endpoints = []
   for (let i = 0; i < count; i++) {

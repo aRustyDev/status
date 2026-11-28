@@ -5,12 +5,15 @@ import { DatabaseSync } from 'node:sqlite'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 import worker from '../src/index.ts'
+import gatewayModule from '../../gateway/index.ts'
 import { getSystemHealthReport } from '../src/system-health.ts'
 import { vaultApi, vaultKeyReady } from '../src/vault.ts'
 import probeWorker from '../../probe/src/index.ts'
 import { endpointFingerprint } from '../src/endpoint-config.ts'
 import { syncGatusCatalog } from '../src/gatus-catalog.ts'
 import { gatusSourceId, type GatusCatalogEntry } from '../src/gatus.ts'
+
+const gateway = 'default' in gatewayModule ? gatewayModule.default as typeof gatewayModule : gatewayModule
 
 // This adapter executes actual SQLite statements, including atomic batches, to
 // exercise the API independently of a running Cloudflare account.
@@ -76,6 +79,7 @@ const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
 let sign: (subject: string, email: string, aud?: string, expires?: string) => Promise<string>
+let signService: (clientId: string, aud?: string, expires?: string, type?: string) => Promise<string>
 let adminToken: string, operatorToken: string, viewerToken: string
 
 async function request(path: string, token?: string, method = 'GET', body?: unknown, origin = 'https://status.example', idempotencyKey?: string, idempotencyActor?: string) {
@@ -97,7 +101,7 @@ before(async () => {
     miniflare = new Miniflare(convertV4MiniflareOptions({ modules: true, script: 'export default {fetch(){return new Response()}}', d1Databases: ['DB'] }))
     db = await miniflare.getD1Database('DB') as unknown as TestDatabase
     env.DB = db
-    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql']) {
+    for (const file of ['0001_board.sql', '0002_checks.sql', '0003_endpoint_registry.sql', '0004_aliases.sql', '0005_gatus_sources.sql', '0006_advanced_http.sql', '0007_idempotency.sql', '0008_monitor_tags.sql', '0008_vault.sql', '0009_monitor_auth.sql', '0009_channels.sql', '0009_actions.sql', '0010_monitor_alert_links.sql', '0010_notification_transition_state.sql', '0011_email_channels.sql', '0012_notification_delivery_state.sql', '0013_notification_unlink_cancel.sql', '0014_monitor_alert_channel_limit.sql', '0015_monitor_dependencies.sql', '0015_monitor_request.sql', '0016_dependency_observations.sql', '0017_monitor_action_links.sql', '0018_delivery_history.sql']) {
       const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8').replace(/^\s*--[^\n]*$/gm, '')
       const parts = sql.split(/(?=CREATE TRIGGER |DROP TRIGGER )/)
       const statements = parts.shift()!.split(';').map(value => value.trim()).filter(Boolean)
@@ -129,6 +133,7 @@ before(async () => {
     sqlite.db.exec(readFileSync(new URL('../migrations/0016_dependency_observations.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0015_monitor_request.sql', import.meta.url), 'utf8'))
     sqlite.db.exec(readFileSync(new URL('../migrations/0017_monitor_action_links.sql', import.meta.url), 'utf8'))
+    sqlite.db.exec(readFileSync(new URL('../migrations/0018_delivery_history.sql', import.meta.url), 'utf8'))
   }
   const keys = await generateKeyPair('RS256', { extractable: true })
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' }
@@ -142,6 +147,7 @@ before(async () => {
     return Response.json({ keys: available })
   }
   sign = (subject, email, aud = audience, expires = '5m') => new SignJWT({ email }).setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).setIssuer(issuer).setAudience(aud).setSubject(subject).setIssuedAt().setExpirationTime(expires).sign(keys.privateKey)
+  signService = (clientId, aud = audience, expires = '5m', type = 'app') => new SignJWT({ common_name: clientId, type }).setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).setIssuer(issuer).setAudience(aud).setSubject('').setIssuedAt().setExpirationTime(expires).sign(keys.privateKey)
   adminToken = await sign('admin-id', 'admin@example.com')
   operatorToken = await sign('operator-id', 'operator@example.com')
   viewerToken = await sign('viewer-id', 'viewer@example.com')
@@ -159,6 +165,101 @@ test('Access identity, roles and same-origin mutations are enforced', async () =
   assert.equal((await request('/api/v1/admin/users', operatorToken)).response.status, 403)
   assert.equal((await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'API' }, 'https://evil.example')).response.status, 403)
   assert.equal((await request('/api/v1/admin/users', adminToken)).response.status, 200)
+})
+
+test('preview identity verification authenticates without reading or writing users', async () => {
+  const verify = (token?: string, method = 'GET') => worker.fetch(new Request('https://status.example/api/v1/auth/preview-verify', {
+    method, headers: token ? { 'Cf-Access-Jwt-Assertion': token } : {},
+  }), { ...env, DB: { prepare: () => { throw new Error('Preview verification must not use D1') } } } as never)
+  const newIdentity = await sign('preview-only-id', 'preview-only@example.com')
+  const changedEmail = await sign('admin-id', 'changed@example.com')
+  assert.equal((await verify(newIdentity)).status, 200)
+  assert.equal((await verify(changedEmail)).status, 200)
+  assert.equal((await db.prepare('SELECT id FROM users WHERE subject=?').bind('preview-only-id').first()), null)
+  assert.equal((await db.prepare('SELECT email FROM users WHERE subject=?').bind('admin-id').first<{ email: string }>())?.email, 'admin@example.com')
+  assert.equal((await verify()).status, 401)
+  assert.equal((await verify(await sign('invalid', 'invalid@example.com', 'other-audience'))).status, 401)
+  assert.equal((await verify(await sign('expired', 'expired@example.com', audience, '-1m'))).status, 401)
+  assert.equal((await verify(await sign('missing-email', ''))).status, 401)
+  assert.equal((await verify(newIdentity, 'POST')).status, 405)
+})
+
+test('the preview browser is a read-only viewer on its configured origin through both gateways', async () => {
+  const origin = 'https://status.example'
+  const clientId = 'preview-browser.access'
+  const token = await signService(clientId)
+  const selector = 'branch-' + 'a'.repeat(24)
+  const release = 'b'.repeat(40)
+  const settings = { ...env, DEPLOYMENT_ENVIRONMENT: 'staging', PREVIEW_BROWSER_ORIGIN: origin, PREVIEW_BROWSER_CLIENT_ID: clientId }
+  const api = { fetch: (req: Request) => {
+    assert.equal(req.headers.has('CF-Access-Client-Secret'), false)
+    assert.equal(req.headers.has('CF-Access-Client-Id'), false)
+    return worker.fetch(req, settings as never)
+  } }
+  const target = { API: api, STATUS_API: api, MONITORING_API: api, STATUS_UI: env.ASSETS, PREVIEW_SELECTOR: selector, PREVIEW_RELEASE: release }
+  let dispatches = 0
+  const baseline = {
+    API: { fetch: (req: Request) => worker.fetch(req, { ...settings, DB: { prepare() { throw new Error('Baseline D1 was accessed') } } } as never) },
+    PREVIEW_DISPATCHER: { fetch: async (req: Request) => {
+      dispatches++
+      const headers = new Headers(req.headers)
+      headers.set('X-Status-Preview-Release', release)
+      const response = await gateway.fetch(new Request(req, { headers }), target as never)
+      const resultHeaders = new Headers(response.headers)
+      resultHeaders.set('X-Status-Preview-Commit', release)
+      return new Response(response.body, { status: response.status, headers: resultHeaders })
+    } },
+  }
+  const makeRequest = (path: string, method = 'GET') => new Request(origin + path, {
+    method, headers: { 'Cf-Access-Jwt-Assertion': token, 'CF-Access-Client-Secret': 'fixture', 'CF-Access-Client-Id': clientId, 'X-Status-Preview': selector, 'X-Status-Identity-Method': 'GET', accept: 'text/html' },
+  })
+  for (const path of ['/', '/asset.js', '/api/v1/auth/me', '/api/v1/bsp/public/status']) {
+    const response = await gateway.fetch(makeRequest(path), baseline as never)
+    assert.equal(response.status, 200, path)
+    assert.equal(response.headers.get('X-Status-Preview-Commit'), release)
+    if (path === '/api/v1/auth/me') {
+      const user = await response.json() as {id: string; role: string}
+      assert.equal(user.id, 'preview-browser')
+      assert.equal(user.role, 'viewer')
+    }
+  }
+  assert.equal((await gateway.fetch(makeRequest('/admin/'), baseline as never)).status, 403)
+  const beforeWrites = dispatches
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+    assert.equal((await gateway.fetch(makeRequest('/api/v1/admin/components', method), baseline as never)).status, 403)
+    assert.equal((await worker.fetch(makeRequest('/api/v1/admin/components', method), settings as never)).status, 403)
+  }
+  assert.equal(dispatches, beforeWrites)
+  assert.equal(await db.prepare('SELECT id FROM users WHERE subject=?').bind(clientId).first(), null)
+  const check = (jwt: string, url = origin, config: object = settings) => worker.fetch(new Request(url + '/api/v1/auth/me', { headers: { 'Cf-Access-Jwt-Assertion': jwt } }), config as never)
+  for (const rejected of [await signService('deployment-probe.access'), await signService(clientId, 'other'), await signService(clientId, audience, '-1m'), await signService(clientId, audience, '5m', 'org'), 'invalid']) {
+    assert.equal((await check(rejected)).status, 401)
+  }
+  assert.equal((await check(token, origin, env)).status, 401)
+  assert.equal((await check(token, origin, { ...settings, DEPLOYMENT_ENVIRONMENT: 'production' })).status, 401)
+  assert.equal((await check(token, 'https://production.example')).status, 401)
+  assert.equal((await check(token, 'http://status.example', { ...settings, PREVIEW_BROWSER_ORIGIN: 'http://status.example' })).status, 401)
+})
+
+test('gateway checks authenticated preview navigation and API requests without touching baseline D1', async () => {
+  const isolatedEnv = { ...env, DB: { prepare: () => { throw new Error('Baseline D1 was accessed') } } }
+  let dispatches = 0
+  const gatewayEnv = {
+    API: { fetch: (req: Request) => worker.fetch(req, isolatedEnv as never) },
+    PREVIEW_DISPATCHER: { fetch: async () => { dispatches++; return new Response('preview') } },
+  }
+  const token = await sign('preview-gateway-id', 'preview-gateway@example.com')
+  const headers = { 'Cf-Access-Jwt-Assertion': token, 'X-Status-Preview': `branch-${'a'.repeat(24)}` }
+  for (const path of ['/', '/assets/app.js', '/api/v1/auth/me']) {
+    const response = await gateway.fetch(new Request(`https://status.example${path}`, { headers }), gatewayEnv as never)
+    assert.equal(response.status, 200)
+    assert.equal(await response.text(), 'preview')
+  }
+  assert.equal(dispatches, 3)
+  const invalid = await gateway.fetch(new Request('https://status.example/', { headers: { ...headers, 'Cf-Access-Jwt-Assertion': 'invalid' } }), gatewayEnv as never)
+  assert.equal(invalid.status, 401)
+  assert.equal(dispatches, 3)
+  assert.equal(await db.prepare('SELECT id FROM users WHERE subject=?').bind('preview-gateway-id').first(), null)
 })
 
 test('system health is administrator-only and reports observed dependency state', async () => {
@@ -2031,4 +2132,16 @@ test('saved Vault header tests do not require the monitoring API to hold the Vau
     await db.prepare('DELETE FROM vault_key_verifier').run()
     delete env.PROBE; delete env.VAULT_ENCRYPTION_KEY; delete env.MONITOR_AUTH_READY; delete env.MONITOR_REQUEST_READY; env.ENDPOINTS = '[]'
   }
+})
+
+test('delivery history requires Access and administrator permissions even when dispatch is disabled', async () => {
+  const path = '/api/v1/bsp/admin/delivery-history/notifications'
+  assert.equal((await request(path)).response.status, 401)
+  assert.equal((await request(path, viewerToken)).response.status, 403)
+  assert.equal((await request(path, operatorToken)).response.status, 403)
+  assert.equal((await request(path, adminToken)).response.status, 200)
+  assert.equal((await request(`${path}?page=0`, adminToken)).response.status, 400)
+  assert.equal((await request(`${path}/missing/retry`, adminToken, 'POST', {}, 'https://other.example')).response.status, 403)
+  const capability = await request('/api/v1/bsp/capabilities', adminToken)
+  assert.ok((capability.body as unknown as {supportedRoutes:string[]}).supportedRoutes.includes('/admin/delivery-history'))
 })

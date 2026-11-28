@@ -1,0 +1,630 @@
+# Deployment Guide
+
+Two paths: **Docker Compose** (recommended — zero dependencies, five commands) or **bare metal** (if you manage your own Node.js environment).
+
+---
+
+## Option A — Docker Compose (recommended)
+
+### Prerequisites
+
+- Docker 24+ and Docker Compose v2 (`docker compose version`)
+- A domain or IP pointing to your server
+
+The published image on GHCR contains the compiled API and both built frontends, so the server does not need the source code. It needs only two files in one directory: `docker-compose.yml` and `.env`.
+
+### Quick install (script)
+
+To skip steps 1 to 3, run the installer on the server:
+
+```bash
+curl -fsSL https://betterstatuspage.dev/install.sh | sh
+```
+
+It checks for `curl`, Docker and Docker Compose v2, downloads `docker-compose.yml` and `.env.example`, generates `JWT_SECRET` and `VAULT_ENCRYPTION_KEY` into a `.env` readable only by its owner (`chmod 600`), then runs `docker compose pull` and `docker compose up -d`. The application listens on `127.0.0.1:3000`; continue with [step 4](#4-open-the-setup-wizard) and put [Nginx](#nginx-reverse-proxy) in front for remote access.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BSP_DIR` | `/opt/bsp` as root, otherwise `~/bsp` | Install directory. |
+| `BSP_REF` | `main` | Branch or tag the files are downloaded from. Use a release tag to get the Compose file that matches it. |
+
+```bash
+curl -fsSL https://betterstatuspage.dev/install.sh | BSP_DIR=/srv/bsp sh
+```
+
+Running it again is safe: the Compose file is refreshed, an existing `.env` is kept (so the secrets stay), and the image is pulled and the container started again. To update, change `BSP_IMAGE` in `.env` as described in [Updates](#updates).
+
+Store `VAULT_ENCRYPTION_KEY` from the generated `.env` outside the server as well — backups never include it. To read the script before running it, download it first: `curl -fsSLO https://betterstatuspage.dev/install.sh`. The manual steps below do the same thing.
+
+### 1. Download the Compose file and the environment template
+
+```bash
+mkdir -p /opt/bsp && cd /opt/bsp
+curl -fsSLO https://raw.githubusercontent.com/BElluu/BetterStatusPage/main/docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/BElluu/BetterStatusPage/main/.env.example -o .env
+chmod 600 .env
+```
+
+### 2. Configure `.env`
+
+Generate the two production secrets:
+
+```bash
+openssl rand -hex 32   # JWT_SECRET
+openssl rand -hex 32   # VAULT_ENCRYPTION_KEY
+```
+
+Edit `.env` and set at least:
+
+```env
+BSP_IMAGE=ghcr.io/belluu/better-status-page:0.8.3
+BSP_BIND_ADDRESS=127.0.0.1
+JWT_SECRET=<first generated value>
+VAULT_ENCRYPTION_KEY=<second generated value>
+TRUST_PROXY=1                          # when Nginx is in front, see below
+PUBLIC_URL=https://status.example.com  # required for email/webhook subscriptions
+```
+
+The same `.env` serves two purposes. Docker Compose reads it automatically to fill `${BSP_IMAGE}`, `${BSP_BIND_ADDRESS}` and `${PORT}` in `docker-compose.yml`, and passes it to the container through `env_file`. Nothing needs to be exported in the shell.
+
+With Docker, `PORT` only changes the published host port; the app always listens on `3000` inside the container. `NODE_ENV`, `DATABASE_PATH`, `UPLOAD_DIR` and `BACKUP_DIR` are fixed by `docker-compose.yml` and point at the volumes, so their values in `.env` are ignored.
+
+Store `VAULT_ENCRYPTION_KEY` somewhere outside the server as well — backups never include it.
+
+### 3. Pull and start
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+### Building the image from source
+
+To build and run your own image instead of the published one, clone this repository and use the local override, so the production Compose file keeps pointing at GHCR:
+
+```bash
+git clone https://github.com/aRustyDev/status.git
+cd status
+cp .docker/dev/.env.example .env   # set the secrets as above
+docker compose --project-directory . --env-file .env -f .docker/compose.yml -f .docker/dev/compose.yml up -d --build
+```
+
+Use the same `--project-directory`, `--env-file`, and `-f` arguments for later Compose commands. The project directory preserves the checkout's usual Compose project name and volume names; if the existing deployment used another project name, set `COMPOSE_PROJECT_NAME` to that name before starting.
+
+### 4. Open the setup wizard
+
+Navigate to `http://your-server:3000/admin` — you'll be greeted by the setup wizard. Create the first administrator account there; the web setup wizard does not read administrator credentials from `.env`.
+
+The wizard has three steps:
+
+1. **Database** — SQLite is the only option and is already selected.
+2. **Admin Account** — email and password (8 to 128 characters). This account gets the `admin` role.
+3. **Done** — the database is created, default branding (site name *My Status Page*) and an empty page layout are added, monitoring starts, and you are signed in.
+
+Setup runs only once. When it finishes, `setup.json` is written to the data directory and the wizard closes. If `setup.json` is lost while the database remains, setup stays refused as long as the database has any user; restore the file from a backup or recreate it as `{"setupComplete": true, "dbType": "sqlite"}`. Until then `/ready` returns 503. Further administrators and the other roles are added later under **Users**, see [users and roles](users-and-roles.md).
+
+The status page is at `http://your-server:3000`.
+
+### ICMP ping monitors
+
+ICMP [Ping monitors](monitors.md#ping--tcp) need the host kernel to allow unprivileged ICMP. If every ICMP check reports *ICMP is not permitted for the server process*, uncomment the `sysctls` block in `docker-compose.yml` (`net.ipv4.ping_group_range: "0 2147483647"`) and run `docker compose up -d`. TCP mode is not affected.
+
+### Useful commands
+
+```bash
+docker compose logs -f          # stream logs
+docker compose restart app      # restart after config change
+docker compose down             # stop (data is preserved in the volume)
+docker compose down -v          # stop AND delete all data — use with caution
+docker compose pull && docker compose up -d  # update to the configured published image
+```
+
+### Where is my data?
+
+Application data lives in the `bsp_data` Docker named volume, mounted at `/app/data` inside the container:
+
+```
+/app/data/
+├── db.sqlite       # the entire database
+├── setup.json      # marks setup as complete
+└── uploads/        # uploaded logos and favicons
+```
+
+Generated archives live in a separate `bsp_backups` volume mounted at `/app/backups`. Both volumes survive `docker compose down`, container rebuilds, and image upgrades. Use the backup commands below instead of copying the active WAL database or its volume directly.
+
+---
+
+## Option B — Bare metal (VPS / dedicated server)
+
+### Prerequisites
+
+- **Node.js 26.10+** — uses the built-in `node:sqlite` module
+- **npm 11+**
+- Linux (Ubuntu 22.04+ recommended) or any OS with Node.js support
+
+### 1. Install Node.js 26
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_26.x | sudo -E bash -
+sudo apt-get install -y nodejs
+node --version   # should print v26.x.x
+```
+
+### 2. Clone and install dependencies
+
+```bash
+git clone https://github.com/aRustyDev/status.git
+cd status
+npm install
+```
+
+### 3. Configure
+
+```bash
+cp .docker/dev/.env.example .env
+nano .env
+```
+
+Set `JWT_SECRET` and `VAULT_ENCRYPTION_KEY`. The web setup wizard asks for the first administrator credentials. See the [environment variables reference](#environment-variables) below.
+
+### 4. Build
+
+```bash
+npm run build
+```
+
+This compiles the TypeScript API and builds both React frontends. Output:
+- `apps/api/dist/` — compiled API
+- `apps/admin-node/dist/` — admin panel static files
+- `apps/status-node/dist/` — status page static files
+
+### 5. Start
+
+```bash
+NODE_ENV=production node apps/api/dist/index.js
+```
+
+Open `http://localhost:3000/admin` to run the setup wizard.
+
+If you open the panel over plain HTTP from another machine (`http://your-server:3000/admin`) and the sign-in sends you back to the login screen, the browser is refusing the `Secure` session cookie. Put HTTPS in front (recommended), or, on a trusted network or VPN only, set `COOKIE_SECURE=false`: without HTTPS the password and the session are sent unencrypted. See `COOKIE_SECURE` in [Environment variables](#environment-variables).
+
+### 6. Keep it running with PM2
+
+```bash
+npm install -g pm2
+pm2 start apps/api/dist/index.js --name bsp --node-args="--env-file=.env"
+pm2 save
+pm2 startup    # generates the command to run on boot — follow the printed instructions
+```
+
+Or create `ecosystem.config.cjs`:
+
+```js
+module.exports = {
+  apps: [{
+    name: 'bsp',
+    script: 'apps/api/dist/index.js',
+    env: {
+      NODE_ENV: 'production',
+    },
+  }],
+}
+```
+
+```bash
+pm2 start ecosystem.config.cjs
+pm2 save && pm2 startup
+```
+
+---
+
+## Nginx reverse proxy
+
+Whether you're using Docker or bare metal, put Nginx in front — it handles SSL termination, compression, custom ports, and proper SSE proxying.
+
+BetterStatusPage is a **single process** that serves everything (API + admin panel + status page) on one port. Nginx is what exposes different URLs or ports to the outside world, routing each domain transparently to that one backend. Because the frontend JavaScript uses relative URLs (`/api/v1/...`), requests always go to the same origin the user sees in their browser — Nginx handles the rest invisibly.
+
+Set `TRUST_PROXY=1` when Nginx is the only path to the application. This makes authentication and setup rate limits and the audit log use the real client IP from `X-Forwarded-For`. `TRUST_PROXY=1` trusts a proxy connecting from loopback or a private network address (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), which covers Nginx on the same host and a proxy container on a Docker network. To narrow it, set an explicit comma-separated list of addresses or CIDR ranges instead, for example `TRUST_PROXY=172.18.0.0/16`. Do not enable it while the application port is directly reachable from the internet, because clients could spoof forwarding headers.
+
+Production rule: do not expose the application port directly to the internet when `TRUST_PROXY` is enabled. Bind Docker to `127.0.0.1:3000:3000` or restrict the port with your firewall, then let Nginx be the only public entry point.
+
+### Install Nginx
+
+```bash
+sudo apt install nginx
+```
+
+### Scenario 1 — everything on one domain (simplest)
+
+The status page is at the root, admin panel at `/admin/`.
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name status.example.com;
+
+    # Nginx refuses bodies over 1 MB by default. A configuration file may be up to 2 MB; backups are larger.
+    client_max_body_size 2m;
+
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        # Required for Server-Sent Events — do not remove
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+The admin panel is then reachable at `https://status.example.com/admin/`.
+
+### Scenario 2 — separate subdomains for status page and admin panel
+
+Two domains, one backend process. The browser JS on each domain makes relative API requests to its own domain, and Nginx proxies those to the shared backend.
+
+```nginx
+# ── Shared proxy settings ─────────────────────────────────────────────────────
+# Put this in /etc/nginx/snippets/bsp-proxy.conf
+# proxy_pass         http://127.0.0.1:3000;
+# proxy_http_version 1.1;
+# proxy_set_header   Host              $host;
+# proxy_set_header   X-Real-IP         $remote_addr;
+# proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+# proxy_set_header   X-Forwarded-Proto $scheme;
+# proxy_buffering    off;
+# proxy_cache        off;
+# proxy_read_timeout 3600s;
+
+# ── Public status page ────────────────────────────────────────────────────────
+server {
+    listen 443 ssl;
+    server_name status.example.com;
+
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 3600s;
+    }
+}
+
+# ── Admin panel ───────────────────────────────────────────────────────────────
+# The admin panel assets are served at /admin/ by the Node.js process.
+# Nginx proxies everything — both /admin/* (static files) and /api/v1/* (API calls).
+server {
+    listen 443 ssl;
+    server_name admin.example.com;
+
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+Users visit `https://admin.example.com/admin/` for the admin panel. The JS inside makes requests to `admin.example.com/api/v1/...`, Nginx proxies those to `localhost:3000/api/v1/...`. Transparent.
+
+### Scenario 3 — custom ports per component
+
+Some deployments expose specific ports directly (without port 443). Set the app's `PORT` in `.env`, then configure Nginx to listen on whatever external port you want:
+
+```nginx
+# Status page accessible on port 4000
+server {
+    listen 4000 ssl;
+    server_name statusklient1.pl;
+    ...
+    location / { proxy_pass http://127.0.0.1:3000; ... }
+}
+
+# Admin panel accessible on port 5000
+server {
+    listen 5000 ssl;
+    server_name adminpanelklient1.pl;
+    ...
+    location / { proxy_pass http://127.0.0.1:3000; ... }
+}
+```
+
+The app itself still runs on port 3000 internally. Nginx is the only thing that needs to know about the external ports.
+
+> For each port you expose, make sure your firewall allows it:
+> ```bash
+> sudo ufw allow 4000/tcp
+> sudo ufw allow 5000/tcp
+> ```
+
+### Scenario 4 — multiple clients on the same server
+
+Each client gets their own BetterStatusPage instance. Run one Docker Compose stack per client, each on a different internal port, then use Nginx to route domains:
+
+```
+/opt/bsp-client1/   → runs on port 3001
+/opt/bsp-client2/   → runs on port 3002
+/opt/bsp-client3/   → runs on port 3003
+```
+
+```bash
+# /opt/bsp-client1/.env
+PORT=3001
+JWT_SECRET=<unique per client>
+VAULT_ENCRYPTION_KEY=<unique per client>
+```
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name status.client1.com;
+    location / { proxy_pass http://127.0.0.1:3001; ... }
+}
+
+server {
+    listen 443 ssl;
+    server_name status.client2.com;
+    location / { proxy_pass http://127.0.0.1:3002; ... }
+}
+```
+
+Each client has fully isolated data (separate SQLite files, separate encryption keys, separate JWT secrets). They never share anything.
+
+### Limit backend access to localhost only
+
+When using Nginx as the public entry point, bind the app to localhost only so it can't be reached directly:
+
+```yaml
+# docker-compose.yml
+ports:
+  - "127.0.0.1:3000:3000"
+```
+
+```bash
+# bare metal .env
+# PORT=3000 — then Nginx proxies to 127.0.0.1:3000
+TRUST_PROXY=1
+```
+
+### HTTPS with Let's Encrypt
+
+```bash
+sudo apt install certbot python3-certbot-nginx
+sudo certbot --nginx -d status.example.com -d admin.example.com
+```
+
+Certbot edits your Nginx configs automatically and sets up auto-renewal.
+
+### Behind Cloudflare: "Origin not allowed"
+
+In production the app rejects state-changing requests (setup wizard, login, saving settings) whose `Origin` header does not match the address the app thinks it is served from. It builds that address from `X-Forwarded-Proto` and `Host`.
+
+With Cloudflare's **Flexible** SSL mode, the browser talks HTTPS to Cloudflare, but Cloudflare talks plain HTTP to Nginx on port 80. Nginx's `$scheme` is then `http`, so the app sees `http://status.example.com` while the browser sends `Origin: https://status.example.com`, and the request fails with `403 Origin not allowed`. Setting `ALLOWED_ORIGINS` is not the fix — the forwarded protocol is wrong.
+
+Pick one of two fixes:
+
+**Option 1 — keep Flexible, hardcode the protocol in Nginx.** In the `location` block replace `$scheme` with a fixed value:
+
+```nginx
+proxy_set_header   X-Forwarded-Proto https;
+```
+
+This works as long as every request reaches Nginx through Cloudflare. Traffic between Cloudflare and your server stays unencrypted.
+
+**Option 2 — switch Cloudflare to Full (strict).** Set SSL/TLS mode to *Full (strict)* in the Cloudflare dashboard and give Nginx a `listen 443 ssl` server block with a certificate (a Cloudflare Origin Certificate or Let's Encrypt). `X-Forwarded-Proto $scheme` then carries `https` and no other change is needed. Traffic is encrypted end to end.
+
+Either way, reload Nginx afterwards:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+---
+
+## Updates
+
+### Docker Compose
+
+Set the new version in `.env`, for example `BSP_IMAGE=ghcr.io/belluu/better-status-page:0.8.3`, then:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+If a release changes `docker-compose.yml`, download it again from the matching tag.
+
+The volume is untouched. Database migrations run automatically on startup.
+
+The container runs as the unprivileged `node` user (UID 1000). Volumes created by older images, which ran as root, are owned by root; if the app then fails to start with a permission error, give the volumes to UID 1000 once:
+
+```bash
+docker compose run --rm --user root app chown -R 1000:1000 /app/data /app/backups
+```
+
+### Bare metal
+
+```bash
+git pull
+npm install
+npm run build
+pm2 restart bsp
+```
+
+---
+
+## Production checklist
+
+Before exposing an instance publicly:
+
+- `NODE_ENV=production` is set.
+- `JWT_SECRET` is random, non-default, and at least 32 characters.
+- `VAULT_ENCRYPTION_KEY` is a random 64-character hex string and stored outside the application.
+- The app port is private; public traffic goes through Nginx/SSL.
+- `TRUST_PROXY=1` is enabled only when Nginx is the only path to the app.
+- Backups are configured, one backup was created, and verification passes.
+- A restore drill was completed on a non-production copy.
+- Optional: [static fallback](static-fallback.md) is set up, so the status page still answers when this server does not.
+- `/health` returns 200 and `/ready` returns 200 after setup.
+- If SSO is enabled, `PUBLIC_URL` is set, the same callback URL is registered at the identity provider, and you know the `OIDC_FORCE_PASSWORD_LOGIN` break-glass switch.
+- GitHub CI or equivalent release checks passed: lint, tests, build, Docker build, and E2E on Linux.
+
+---
+
+## Environment variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `BSP_IMAGE` | Docker Compose | Container image used by `docker-compose.yml`, for example `ghcr.io/belluu/better-status-page:0.8.3`. |
+| `BSP_BIND_ADDRESS` | Docker Compose | Host address for published port. Default/recommended behind Nginx: `127.0.0.1`. Use `0.0.0.0` only for direct testing. |
+| `PORT` | No | Port to listen on. Default: `3000` |
+| `NODE_ENV` | Yes (prod) | Set to `production`. Enables security headers, HSTS, enforces secrets. |
+| `COOKIE_SECURE` | No | Whether the session cookies are marked `Secure`. Default: `true` when `NODE_ENV=production`. A browser keeps a `Secure` cookie only over HTTPS (or on `localhost`), so an installation opened over plain `http://` cannot stay signed in: the sign-in succeeds and the login screen comes straight back. Set `COOKIE_SECURE=false` there, or put HTTPS in front (recommended, see [HTTPS with Let's Encrypt](#https-with-lets-encrypt)). Over plain HTTP the password and the session travel unencrypted whatever this flag says, so use `false` only on a trusted network or VPN, never on a panel reachable from the internet, and never on an installation that does have HTTPS. The application logs a warning at start while it is `false` in production. |
+| `JWT_SECRET` | Yes (prod) | Signs the HttpOnly admin session cookie. Min 32 chars. Changing it logs everyone out. |
+| `VAULT_ENCRYPTION_KEY` | Yes (prod) | 64-char hex string (32 bytes) for AES-256-GCM vault encryption. **Changing it makes all stored secrets unreadable.** |
+| `ADMIN_EMAIL` | `db:seed` only | Required only when intentionally running `npm run db:seed`, which creates this administrator and skips the web setup wizard. The wizard does not read it. |
+| `ADMIN_PASSWORD` | `db:seed` only | Required only when intentionally running `npm run db:seed`; minimum 8 characters. It becomes the password of the administrator the seed creates. |
+| `DATA_DIR` | No | Base directory for application data; the four paths below default to locations inside it. Default: `./data` (relative to the working directory) |
+| `DATABASE_PATH` | No | Path to the SQLite file. Default: `<DATA_DIR>/db.sqlite` |
+| `UPLOAD_DIR` | No | Directory for uploaded files (logos, favicons). Default: `<DATA_DIR>/uploads` |
+| `BACKUP_DIR` | No | Directory for generated backup archives. Default: `<DATA_DIR>/backups` (the Docker image sets `/app/backups`) |
+| `SETUP_CONFIG_PATH` | No | Marker file written when the setup wizard finishes. Default: `<DATA_DIR>/setup.json` |
+| `ALLOWED_ORIGINS` | No | Comma-separated CORS origins. Leave unset if Nginx handles CORS, or in single-domain setups. |
+| `TRUST_PROXY` | No | Trusted proxy setting: `1` trusts a proxy on loopback or a private network (Docker bridge included), or give a comma-separated list of addresses/CIDR ranges. Enable only when the app port is not directly exposed. |
+| `PUBLIC_URL` | For email/webhook subscriptions | Public address of the status page, e.g. `https://status.example.com`. All links sent to subscribers are built from it; see [subscriptions](subscriptions.md#public-url). An SSO sign-in started on the sign-in screen of a [private status page](private-status-page.md) also returns to it. |
+| `UPDATE_CHECK` | No | Set to `false` to stop the server from asking GitHub for the latest release. By default it does so in the background every 6 hours, and [System Health](users-and-roles.md#system-health) and the Dashboard link to the release when it is newer than the running version. |
+| `OIDC_ISSUER` / `OIDC_CLIENT_ID` | No | Configure OpenID Connect single sign-on from the environment instead of **Users → Single sign-on**. When both are set they override the UI settings and lock that page. Register `<PUBLIC_URL>/api/v1/auth/oidc/callback` as the redirect URI. Users must already exist; they are matched by verified email. A [private status page](private-status-page.md) can let SSO create Viewer accounts. |
+| `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_SCOPES`, `OIDC_BUTTON_LABEL` | No | Optional companions to the two variables above (defaults: none, derived from `PUBLIC_URL`, `openid email profile`, `Sign in with SSO`). |
+| `OIDC_DISABLE_PASSWORD_LOGIN`, `OIDC_ALLOW_UNVERIFIED_EMAIL` | No | `true` hides and rejects password sign-in while OIDC is active / accepts IdPs that send neither `email_verified` nor `xms_edov` (for Entra ID add the `xms_edov` optional claim instead). |
+| `OIDC_FORCE_PASSWORD_LOGIN` | No | Break-glass: `true` re-enables password sign-in even if it was disabled, for when the identity provider is down. Restart required. |
+| `SCHEDULER_TICK_SECONDS` | No | How often the scheduler scans for due monitors. Default: `10`. Must be 1-59 seconds. |
+| `SSE_MAX_CLIENTS` / `SSE_MAX_CLIENTS_PER_IP` | No | Most live event streams (status page and admin) open at the same time, in total and from one address (an IPv6 `/64` counts as one). Only anonymous streams are counted. Streams over the limit get `429`; the status page then falls back to refreshing every 30 seconds. Defaults: `1000` and `10`. Behind a reverse proxy or CDN, set `TRUST_PROXY` so the address is the visitor's: otherwise every visitor shares the proxy's address and the per-address limit applies to all of them. Each stream holds a file descriptor, so keep the total below the process limit (`ulimit -n`). |
+| `MONITOR_CHECK_CONCURRENCY` | No | Maximum number of scheduled checks running at the same time, across all ticks. Default: `20`. "Check now" is not counted. |
+| `HEARTBEAT_AUTO_CREATE_LIMIT` | No | How many monitors one API token may create an hour by [sending a heartbeat to a key](monitors.md#sending-by-key-created-on-the-first-heartbeat) that has no monitor yet. Default: `50`. `0` means no limit. |
+| `MONITOR_RESULT_RETENTION_DAYS` | No | Monitor result retention period. Default: `90`. |
+| `MONITOR_RESULT_PURGE_CRON` | No | Cron expression for purging old monitor results. Default: `0 2 * * *` (daily at 02:00). |
+
+Generate secrets:
+
+```bash
+# JWT_SECRET
+openssl rand -hex 32
+
+# VAULT_ENCRYPTION_KEY (must be exactly 64 hex chars)
+openssl rand -hex 32
+```
+
+Without OpenSSL, `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` produces the same format.
+
+---
+
+## Backups
+
+BetterStatusPage creates a consistent SQLite snapshot with `VACUUM INTO`; do not copy a live `db.sqlite` directly while WAL mode is active. A `bsp-backup-TIMESTAMP.backup` archive contains the database, `setup.json`, uploads, a versioned manifest, and SHA-256 checksums.
+
+For the full operational procedure, including restore drills and key handling, see [backup-restore.md](backup-restore.md).
+
+Build the application before using the CLI, then create or verify a backup:
+
+```bash
+npm run build
+npm run backup -- --output ./backups
+npm run backup:verify -- --input ./backups/bsp-backup-TIMESTAMP.backup
+```
+
+The admin **Backups** page can create, download, validate, delete, and schedule backups. Automatic backups support daily or weekly execution and count-based retention.
+
+Restore is deliberately offline. Stop the application first:
+
+```bash
+pm2 stop bsp
+npm run restore -- --input ./backups/bsp-backup-TIMESTAMP.backup --vault-encryption-key YOUR_64_CHARACTER_HEX_KEY
+pm2 start bsp
+```
+
+The restore validates every checksum, runs SQLite integrity checks, creates a safety backup of the current state, atomically replaces the data, runs migrations, and rolls back if migration fails.
+
+Docker Compose uses a separate `bsp_backups` volume, so deleting the application data volume does not delete backup archives:
+
+```bash
+# Online backup
+docker compose exec app node apps/api/dist/cli/backup.js
+
+# List available archives
+docker compose run --rm app ls -lh /app/backups
+
+# Offline restore
+docker compose stop app
+docker compose run --rm app node apps/api/dist/cli/restore.js --input /app/backups/bsp-backup-TIMESTAMP.backup --vault-encryption-key YOUR_64_CHARACTER_HEX_KEY
+docker compose up -d app
+```
+
+`VAULT_ENCRYPTION_KEY` and `.env` are never included. Keep the key separately. Restore requires the key explicitly and rejects malformed or mismatched values.
+
+---
+
+## Single sign-on
+
+Administrators can sign in through an OpenID Connect identity provider (Entra ID, Keycloak, Okta, Google and others). Set it up from **Users → Single sign-on** with no restart, or with the `OIDC_*` variables in the table above. `PUBLIC_URL` must be set (or `OIDC_REDIRECT_URI`) so the callback address can be built. See [single-sign-on.md](single-sign-on.md).
+
+## Recover access when 2FA is lost
+
+An administrator can reset 2FA for another user from **Admin → Users**. The action requires the administrator to confirm who they are (their current password, or single sign-on when they signed in with it, see [single-sign-on.md](single-sign-on.md#confirming-sensitive-actions)) and exact confirmation of the target email address. It removes only the target user's 2FA configuration, revokes all of their active sessions, and writes an audit entry. It does not change their password.
+
+An administrator cannot use this action on their own account. If the installation has only one administrator and both the authenticator and recovery codes are unavailable, use the emergency CLI from a trusted host. Access to the application host and data volume is the authority for this operation.
+
+Build the application before running the local CLI:
+
+```bash
+npm run build
+npm run 2fa:reset -w apps/api -- --email admin@example.com --confirm admin@example.com
+```
+
+Docker Compose:
+
+```bash
+docker compose exec app node apps/api/dist/cli/resetTwoFactor.js --email admin@example.com --confirm admin@example.com
+```
+
+If the application container is not running, use the same persistent data volume through a one-off container:
+
+```bash
+docker compose run --rm app node apps/api/dist/cli/resetTwoFactor.js --email admin@example.com --confirm admin@example.com
+```
+
+The confirmation must exactly match the email. A successful reset revokes every session for the account and records an `emergency_cli` entry in the audit log. Sign in again, with the existing password or single sign-on, and configure 2FA again immediately.
+
+---
+
+## Firewall
+
+Only expose port 443 (and 80 for redirect) to the internet. Keep the app port (3000) internal:
+
+```bash
+sudo ufw allow 22/tcp    # SSH
+sudo ufw allow 80/tcp    # HTTP (for Let's Encrypt redirect)
+sudo ufw allow 443/tcp   # HTTPS
+sudo ufw enable
+```
+
+If using Docker without Nginx, you can publish the port to localhost only:
+
+```yaml
+ports:
+  - "127.0.0.1:3000:3000"
+```
+
+This prevents direct access to port 3000 from outside — all traffic goes through Nginx.

@@ -1,25 +1,16 @@
 name: CI
 
-# Documentation-only changes skip CI. docs/changelog.md is baked into the image and parsed by the
+# Documentation-only changes skip CI. docs/src/changelog.md is baked into the image and parsed by the
 # app, and docs/public/openapi.yaml is checked by an API test, so both still trigger it.
 on:
   push:
-    branches: [main]
-    paths-ignore:
-      - 'docs/**/*.md'
-      - 'docs/src/**'
-      - 'README*.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '!docs/changelog.md'
+    branches: [main, 'feat/**', 'fix/**', 'stage/**', 'schema/**']
   pull_request:
     paths-ignore:
       - 'docs/**/*.md'
       - 'docs/src/**'
-      - 'README*.md'
-      - 'SECURITY.md'
       - 'LICENSE'
-      - '!docs/changelog.md'
+      - '!docs/src/changelog.md'
   workflow_dispatch:
 
 permissions:
@@ -130,6 +121,9 @@ jobs:
       - name: Install Playwright browser
         run: npx playwright install --with-deps chromium
 
+      - name: Headless preview browser pilot
+        run: node --test .agents/skills/preview-browser/scripts/cli.e2e.mjs
+
       - name: End-to-end tests
         run: npm run test:e2e
 
@@ -176,6 +170,14 @@ jobs:
 
       - name: Gateway routing tests
         run: node --import tsx --test apps/gateway/test/*.test.mts
+
+      - name: Staging preview tests
+        run: node --test .github/actions/branch-previews/preview-browser.test.mjs .github/workflows/branch-previews/test/runner-auth.test.mjs .agents/skills/preview-browser/scripts/*.test.mjs
+
+      - name: Branch preview controller tests
+        run: |
+          npm ci --ignore-scripts --prefix .github/actions/branch-previews
+          npm test --prefix .github/actions/branch-previews
 
       - name: Fallback routing tests
         run: node --import tsx --test apps/fallback/test/*.test.mts
@@ -247,6 +249,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: .docker/dev/Dockerfile
           load: true
           tags: better-status-page:test
           cache-from: type=gha,scope=${{ matrix.arch }}

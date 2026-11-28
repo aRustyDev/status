@@ -16,7 +16,7 @@
       "workers_dev": false,
       "preview_urls": false,
       "vars": {
-        "UI_MODE": "legacy"
+        "UI_MODE": "upstream"
       },
       "services": [
         {
@@ -38,6 +38,10 @@
         {
           "binding": "MONITORING_API",
           "service": "status-monitoring-api-staging"
+        },
+        {
+          "binding": "PREVIEW_DISPATCHER",
+          "service": "status-preview-dispatcher"
         }
       ],
       "routes": []

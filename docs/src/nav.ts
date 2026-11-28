@@ -6,7 +6,7 @@ export const REPO_URL = 'https://github.com/BElluu/BetterStatusPage'
 export const SITE_URL = 'https://betterstatuspage.dev'
 
 /**
- * Sidebar order. Each slug is a file name in docs/ without `.md`; `label` overrides the page title
+ * Sidebar order. Each slug is a file name in docs/src/ without `.md`; `label` overrides the page title
  * in the sidebar only. A guide missing from this list still gets a page and shows up under "More".
  */
 const SECTIONS: { label: string; items: { slug: string; label?: string }[] }[] = [

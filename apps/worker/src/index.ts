@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify } from 'jose'
+import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose'
 import { endpointFingerprint, parseEndpoints, type Endpoint } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
 import { parsePersistedHttpConfig, parseVaultHttpAuth, requestAllowedForEndpoint } from '../../probe/src/http-monitor'
@@ -6,6 +6,7 @@ import { ProbeTestTimeout, requestProbeTest } from './probe-test'
 import { getSystemHealthReport } from './system-health'
 import { vaultApi, vaultKeyReady, VaultError } from './vault'
 import { channelApi, ChannelError } from './channels'
+import { deliveryHistoryApi, deliveryHistoryAvailable } from './delivery-history'
 import { channelEndpoints, type ChannelEnvironment } from './channels-runtime'
 import { emailChannelFingerprint, emailDestinations, emailReady, type EmailChannelEnv } from './email-channel'
 import { resolveChannelCredential } from './vault-resolver'
@@ -30,6 +31,9 @@ interface Env extends EmailChannelEnv {
   MONITOR_MODAL?: string
   ACCESS_TEAM_DOMAIN: string
   ACCESS_AUD: string
+  PREVIEW_BROWSER_CLIENT_ID?: string
+  PREVIEW_BROWSER_ORIGIN?: string
+  DEPLOYMENT_ENVIRONMENT?: string
   ENDPOINTS: string
   GATUS?: GatusBinding
   GATUS_REQUIRED?: string
@@ -149,18 +153,37 @@ function stableJson(value: unknown): string {
 function effectiveTestConfig(value: Json): Json {
   return { ...value, method: typeof value.method === 'string' ? value.method.toUpperCase() : 'GET', timeoutMs: value.timeoutMs ?? 10_000, attempts: value.attempts ?? 1 }
 }
-async function authenticate(request: Request, env: Env): Promise<User> {
+type AccessIdentity = Pick<User, 'issuer' | 'subject' | 'email'> & { previewBrowser?: true }
+
+async function accessIdentity(request: Request, env: Env): Promise<AccessIdentity> {
   const token = request.headers.get('Cf-Access-Jwt-Assertion')
   if (!token || !env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) throw new HttpError(401, 'Access authentication required')
   const issuer = `https://${env.ACCESS_TEAM_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '')}`
-  let subject: string
-  let email: string
+  let payload: JWTPayload
   try {
-    const { payload } = await jwtVerify(token, accessKeySet(issuer), { issuer, audience: env.ACCESS_AUD })
-    if (typeof payload.sub !== 'string' || typeof payload.email !== 'string' || !payload.email) throw new Error('Missing human identity')
-    subject = payload.sub
-    email = payload.email
+    const verified = await jwtVerify(token, accessKeySet(issuer), { issuer, audience: env.ACCESS_AUD, algorithms: ['RS256'], requiredClaims: ['exp'] })
+    payload = verified.payload
   } catch { throw new HttpError(401, 'Invalid Access identity') }
+  if (payload.common_name !== undefined) {
+    const url = new URL(request.url)
+    if (env.DEPLOYMENT_ENVIRONMENT !== 'staging' || !env.PREVIEW_BROWSER_CLIENT_ID || payload.common_name !== env.PREVIEW_BROWSER_CLIENT_ID ||
+        payload.type !== 'app' || url.protocol !== 'https:' || url.origin !== env.PREVIEW_BROWSER_ORIGIN) {
+      throw new HttpError(401, 'Invalid Access identity')
+    }
+    // A gateway identity subrequest is a GET even when the original request would mutate.
+    const originalMethod = request.headers.get('X-Status-Identity-Method') ?? request.method
+    if (!['GET', 'HEAD'].includes(request.method) || !['GET', 'HEAD'].includes(originalMethod)) {
+      throw new HttpError(403, 'Preview browser is read-only')
+    }
+    return { issuer, subject: payload.common_name, email: 'preview-browser@automation.invalid', previewBrowser: true }
+  }
+  if (typeof payload.sub !== 'string' || typeof payload.email !== 'string' || !payload.email) throw new HttpError(401, 'Invalid Access identity')
+  return { issuer, subject: payload.sub, email: payload.email }
+}
+async function authenticate(request: Request, env: Env): Promise<User> {
+  const identity = await accessIdentity(request, env)
+  if (identity.previewBrowser) return { ...identity, id: 'preview-browser', role: 'viewer', version: 1 }
+  const { issuer, subject, email } = identity
   await env.DB.prepare('INSERT INTO users (id, issuer, subject, email) VALUES (?, ?, ?, ?) ON CONFLICT(issuer, subject) DO UPDATE SET email=excluded.email').bind(id(), issuer, subject, email).run()
   const user = await env.DB.prepare('SELECT * FROM users WHERE issuer=? AND subject=?').bind(issuer, subject).first<User>()
   if (!user) throw new Error('User lookup failed')
@@ -678,6 +701,11 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     requireRole(user, 'admin')
     return json(await getSystemHealthReport(env))
   }
+  if (route.startsWith('/admin/delivery-history/')) {
+    requireRole(user, 'admin')
+    if (!await deliveryHistoryAvailable(db)) throw new HttpError(503, 'Delivery history is unavailable')
+    return deliveryHistoryApi(request, env, user, route)
+  }
   if (route === '/admin/actions' || route.startsWith('/admin/actions/')) {
     requireRole(user, 'admin')
     if (env.ACTIONS_READY !== 'true' || !actionEndpoints(env.ACTION_ENDPOINTS).size || !await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Actions are unavailable')
@@ -992,8 +1020,9 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   if (route === '/capabilities' && method === 'GET') {
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
     const notificationsAvailable = await notificationsReady(env)
+    const historyAvailable = await deliveryHistoryAvailable(db)
     const actionsAvailable = vaultAvailable && env.ACTIONS_READY === 'true' && actionEndpoints(env.ACTION_ENDPOINTS).size > 0
-    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
+    return json({ supportedRoutes: ['/admin/', '/admin/monitors', '/admin/incidents', '/admin/maintenance', '/admin/users', '/admin/audit-log', '/admin/system-health', ...(historyAvailable ? ['/admin/delivery-history'] : []), ...(env.BACKUPS && env.BACKUPS_READY === 'true' ? ['/admin/backups'] : []), ...(vaultAvailable ? ['/admin/vault'] : []), ...(notificationsAvailable ? ['/admin/notifications'] : []), ...(actionsAvailable ? ['/admin/actions'] : []), ...(env.FALLBACK_BUCKET && env.FALLBACK_READY === 'true' ? ['/admin/static-fallback'] : [])], vault: vaultAvailable, monitorAuth: vaultAvailable && env.MONITOR_AUTH_READY === 'true', monitorRequest: env.MONITOR_REQUEST_READY === 'true', subscriptions: false, notifications: notificationsAvailable, actions: actionsAvailable, dependencies: true, templates: false, recurringMaintenance: false, retentionDays: 14, monitorModal: env.MONITOR_MODAL === 'upstream' })
   }
   if (method === 'GET' && route === '/public/locales') return json([])
   if (method === 'GET' && route.startsWith('/public/locales/')) return json({ translations: {} })
@@ -1132,6 +1161,13 @@ export default {
     let receipt: ReceiptContext | null = null
     try {
       const url = new URL(request.url)
+      // The shared gateway checks preview identity before choosing a release.
+      // This check must not create or update a user in the shared database.
+      if (url.pathname === '/api/v1/auth/preview-verify') {
+        if (request.method !== 'GET') throw new HttpError(405, 'Method not allowed')
+        await accessIdentity(request, env)
+        return json({ ok: true })
+      }
       const user = await authenticate(request, env)
       if (!['GET','HEAD','OPTIONS'].includes(request.method) && request.headers.get('origin') !== url.origin) throw new HttpError(403,'Invalid request origin')
       if (url.pathname === '/api/v1/bsp/admin/backups' || /^\/api\/v1\/bsp\/admin\/backups\/[a-f0-9]{64}\/(verify|download)$/.test(url.pathname)) {

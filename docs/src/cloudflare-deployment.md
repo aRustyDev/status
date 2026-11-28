@@ -1,0 +1,160 @@
+# Cloudflare deployment and operations
+
+This guide describes the Workers deployment in this fork. The staging gateway serves the adapted upstream React reader and admin console, with the legacy board retained for rollback. The upstream Node deployment guides do not configure these Workers.
+
+## Prerequisites
+
+Use a Cloudflare account with Workers, D1, an active DNS zone, and Cloudflare Access connected to the engineering team's identity provider. Choose separate hostnames, Access applications, and D1 databases for staging and production. Record the Cloudflare Access team domain and each application's audience tag. An engineer with the appropriate Cloudflare permissions must create the bindings and configure the hostnames.
+
+For private checks, create a Cloudflare Tunnel with connectivity to each private origin and register an HTTP VPC Service for that origin. The tunnel connector must resolve the configured hostname and reach the service. Workers VPC requires `cloudflared` 2025.7.0 or later and QUIC transport (`auto` or `quic`), with outbound UDP port 7844 allowed. Configure certificate validation and a private CA in the VPC Service when needed. Workers VPC is a Cloudflare beta product. See [VPC Services](https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/) and [Cloudflare Tunnel for Workers VPC](https://developers.cloudflare.com/workers-vpc/configuration/tunnel/).
+
+Install the repository's Node and npm versions, then install dependencies from the lockfile:
+
+```sh
+npm ci
+npm run build -w @bsp/board
+```
+
+## Configure each environment
+
+The checked-in staging configurations contain placeholders, no routes, no endpoint registry, and a disabled probe schedule. Fill in the environment-specific values locally before deployment; never commit credentials or private endpoint details.
+
+For a standalone legacy board, configure `apps/worker/wrangler.jsonc` with the matching custom-domain route, D1 `DB` binding, `ACCESS_TEAM_DOMAIN`, and `ACCESS_AUD`. In the staging gateway deployment, the gateway owns the custom-domain route, and the internal API Workers use the matching D1 and Access settings in their gateway configurations. `ACCESS_TEAM_DOMAIN` identifies the Access team, and `ACCESS_AUD` is the audience tag of the Access application protecting that hostname. Use the values from your own Cloudflare account. Keep `workers_dev` and `preview_urls` disabled and protect the entire hostname, including assets and `/api` paths, with an Access policy for the engineering team. Test the policy before publishing the route. Consult [Wrangler environments](https://developers.cloudflare.com/workers/wrangler/environments/) for non-inheritable bindings and variables.
+
+The probe Worker uses the same environment's D1 database. In both Worker configs, set `ENDPOINTS` to the same JSON array of approved endpoints. Each item has an `id`, `name`, and absolute `url`. Public targets use HTTPS. Private targets also specify the configured VPC Service binding and service ID, as in `[{"id":"api","name":"API","url":"https://api.internal/health","binding":"PRIVATE_API","serviceId":"<VPC_SERVICE_ID>","revision":"1"}]`. The optional `revision` identifies the target configuration and must be changed whenever the service itself is changed without changing its ID. Configure the VPC Service binding in `apps/probe/wrangler.jsonc`. Infrastructure administrators manage the endpoint list and bindings. Keep staging and production databases, routes, and endpoint lists separate. A component displays the most severe of its manual status, enabled HTTP check status, and active incident impact. An enabled check with no recent result is unknown; active maintenance appears separately and does not hide an incident or a failure.
+
+In the Cloudflare monitor editor, the Checks panel supports an optional keyword, header and JSON assertions, a degraded latency threshold, and up to 20 accepted HTTP status ranges. A configured range replaces the single expected status; removing the last range restores it. Test and scheduled checks use the same validation and evaluator. GET and HEAD are supported, but HEAD cannot use keyword or JSON checks. Redirects are not followed, even if their status appears in an accepted range. Only approved destinations can be checked.
+
+> [!WARNING]
+> **Not released yet.** Cloudflare monitor tags require a build from the `main` branch (see [Deployment](deployment.md)).
+
+The editor's Tags panel adds coloured labels to Cloudflare-managed monitors. Start typing to select an existing label and its colour, or add a new label with one of the offered colours. Tags appear on the admin monitor list, where selecting tags filters for monitors carrying all of them. They also appear in the BSP public monitor payload, so do not put confidential information in tag labels. A monitor can have up to 20 tags; labels are 1–40 characters and colours are six-digit hex values. The API accepts tags as `{ "label": "production", "color": "#6366f1" }` objects. Omitting `tags` from an update preserves the existing tags. Gatus-managed monitors remain read-only and return no tags. Subscriber filtering by tag is not supported by the Cloudflare profile.
+
+Add the binding to the selected probe environment with its Cloudflare VPC Service ID:
+
+```jsonc
+"vpc_services": [{ "binding": "PRIVATE_API", "service_id": "<VPC_SERVICE_ID>" }]
+```
+
+Before synchronizing an existing pre-registry deployment, disable and drain its scheduled probe as described below. Apply D1 migrations to the intended database with the board Worker's config and environment. Check the account and database ID before passing `--remote`:
+
+```sh
+npx wrangler d1 migrations list DB --config apps/worker/wrangler.jsonc --env staging --remote
+npx wrangler d1 migrations apply DB --config apps/worker/wrangler.jsonc --env staging --remote
+```
+
+## Synchronize endpoint identities
+
+The D1 endpoint registry stores hashes of each approved URL, binding name, service ID, and optional revision. A registry change atomically invalidates affected check results. The board displays unknown for a mismatch; the guarded probe refuses mismatched targets and checks the registry again when saving results. Display names are not part of the target identity. Configure the same endpoint JSON in both Workers and make the `serviceId` match the `vpc_services` binding. Runtime bindings cannot report their service ID or detect an out-of-band edit to a VPC Service. Treat its configuration as controlled infrastructure: stop checks and update the `revision` whenever its origin, ports, TLS, or resolver changes. The sync generator verifies both Worker lists, the configured D1 IDs, and VPC binding IDs; it cannot verify the live VPC Service contents.
+
+For the **first upgrade** from a pre-registry probe, disable its Cron Trigger, deploy that disabled version, confirm the trigger is removed and all pre-registry scheduled invocations have finished before synchronizing the registry. The additive migration may be applied earlier while the registry remains empty. Cloudflare says a Cron Trigger deletion can take up to 15 minutes to propagate, and a scheduled invocation can run for up to 15 minutes; allow for both periods and confirm the old invocations have drained before proceeding. See [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/) and [Workers limits](https://developers.cloudflare.com/workers/platform/limits/). A pre-registry probe does not enforce this fence and must not run after synchronization. Do not roll back the probe to a pre-registry version after this upgrade; restoring a pre-registry board also loses mismatch masking. An ordinary Worker rollback does not roll back the registry or D1 data.
+
+For the upgrade that applies `0010_notification_transition_state.sql`, stop and drain the **old probe before applying the migration**, even if the endpoint registry has already been initialized. Deploy the old probe with its Cron Trigger removed, confirm the trigger is removed, and allow for both trigger propagation and the maximum scheduled invocation duration as described above. Confirm that old scheduled invocations and any in-flight dispatches have finished. An old probe does not maintain the new transition generation and can send or write stale jobs after migration. Keep the schedule disabled while applying the pending migrations, deploy and verify the new probe and matching operations configuration, then restore the intended Cron Trigger. Do not roll back to an old probe after migration without a compatible data recovery plan. Migration `0010` fails legacy pending or sending notification jobs and pending actions closed; legacy executing actions become uncertain because their external outcome cannot be established. Review those records and destinations rather than replaying them blindly.
+
+For the upgrade that applies `0016_dependency_observations.sql`, stop and drain the old probe before applying the migration using the same procedure. The migration copies the existing notification generation into a separate table. An old probe continues updating the original table, so it must not run during or after this handover. Apply the dependency migrations, deploy the updated probe and status API, then deploy the operations API and admin UI. Restore the probe schedule and verify fresh observations. Before rolling back to an older probe, stop and drain the current probe and reconcile notification generations and pending deliveries.
+
+For each endpoint change, serialize deployments. The registry fence prevents old results from being saved, but a running invocation may already have captured an older registry snapshot and can still contact an old target. For strict network revocation, stop and drain probes before changing or removing any endpoint. Always stop and drain probes before changing a live VPC Service itself. Update both local Worker configs, including a new revision for a changed VPC Service. Apply migrations before synchronization. Generate and review a SQL file with the intended environment and D1 database ID, then apply it to that same database. Both Workers must have an explicit `ENDPOINTS` value; use `[]` to intentionally remove all endpoints. The config files must be valid JSON when using the generator (remove JSONC comments first):
+
+```sh
+node --import tsx apps/probe/scripts/sync-endpoints.ts staging > /tmp/status-staging-endpoints.sql
+cat /tmp/status-staging-endpoints.sql
+npx wrangler d1 execute DB --config apps/worker/wrangler.jsonc --env staging --remote --file /tmp/status-staging-endpoints.sql
+```
+
+Each endpoint upsert or removal and its invalidation are atomic; the full file can be partially applied if an operation fails. Checks with mismatched definitions remain unknown and do not record results. Review errors and rerun the full sync before deploying matching board and guarded probe configurations. Never run concurrent registry synchronizations. Restore the Cron Trigger only after the guarded probe and matching registry are deployed. The SQL contains endpoint IDs and fingerprints, not URLs, but protect it as operational configuration. Never infer that a successful sync validates network reachability.
+
+All migrations reside in `apps/worker/migrations`. The following commands are for a standalone legacy board deployment, not the staging gateway. **Do not deploy the legacy Worker with its custom-domain route while the gateway owns that hostname**: the configured route can take traffic away from the gateway and its upstream screens. Use the gateway rollback procedure below for the staging cutover. For a standalone board, build and deploy the Worker with the same environment:
+
+```sh
+npm run build -w @bsp/board
+npx wrangler deploy --config apps/worker/wrangler.jsonc --env staging --dry-run
+npx wrangler deploy --config apps/worker/wrangler.jsonc --env staging
+npx wrangler deploy --config apps/probe/wrangler.jsonc --env staging --dry-run
+npx wrangler deploy --config apps/probe/wrangler.jsonc --env staging
+```
+
+For a separately configured standalone production board, replace `staging` with `production`. The staging gateway configuration does not include a production environment; provision and verify one before any production gateway deployment. Apply the complete migration set and synchronize endpoint identities before deploying the guarded board and probe Workers. Production starts with an empty Cron Trigger list. After the board is verified, set the production probe environment's `triggers.crons` to `["* * * * *"]` and deploy the probe Worker. Deployment options and the local CLI version are shown by `npx wrangler deploy --help`.
+
+## Bootstrap the first administrator
+
+After the board is deployed and protected by Access, the intended administrator signs in once. A verified Access identity is created as a viewer. A Cloudflare administrator then queries the selected environment's D1 `users` table for the account's `id`, `issuer`, `subject`, `email`, `role`, and `version`. Confirm the identity and application before updating that exact row to `admin` and incrementing `version`. Use the D1 console or `wrangler d1 execute` with `--remote`, the board config, and the explicit environment. Do not paste tokens or credentials into logs or chat. The promoted user can assign roles in the admin interface after refreshing.
+
+Backup provisioning, retention and isolated recovery verification are described in [Cloudflare D1 backups and recovery](cloudflare-backups.md). The Backups capability stays disabled until its dedicated service is provisioned and verified.
+
+## Cloudflare vault
+
+The operations API offers local vaults when its `VAULT_ENCRYPTION_KEY` Worker secret is configured as exactly 64 hexadecimal characters representing 32 cryptographically random bytes. Set this separately for each environment, using the gateway operations API configuration. Keep the key outside the database and alongside the recovery material for its backups; losing or changing it makes existing secrets unreadable. Do not rotate this encryption key until a re-encryption procedure exists. On first use the database stores an encrypted key verifier; later capability checks and operations require the original key to authenticate it. A mismatched key disables the capability.
+
+Only administrators can manage vaults. Values are encrypted with AES-256-GCM and a fresh random IV before being stored in D1. Vault and secret names are visible metadata: never put credential values in names. API responses contain metadata only; values cannot be revealed. Rotation replaces a value in place and checks its version to prevent overwriting a concurrent change. Secret deletion also checks the displayed version; if it changed, review it before retrying. Deleting a vault deletes its secrets; deletion does not guarantee erasure from D1 backups or history. External vault providers and revealing saved values remain unavailable. See [UPSTREAM.md](UPSTREAM.md) for the UI adaptation.
+
+For saved HTTP monitor Basic authentication, apply the Vault and monitor-auth migrations to the intended D1 database, then configure the same environment's Vault key as a secret in the operations API and probe Workers. Deploy the updated probe and operations and monitoring API Workers first, with matching D1 and approved `ENDPOINTS` settings and a working `PROBE` service binding on the monitoring API. Ensure the endpoint registry matches those settings and that credential-bearing targets use HTTPS, including bound private targets. Verify the key and bindings in both Workers before setting `MONITOR_AUTH_READY=true` in the probe, operations API (which saves settings and reports capability), and monitoring API (which handles monitor tests). Redeploy the probe and both APIs, then the admin UI; verify a saved check and scheduled execution with a non-sensitive synthetic credential and approved test target in staging. Administrators can select a Vault User / Password secret on a saved check; the secret value is sent only to its approved target. See [Cloudflare Vault runtime contract](cloudflare-vault-runtime.md) for the resolution and failure behavior.
+
+For custom monitor requests, apply the monitor request migration and deploy the compatible probe and APIs before setting `MONITOR_REQUEST_READY=true` in the operations and monitoring API Workers. An endpoint may specify `requestPolicy`, for example `{"allowPost":true,"plaintextHeaders":["x-monitor"],"vaultHeaders":["authorization"]}`. Configure matching endpoint policies in every API and probe configuration and synchronize the endpoint registry. Policy changes alter the destination fingerprint and invalidate previous results. POST must be explicitly enabled for a probe-safe HTTPS target and uses one attempt. Up to 20 custom headers are supported, with 2,048 UTF-8 bytes per value and 8,192 bytes in total. A JSON POST body may contain up to 16 KiB. Plaintext header values and bodies are stored and returned as configured; use Vault Secure Value references for sensitive headers. Vault-backed requests require `MONITOR_AUTH_READY` and a saved, unchanged check before testing. Verify a synthetic saved check and a scheduled result in staging before enabling the UI.
+
+The readiness flag gates saving and testing authentication and credential resolution by the probe. Remove it from the probe to stop new authenticated requests; in-flight probes using an older deployment can still complete, so drain them before changing or revoking access. An enabled credential-bearing check reports a credential-unavailable fault while readiness is disabled, until readiness is restored or its authentication is removed. Follow the endpoint synchronization and drain procedure above when changing approved targets. Notification channels and actions have separate readiness flags and deployment procedures in [Cloudflare notification channels](cloudflare-notifications.md) and [Cloudflare actions](cloudflare-actions.md).
+
+## Audit history
+
+The administrator-only Audit Log lists application mutations, including monitor, check, incident, maintenance, and role changes. It does not record Cloudflare Access sign-ins or denied requests; use Access logs for those events. Filters and pagination use the operations API, and details are restricted to an allowlist of non-sensitive values. Check events retain the associated monitor UUID and basic scheduling and status settings. Names, incident text, endpoint identifiers, advanced check configuration and credentials are not included in new audit details. Existing records are filtered on read, but their stored values are not rewritten; treat database access and backups accordingly. Deploy both operations and monitoring Workers to apply the new recording rules to both mutation paths.
+
+## Staging verification
+
+1. Sign in as a viewer, operator, and administrator. Confirm unauthenticated requests are rejected, viewers cannot write, operators cannot change roles, and administrators can view audit events. Check the JSON endpoints directly as well as the pages.
+2. Create a component, draft an incident, and confirm readers cannot see the draft. Publish it, add an update, and resolve it. Verify the audit history and that a stale edit returns a conflict.
+3. Schedule a future maintenance window and confirm it appears before start, changes state at its start and end, and can end early. Publish an overlapping incident and confirm both the impact and maintenance badge are visible.
+4. Configure one approved public HTTPS check and one private VPC Service check. Verify success, unexpected HTTP status, timeout, and recovery. Confirm an unregistered destination cannot be selected and a failure does not publish an incident. Check Workers Logs for scheduled and completed probes without logging secrets or response bodies.
+5. Verify the reader page on a direct load, the `/admin` deep links, Access expiry, and the expected D1 database and hostname for the environment. Exercise the previous Worker version against the upgraded staging schema before production.
+
+A successful dry run validates packaging; it does not validate Access, D1, Tunnel reachability, or actual scheduled execution. Record the staging environment, timestamp, and outcome of each check before production rollout.
+
+### Staging rehearsal
+
+The staging rehearsal covered role enforcement, incidents, maintenance transitions, probe recovery, Access session expiry, and rollback. See the cutover plan for the recorded outcomes. Environment-specific identifiers and internal endpoints are maintained outside this public repository.
+
+On November 23, 2026 at 11:58 p.m. Eastern, the shared monitor editor was verified in staging. Draft tests returned HTTP 200 for both approved public and private destinations. An unexpected-status test failed as expected. A disabled verification monitor was created, edited, and reopened with its destination and response check intact. Existing scheduled public and private checks also returned HTTP 200 after the probe deployment. The verification monitor remains in staging with its check disabled. Staging had no Gatus-backed monitors, so Gatus read-only behavior was verified by the local integration suite. Later local draft-preservation and timeout fixes have not yet been verified on staging.
+
+## Upstream UI staging gateway
+
+### System Health
+
+The administrator-only System Health page adapts the incorporated BetterStatusPage card, badge, and refresh UI. The Node report describes a persistent process and scheduler, so the Cloudflare page retains the presentation but uses a separate Worker report instead of inventing those metrics. See `UPSTREAM.md` and `THIRD_PARTY_LICENSE_BetterStatusPage` for attribution and license terms.
+
+The report checks the operations Worker response and D1, summarizes enabled native checks against the endpoint registry and their freshness, and checks the Gatus snapshot when configured. It does not establish scheduler liveness or report the health of each monitored service. The backup check only verifies that the configured backup service and its R2 binding respond to a read; it does not verify backup integrity or a schedule. Notification delivery health remains unavailable. When configured, static fallback health reports the last publication and its freshness. See [Cloudflare static fallback](cloudflare-static-fallback.md). Disabled checks do not make the overall report degraded; failed dependencies or stale checks do. Access authentication and the administrator role are required, and dependency errors and configuration details are not returned. Because authentication itself uses D1, a D1 outage can prevent the report from being returned at all. Deploy the backup Worker with its private `/health` endpoint before deploying an operations Worker that uses it; an older backup Worker returns 404 and will be reported unavailable until upgraded. Keep the backup Worker private and preserve its configured bindings when deploying it.
+
+The cutover gateway is configured in `apps/gateway/wrangler.jsonc`. Its staging `UI_MODE` selects `legacy` or `upstream` HTML while both `/api/v1/` and `/api/v1/bsp/` remain routed to the internal Workers. The gateway serves the legacy board from the operations Worker and forwards upstream assets to the status and admin UI Workers. Keep both UI Workers deployed during a rollback so existing tabs can load their assets.
+
+Apply the additive migrations to staging D1 using the existing migration owner before deploying code that reads aliases. Build `@bsp/shared`, `@bsp/board`, `@bsp/status`, and `@bsp/admin`. Deploy the internal Workers first, then the gateway:
+
+```sh
+npm run build -w @bsp/shared
+npm run build -w @bsp/board
+npm run build -w @bsp/status
+npm run build -w @bsp/admin
+npx wrangler deploy --config apps/probe/wrangler.jsonc --env staging
+npx wrangler deploy --config apps/gateway/status-api.wrangler.jsonc --env staging
+npx wrangler deploy --config apps/gateway/monitoring-api.wrangler.jsonc --env staging
+npx wrangler deploy --config apps/gateway/api.wrangler.jsonc --env staging
+npx wrangler deploy --config apps/gateway/status.wrangler.jsonc --env staging
+npx wrangler deploy --config apps/gateway/admin.wrangler.jsonc --env staging
+npx wrangler deploy --config apps/gateway/wrangler.jsonc --env staging
+```
+
+Run the checks and rollback rehearsal in `.agents/plans/2026-11-23-better-status-page-cloudflare-ui.md` before leaving the gateway in upstream mode. To roll back the HTML, set staging `UI_MODE` to `legacy` in the gateway configuration and redeploy the gateway. Keep both internal API contracts and UI Workers deployed so already-open upstream tabs can still load assets and use their APIs. Switch the same setting back to `upstream` and redeploy when the checks pass. Do not deploy `apps/worker/wrangler.jsonc` to the gateway-owned staging hostname as a rollback shortcut.
+
+These gateway configurations currently define staging only. Production needs separately reviewed environment-specific gateway, internal Worker, Access, D1, endpoint, and route settings; substituting `production` in the staging commands is not sufficient.
+
+The three API Worker configurations carry the same `ENDPOINTS` and D1 settings as the board and probe. Update all of them together when an approved target changes. The endpoint synchronization generator validates each configured gateway API environment against the probe before emitting SQL. Continue to use the probe drain, registry synchronization, and VPC revision procedures above.
+
+Apply migrations 0005 through 0008 before deploying the updated Workers. The monitoring API needs a `PROBE` service binding to the staging probe for draft tests. Set `MONITOR_MODAL` to `upstream` in the operations API environment to enable the shared monitor editor. Remove that setting and redeploy the operations API to restore the previous editor. Deploy the probe and monitoring API before enabling the editor, and deploy the gateway so monitor test requests reach the monitoring API.
+
+## Production deployment and rollback
+
+Before applying a production migration, capture a D1 Time Travel bookmark with the selected production database and verify its restore window. Apply additive migrations first, deploy the board, and verify the protected board before deploying and enabling the probe schedule. Check scheduled and completed checks, failure counts, and stale results in Workers Logs.
+
+To stop checks without taking down the board, remove or disable the probe Worker's Cron Trigger using the managed deployment configuration and redeploy that Worker. Roll back a Worker deployment using a registry-aware version after confirming compatibility with the current schema and the registered endpoint definitions. Worker rollbacks do not restore D1 data. If data recovery is required, use the recorded D1 bookmark following the [Time Travel documentation](https://developers.cloudflare.com/d1/reference/time-travel/) and coordinate the restoration because it affects all writes since that point.
+
+## OAuth2 and CAS monitor authentication
+
+Apply the monitor authentication provider migration before deploying code that accepts the new settings. Add the deployment-approved `authProviders` metadata to the appropriate entries in each API, probe and CAS Worker's `ENDPOINTS` configuration. Each provider has an `id`, `name` and HTTPS `url`, with optional `binding`, `serviceId` and `revision` following the endpoint binding rules. An OAuth2 URL is the token endpoint. A CAS URL is the ticket-granting endpoint ending in `/v1/tickets`. Provider identities and URLs contribute to the destination fingerprint. Synchronize the endpoint registry after reviewing the matching configurations and bindings.
+
+Deploy the private CAS Worker with the same D1 database and endpoint list as the probe. The probe resolves its saved Vault credential and passes the scoped snapshot over the service binding. Configure its `CAS_PROBE` service binding on the probe and verify private destination bindings on both Workers. Keep its routes, Workers development URL, logs and traces disabled. Deploy the probe and operations and monitoring APIs with `MONITOR_AUTH_READY`, `MONITOR_OAUTH2_READY` and `MONITOR_CAS_READY` enabled only after their bindings and key are verified. Deploy the admin UI last. Use an isolated synthetic target and credential to compare saved manual Tests and scheduled results for each enabled mode. Before rollback, remove the new readiness flags and drain in-flight checks. Existing CAS and OAuth2 checks report a credential fault until their runtime is restored or their authentication is removed.
