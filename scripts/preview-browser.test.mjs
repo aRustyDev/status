@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import { projectSettings, checkVariant } from '../.agents/skills/preview-browser/scripts/variant.mjs'
-import { statusPreviewEnvironment } from './preview/runner-auth.mjs'
+import { statusPreviewEnvironment } from '../.github/workflows/branch-previews/scripts/runner-auth.mjs'
 
 const config = JSON.parse(await readFile(new URL('../preview-browser.config.json', import.meta.url)))
 const vars = { PREVIEW_ACCESS_ORIGIN: config.origin, CF_ACCESS_CLIENT_ID: 'test-id', CF_ACCESS_CLIENT_SECRET: 'test-secret' }
