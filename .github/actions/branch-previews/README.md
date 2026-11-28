@@ -1,6 +1,6 @@
 # Branch previews
 
-Use the repository's reusable `deploy.yml` and `reconcile.yml` workflows from a trusted default-branch caller. Pin both workflow references to a full release commit. The controller reads the caller's `.github/previews.yml` at its protected default branch. The Status manifest describes its seven-Worker deployment.
+Use the repository's reusable `deploy.yml` and `reconcile.yml` workflows from a trusted default-branch caller. External callers should pin both workflow references to a full release commit. Status can reference a same-repository workflow by relative path, which uses the caller's commit; that workflow pins its action to a full commit reachable from the default branch. The controller reads the caller's `.github/previews.yml` at its protected default branch. The Status manifest describes its seven-Worker deployment.
 
 The manifest supplies the CI and preview workflow filenames, allowed branch prefixes, ordered components, static asset directories, migration directory, one idempotent seed SQL statement, and a smoke path. Internal service bindings must reference an earlier component. The last component is `gateway`. Build commands are argument arrays run only in the feature build job. The credentialed runner receives prebundled modules and validates the archive before deployment.
 
