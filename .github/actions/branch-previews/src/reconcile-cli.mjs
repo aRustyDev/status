@@ -55,7 +55,7 @@ export async function reconcile(env = process.env) {
     const run = async args => execFileSync(wrangler, args, { cwd: root, env: { ...env, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
     const dispatcherName = text(config.dispatcherName, 'dispatcher name')
     const dispatcherSource = path.join(root, 'runtime/dispatcher.ts')
-    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run, subscriberFence, executionFence })
+    const adapter = createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars, directory: temp, databaseConfig, databaseAdapter, run, subscriberFence, executionFence, drainMs: (manifest.retirementDelaySeconds ?? 0) * 1000 })
     const activate = createActivationAdapter({ store, appId, accountId, token, dispatcherName, dispatcherSource, directory: temp, run, verificationSecret: text(secrets.verificationSecret, 'verification secret'), previewUrl: text(config.previewUrl, 'preview URL'), accessHeaders: object(secrets.accessHeaders, 'Access headers'), accessTeamDomain: dispatcherVars.ACCESS_TEAM_DOMAIN, accessAud: dispatcherVars.ACCESS_AUD, serviceTokenId: dispatcherVars.PREVIEW_SERVICE_TOKEN_ID, subscriberFence, executionFenceFor: executionFence ? executionFenceFor(executionFence) : undefined })
     async function isPublishedCandidate({ ref, sha, selector }) {
       const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/flagship/apps/${encodeURIComponent(appId)}/flags/${installation().flagPrefix}branch-${branchKey(ref)}`
@@ -77,6 +77,17 @@ export async function reconcile(env = process.env) {
       retire: ref => retireDeletedBranch({ ref, store, readRemoteHead: branches.head, ...adapter }),
       recoverCandidate: (ref, sha, options) => recoverCandidate({ ref, sha, store, readRemoteHead: branches.head, activate, isPublishedCandidate, ...options }),
       cleanupAbandoned: ref => cleanupAbandoned({ ref, store, deleteResources: input => adapter.deleteAbandonedResources(input) }),
+      cleanupDeletedAbandoned: async ref => {
+        for (;;) {
+          if (await branches.head(ref) !== null) throw new Error('Branch was recreated during abandoned cleanup')
+          const before = await store.read(ref)
+          if (!before || !(before.record.abandoned || []).length) return { status: 'empty' }
+          const outcome = await cleanupAbandoned({ ref, store, graceMs: 0, deleteResources: input => adapter.deleteAbandonedResources(input) })
+          if (outcome.status === 'unresolved') return outcome
+          const after = await store.read(ref)
+          if (!after || after.revision === before.revision) return outcome
+        }
+      },
       cleanupRetained: ref => cleanupRetained({ ref, store, removeBindings: input => adapter.removeBindings(input), deleteResources: input => adapter.deleteOwnedResources(input) }),
       ciStatus: branches.ciStatus, dispatchCi: branches.dispatchCi, dispatchPreview: branches.dispatchPreview })
     console.log(JSON.stringify(result, null, 2))

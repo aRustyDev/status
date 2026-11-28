@@ -12,7 +12,7 @@ export async function cleanupAbandoned({ ref, store, deleteResources, now = Date
   const abandoned = record.abandoned || []
   if (!abandoned.length) return { status: 'empty' }
   if (record.candidate) return { status: 'busy' }
-  if (!Number.isSafeInteger(graceMs) || graceMs < 3600_000) throw new Error('Invalid abandoned cleanup grace period')
+  if (!Number.isSafeInteger(graceMs) || graceMs < 0) throw new Error('Invalid abandoned cleanup grace period')
   const unmarked = abandoned.find(item => !Number.isSafeInteger(item.abandonedAt))
   if (unmarked) {
     await save({ ...record, abandoned: abandoned.map(item => item === unmarked ? { ...item, abandonedAt: now() } : item) })
