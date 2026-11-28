@@ -6,8 +6,8 @@ import { deleteOwnedDatabase } from './database.mjs'
 
 // All callers share the deployment workflow's concurrency group. A timed-out
 // flag update stays in the inventory's disabling phase for operator recovery.
-export function createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars = {}, directory, run, databaseConfig, databaseAdapter, fetcher = fetch, now = Date.now, drainMs = 3600_000, subscriberFence, executionFence }) {
-  if (!accountId || !appId || !token || !store || !dispatcherName || !dispatcherSource || !directory || typeof run !== 'function' || !databaseConfig || !databaseAdapter || !Number.isSafeInteger(drainMs) || drainMs < 3600_000) throw new Error('Invalid retirement configuration')
+export function createRetirementAdapter({ accountId, appId, token, store, dispatcherName, dispatcherSource, dispatcherVars = {}, directory, run, databaseConfig, databaseAdapter, fetcher = fetch, now = Date.now, drainMs = 0, subscriberFence, executionFence }) {
+  if (!accountId || !appId || !token || !store || !dispatcherName || !dispatcherSource || !directory || typeof run !== 'function' || !databaseConfig || !databaseAdapter || !Number.isSafeInteger(drainMs) || drainMs < 0) throw new Error('Invalid retirement configuration')
   const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`
   async function request(url, method = 'GET', body) {
     const response = await fetcher(url, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) })
