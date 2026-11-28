@@ -30,7 +30,7 @@ jobs:
   deploy:
     if: vars.PREVIEW_AUTO_ENABLED == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.branch != '' && inputs.sha != '') || (github.event_name == 'workflow_run' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') && github.event.workflow_run.conclusion == 'success'))
     secrets: inherit
-    uses: aRustyDev/status/.github/workflows/deploy.yml@c5e3f2732beee683e1a47c3c1ecd24023cbbe2c3
+    uses: ./.github/workflows/deploy.yml
     with:
       fixture: false
       branch: ${{ github.event.workflow_run.head_branch || inputs.branch }}
