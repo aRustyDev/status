@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { once } from 'node:events'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile, lstat } from 'node:fs/promises'
 import { createServer, request } from 'node:http'
 import { createRequire } from 'node:module'
@@ -148,7 +149,15 @@ async function ownRun(settings, pairs, path, env) {
   }
 }
 
-export async function main(argv = process.argv.slice(2), ownerEnvironment = () => process.env) {
+async function projectEnvironment(config) {
+  // Resolve executable hooks only from the trusted checkout, independently of --config.
+  const adapter = resolve('.github/workflows/branch-previews/scripts/runner-auth.mjs')
+  if (config.auth !== 'access' || !existsSync(adapter)) return process.env
+  const { default: resolveEnvironment } = await import(pathToFileURL(adapter).href)
+  return resolveEnvironment(config)
+}
+
+export async function main(argv = process.argv.slice(2), ownerEnvironment = projectEnvironment) {
   const { values, positionals: [action, ...args] } = parseArgs({ args: argv, allowPositionals: true, options: {
     config: { type: 'string', default: 'preview-browser.config.json' }, path: { type: 'string', default: '/' },
     control: { type: 'boolean', default: false }, help: { type: 'boolean' },

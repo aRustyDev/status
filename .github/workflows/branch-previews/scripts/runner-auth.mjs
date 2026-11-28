@@ -38,3 +38,5 @@ export async function statusPreviewEnvironment(config, env = process.env) {
   }
   return resolved
 }
+
+export default statusPreviewEnvironment

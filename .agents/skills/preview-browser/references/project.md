@@ -2,6 +2,8 @@
 
 Set the credential's permitted origin independently in the secret store. Keep the config and launcher in a trusted checkout. Feature branch code runs on the preview deployment. Use the project's Playwright installation; the launcher resolves it from the working directory.
 
+Run `node .agents/skills/preview-browser/scripts/cli.mjs` from the trusted checkout. For unattended Access authentication, supply the credentials in the owner process environment or provide `.github/workflows/branch-previews/scripts/runner-auth.mjs` in that checkout. Its default export takes the project configuration and returns the environment for the browser owner. Only `open` and `compare` load this optional adapter.
+
 ```json
 {
   "origin": "https://preview.example.com",
