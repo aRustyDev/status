@@ -22,6 +22,8 @@ The Cloudflare monitor Actions panel reuses the upstream `ActionsSection`, adapt
 
 The Cloudflare Static Fallback screen adapts the upstream settings and status presentation. The Node implementation accepts S3 credentials and publishes a public copy. This profile uses a private, deployment-bound R2 bucket and a separate Access-protected Worker. The status reader reuses the upstream snapshot data source and banner.
 
+The Cloudflare Auth panel reuses the incorporated upstream mode selector and Vault controls. OAuth2 uses a deployment-approved token endpoint and a Vault User / Password secret for the client ID and secret. CAS uses the same Vault secret type and supports a single approved HTTPS GET service with a same-target session callback. The upstream Node flow supports additional redirect and session patterns that the Cloudflare profile does not expose.
+
 The Cloudflare Delivery History screen adapts the upstream tabbed history, filters, expandable rows and pagination to the Workers API and D1 delivery records. The upstream history components depend on the Node API's numeric identifiers, response formats and retry semantics, so the Cloudflare screen uses those UI patterns with Cloudflare-specific data and capability states. Subscriber history remains unavailable until subscriber delivery is implemented.
 
 The Cloudflare Users screen adapts the upstream Users table, role buttons, and shared components. The upstream page is coupled to Node account, password, and SSO APIs; Cloudflare Access manages identity and sign-in, while the Workers API manages application roles.

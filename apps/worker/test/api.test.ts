@@ -1402,6 +1402,23 @@ test('draft monitor tests require an admin and forward only approved destination
   } finally { delete env.PROBE; env.ENDPOINTS = '[]' }
 })
 
+test('unchanged saved unauthenticated tests use the saved check and edited drafts still work', async () => {
+  const endpoint = { id: 'saved-none', name: 'Saved None', url: 'https://example.test/' }
+  env.ENDPOINTS = JSON.stringify([endpoint])
+  let forwarded: unknown
+  env.PROBE = { async fetch(request) { forwarded = await request.json(); return Response.json({ overall: 'ok', steps: [], totalMs: 1 }) } }
+  try {
+    const component = await request('/api/v1/admin/components', operatorToken, 'POST', { name: 'Saved None' })
+    const check = await request('/api/v1/admin/checks', adminToken, 'POST', { componentId: component.body.id, endpointId: endpoint.id, enabled: true, intervalMinutes: 1, expectedStatus: 200 })
+    const body = { endpointId: endpoint.id, expectedStatus: 200, checkId: check.body.id, checkVersion: 1, advancedConfig: { method: 'GET', timeoutMs: 5000, attempts: 1 } }
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test', adminToken, 'POST', body)).response.status, 200)
+    assert.deepEqual(forwarded, { checkId: check.body.id, checkVersion: 1 })
+    const draft = { ...body, advancedConfig: { ...body.advancedConfig, keyword: 'ready' } }
+    assert.equal((await request('/api/v1/bsp/admin/monitors/test', adminToken, 'POST', draft)).response.status, 200)
+    assert.deepEqual(forwarded, { endpointId: endpoint.id, expectedStatus: 200, advancedConfig: draft.advancedConfig })
+  } finally { delete env.PROBE; env.ENDPOINTS = '[]' }
+})
+
 test('monitor test and both save paths enforce the same advanced settings size limit', async () => {
   const endpoint = { id: 'size-target', name: 'Size target', url: 'https://example.com' }
   env.ENDPOINTS = JSON.stringify([endpoint])
