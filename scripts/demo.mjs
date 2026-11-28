@@ -36,7 +36,7 @@ function must(args) {
 }
 
 if (!process.argv.includes('--skip-build')) {
-  must(['build', '-t', 'better-status-page:main', '.'])
+  must(['build', '-f', '.docker/dev/Dockerfile', '-t', 'better-status-page:main', '.'])
   must(['build', '--build-arg', 'BSP_IMAGE=better-status-page:main', '-t', 'bsp-demo-instance:local', instance])
 }
 

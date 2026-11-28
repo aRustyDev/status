@@ -31,7 +31,7 @@ Touch every layer, using `sqlserver` as the reference implementation:
 4. `apps/api/src/services/monitorConfigSchema.ts`: the zod schema of the new type's `config`. It is the one place that says what the API accepts (`validateMonitorConfig`, used when a monitor is created or changed, including the config import) and what an agent is told (`monitor_config_fields` serves its JSON Schema), and the build fails until every key of the `XConfig` interface has an entry. The Test button judges a config with the same schema. Add the type's one-line summary to `MONITOR_TYPE_SUMMARY` in `apps/api/src/mcp/monitorFields.ts`, and its `XConfig` schema to `docs/public/openapi.yaml`.
 5. `apps/admin/src/components/monitors/`: `monitorTypes.ts`, `MonitorTypeConfigFields.tsx`, `MonitorFormModal.tsx` (shared form parts such as `Note` and `SectionDivider` come from `@better-forge/ui`); also `pages/Builder.tsx` if monitor types are listed there.
 6. Tests: worker, test-runner, API route, form modal, `apps/api/test/monitor-fields.test.ts` (the schema says what it does: required, unchecked, ranges, secrets); e2e in `e2e/monitors.spec.ts` when the flow changes.
-7. Docs: `docs/monitors.md` and `docs/changelog.md`.
+7. Docs: `docs/src/monitors.md` and `docs/src/changelog.md`.
 
 Suggested flow: `architect` (if non-trivial) → `recon` checklist → implement worker and its tests → remaining layers → `quick-ops` for docs/changelog → `reviewer`.
 
@@ -83,8 +83,8 @@ Copy `apps/template` from Better-Forge (`npx degit BElluu/Better-Forge/apps/temp
 - Icons come from a subset of Material Symbols. After using a new icon name (or raising `@better-forge/*`), run `npm run build:icons` to add it to the fonts (`npm run check:icons` fails in CI otherwise).
 - Rename code, CSS, and DB identifiers when UI wording changes; names must match what the UI says.
 - Do not reference other products as the model for a feature in docs, README, or code comments.
-- README links point to `https://docs.betterstatuspage.dev/<slug>/`; the changelog lives in `docs/changelog.md`.
-- Docs for a feature that is not in a published release yet get a yellow callout at the top of its section (or page), in GitHub alert syntax so it also renders on GitHub: `> [!WARNING]` followed by `> **Not released yet.** ... build the image yourself from the `main` branch (see [Deployment](deployment.md)).` List the feature under `## [Unreleased]` in `docs/changelog.md`. When the feature ships, remove the callout and move the changelog entry to the release.
-- Keep the docs in sync with the code. On every bug fix and every new feature, check whether `docs/`, `README.md`, and the changelog (`docs/changelog.md`) are still true and up to date, and update whatever the change made wrong or incomplete. Do not finish the task before this check.
+- README links point to `https://docs.betterstatuspage.dev/<slug>/`; the changelog lives in `docs/src/changelog.md`.
+- Docs for a feature that is not in a published release yet get a yellow callout at the top of its section (or page), in GitHub alert syntax so it also renders on GitHub: `> [!WARNING]` followed by `> **Not released yet.** ... build the image yourself from the `main` branch (see [Deployment](deployment.md)).` List the feature under `## [Unreleased]` in `docs/src/changelog.md`. When the feature ships, remove the callout and move the changelog entry to the release.
+- Keep the docs in sync with the code. On every bug fix and every new feature, check whether `docs/`, `docs/src/README.md`, and the changelog (`docs/src/changelog.md`) are still true and up to date, and update whatever the change made wrong or incomplete. Do not finish the task before this check.
 - Do not add AI attribution (no `Co-Authored-By`, no AI mentions) to commits, PRs, or comments.
 - For styling that must be consistent with the admin, reuse the existing admin design tokens instead of choosing new colours.

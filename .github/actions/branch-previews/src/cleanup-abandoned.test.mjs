@@ -24,3 +24,10 @@ test('unconfirmed database intent stays recorded for later inspection', async ()
   assert.equal(f.record.abandoned[0].resources.databaseIntent.name, 'db')
   assert.equal(f.record.abandonedCleanup, null)
 })
+
+test('zero grace cleans a known abandoned candidate without an hour delay', async () => {
+  const f = fixture()
+  const result = await cleanupAbandoned({ ref: f.record.ref, store: f.store, graceMs: 0, now: () => 2, deleteResources: async () => ({}) })
+  assert.equal(result.status, 'deleted')
+  assert.deepEqual(f.record.abandoned, [])
+})

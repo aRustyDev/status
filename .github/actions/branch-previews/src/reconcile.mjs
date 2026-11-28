@@ -2,7 +2,7 @@ import { branchPolicy } from './release-contract.mjs'
 
 // Run under the same non-preemptive workflow concurrency group as deployments.
 // A failed or ambiguous candidate is reported instead of being overwritten.
-export async function reconcilePreviews({ branches, store, retire, recoverCandidate, cleanupAbandoned, cleanupRetained, revokeAmbiguousSubscribers, drainAmbiguousExecution, ciStatus, dispatchCi, dispatchPreview, now = Date.now }) {
+export async function reconcilePreviews({ branches, store, retire, recoverCandidate, cleanupAbandoned, cleanupDeletedAbandoned, cleanupRetained, revokeAmbiguousSubscribers, drainAmbiguousExecution, ciStatus, dispatchCi, dispatchPreview, now = Date.now }) {
   const [remote, initialInventory] = await Promise.all([branches.list(), store.list()])
   let inventory = initialInventory
   const result = { retired: [], scheduled: [], pending: [], errors: [] }
@@ -58,6 +58,10 @@ export async function reconcilePreviews({ branches, store, retire, recoverCandid
       }
       const outcome = await retire(record.ref)
       result.retired.push({ ref: record.ref, status: outcome.status })
+      if (outcome.status === 'deleted' && typeof cleanupDeletedAbandoned === 'function') {
+        const cleanup = await cleanupDeletedAbandoned(record.ref)
+        if (cleanup?.status === 'unresolved') result.pending.push({ ref: record.ref, reason: 'database creation intent has no recorded identity' })
+      }
     } catch (error) {
       result.errors.push({ ref: record.ref, message: error.message })
     }

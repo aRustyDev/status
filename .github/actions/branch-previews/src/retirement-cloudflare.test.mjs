@@ -6,6 +6,29 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { newRelease } from './release-contract.mjs'
 import { createRetirementAdapter } from './retirement-cloudflare.mjs'
+
+test('retirement delay defaults to zero and supports a configured interval', async () => {
+  let now = 1_000
+  const ref = 'refs/heads/feat/test'
+  let flag = { enabled: true, default_variation: 'current', rules: [], variations: { current: {} } }
+  const options = {
+    accountId: 'account', appId: 'app', token: 'token', store: {}, dispatcherName: 'dispatcher',
+    dispatcherSource: '/dispatcher.ts', directory: '/tmp', run: async () => {},
+    databaseConfig: {}, databaseAdapter: {}, now: () => now,
+    fetcher: async () => ({ ok: true, json: async () => ({ success: true, result: flag }) }),
+  }
+  const immediate = createRetirementAdapter(options)
+  assert.equal(await immediate.propagationElapsed(1_000, ref), true)
+  const delayed = createRetirementAdapter({ ...options, drainMs: 60_000 })
+  assert.equal(await delayed.propagationElapsed(1_000, ref), false)
+  now = 61_000
+  assert.equal(await delayed.propagationElapsed(1_000, ref), true)
+  flag = { ...flag, variations: { current: { selector: 'unexpected' } } }
+  assert.equal(await immediate.propagationElapsed(1_000, ref), false)
+  for (const drainMs of [-1, 0.5, NaN]) {
+    assert.throws(() => createRetirementAdapter({ ...options, drainMs }), /Invalid retirement configuration/)
+  }
+})
 import { installation } from './installation.mjs'
 
 test('retirement drains the flag, preserves other bindings and removes only owned workers', async () => {

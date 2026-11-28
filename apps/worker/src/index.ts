@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify } from 'jose'
+import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose'
 import { enqueueSubscriberDeliveries, flushSubscriberDeliveries } from './subscriber-delivery'
 import { endpointFingerprint, parseEndpoints, type Endpoint } from './endpoint-config'
 import { getGatusSnapshot, type GatusBinding, type GatusCatalogEntry } from './gatus'
@@ -40,6 +40,9 @@ interface Env extends EmailChannelEnv {
   MONITOR_MODAL?: string
   ACCESS_TEAM_DOMAIN: string
   ACCESS_AUD: string
+  PREVIEW_BROWSER_CLIENT_ID?: string
+  PREVIEW_BROWSER_ORIGIN?: string
+  DEPLOYMENT_ENVIRONMENT?: string
   ENDPOINTS: string
   GATUS?: GatusBinding
   GATUS_REQUIRED?: string
@@ -168,22 +171,37 @@ function stableJson(value: unknown): string {
 function effectiveTestConfig(value: Json): Json {
   return { ...value, method: typeof value.method === 'string' ? value.method.toUpperCase() : 'GET', timeoutMs: value.timeoutMs ?? 10_000, attempts: value.attempts ?? 1 }
 }
-async function accessIdentity(request: Request, env: Env): Promise<{ issuer: string; subject: string; email: string }> {
+type AccessIdentity = Pick<User, 'issuer' | 'subject' | 'email'> & { previewBrowser?: true }
+
+async function accessIdentity(request: Request, env: Env): Promise<AccessIdentity> {
   const token = request.headers.get('Cf-Access-Jwt-Assertion')
   if (!token || !env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) throw new HttpError(401, 'Access authentication required')
   const issuer = `https://${env.ACCESS_TEAM_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '')}`
-  let subject: string
-  let email: string
+  let payload: JWTPayload
   try {
-    const { payload } = await jwtVerify(token, accessKeySet(issuer), { issuer, audience: env.ACCESS_AUD })
-    if (typeof payload.sub !== 'string' || typeof payload.email !== 'string' || !payload.email) throw new Error('Missing human identity')
-    subject = payload.sub
-    email = payload.email
+    const verified = await jwtVerify(token, accessKeySet(issuer), { issuer, audience: env.ACCESS_AUD, algorithms: ['RS256'], requiredClaims: ['exp'] })
+    payload = verified.payload
   } catch { throw new HttpError(401, 'Invalid Access identity') }
-  return { issuer, subject, email }
+  if (payload.common_name !== undefined) {
+    const url = new URL(request.url)
+    if (env.DEPLOYMENT_ENVIRONMENT !== 'staging' || !env.PREVIEW_BROWSER_CLIENT_ID || payload.common_name !== env.PREVIEW_BROWSER_CLIENT_ID ||
+        payload.type !== 'app' || url.protocol !== 'https:' || url.origin !== env.PREVIEW_BROWSER_ORIGIN) {
+      throw new HttpError(401, 'Invalid Access identity')
+    }
+    // A gateway identity subrequest is a GET even when the original request would mutate.
+    const originalMethod = request.headers.get('X-Status-Identity-Method') ?? request.method
+    if (!['GET', 'HEAD'].includes(request.method) || !['GET', 'HEAD'].includes(originalMethod)) {
+      throw new HttpError(403, 'Preview browser is read-only')
+    }
+    return { issuer, subject: payload.common_name, email: 'preview-browser@automation.invalid', previewBrowser: true }
+  }
+  if (typeof payload.sub !== 'string' || typeof payload.email !== 'string' || !payload.email) throw new HttpError(401, 'Invalid Access identity')
+  return { issuer, subject: payload.sub, email: payload.email }
 }
 async function authenticate(request: Request, env: Env): Promise<User> {
-  const { issuer, subject, email } = await accessIdentity(request, env)
+  const identity = await accessIdentity(request, env)
+  if (identity.previewBrowser) return { ...identity, id: 'preview-browser', role: 'viewer', version: 1 }
+  const { issuer, subject, email } = identity
   await env.DB.prepare('INSERT INTO users (id, issuer, subject, email) VALUES (?, ?, ?, ?) ON CONFLICT(issuer, subject) DO UPDATE SET email=excluded.email').bind(id(), issuer, subject, email).run()
   const user = await env.DB.prepare('SELECT * FROM users WHERE issuer=? AND subject=?').bind(issuer, subject).first<User>()
   if (!user) throw new Error('User lookup failed')
