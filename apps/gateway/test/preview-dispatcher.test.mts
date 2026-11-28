@@ -67,6 +67,24 @@ test('rejects malformed, disabled, unknown, and unavailable branch routes', asyn
   route = { selector, release: sha }
 })
 
+test('returns an uncached 404 for a deleted selector flag and keeps evaluation failures unavailable', async () => {
+  try {
+    flagError = 'FLAG_NOT_FOUND'
+    const missing = await gateway.fetch(request(), env)
+    assert.equal(missing.status, 404)
+    assert.equal(await missing.text(), 'Preview not found')
+    assert.equal(missing.headers.get('Cache-Control'), 'no-store')
+    assert.equal(missing.headers.get('X-Status-Preview-Commit'), null)
+
+    for (const error of ['GENERAL', 'TYPE_MISMATCH', 'PARSE_ERROR']) {
+      flagError = error
+      assert.equal((await gateway.fetch(request(), env)).status, 503)
+    }
+  } finally {
+    flagError = undefined
+  }
+})
+
 test('verifies a bound candidate only with a valid, fresh signature and Access identity', async () => {
   const secret = 'private-verification-secret-32-bytes-long'
   const verifyEnv = { FLAGS: flags, PREVIEW_VERIFY_SECRET: secret, [binding]: target } as never
