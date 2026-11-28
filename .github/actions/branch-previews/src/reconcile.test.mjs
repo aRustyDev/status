@@ -19,6 +19,20 @@ test('reconciliation retires deleted branches and schedules only tested, current
   assert.equal(result.pending[0].ref, pending.ref)
 })
 
+test('cleans abandoned resources after a deleted branch is retired', async () => {
+  const ref = 'refs/heads/feat/deleted'
+  const events = []
+  const result = await reconcilePreviews({
+    branches: { list: async () => [], head: async () => null },
+    store: { list: async () => [{ record: { ref } }] },
+    retire: async () => { events.push('retire'); return { status: 'deleted' } },
+    cleanupDeletedAbandoned: async actual => { assert.equal(actual, ref); events.push('abandoned'); return { status: 'empty' } },
+    ciStatus: async () => assert.fail(), dispatchCi: async () => assert.fail(), dispatchPreview: async () => assert.fail(),
+  })
+  assert.deepEqual(events, ['retire', 'abandoned'])
+  assert.deepEqual(result.errors, [])
+})
+
 test('missing CI is dispatched once and failed CI is not retried by reconciliation', async () => {
   const sha = 'a'.repeat(40)
   const calls = []

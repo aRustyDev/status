@@ -176,6 +176,11 @@ jobs:
       - name: Staging preview tests
         run: node --test scripts/preview-browser.test.mjs skills/preview-browser/scripts/provider.test.mjs scripts/preview/*.test.mjs apps/gateway/preview-subscriber-scheduler.test.mjs
 
+      - name: Branch preview controller tests
+        run: |
+          npm ci --ignore-scripts --prefix .github/actions/branch-previews
+          npm test --prefix .github/actions/branch-previews
+
       - name: Fallback routing tests
         run: node --import tsx --test apps/fallback/test/*.test.mts
 
