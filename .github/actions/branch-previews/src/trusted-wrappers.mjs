@@ -45,7 +45,7 @@ export async function buildTrustedPreviewWrappers({ control, branchDir, dir, fix
     output[name] = outfile
   }
   if (fixtureSource) {
-    if (!path.isAbsolute(fixtureSource) || realpathSync(fixtureSource) !== realpathSync(path.join(control,'apps/preview-fixture/index.mjs'))) throw new Error('Invalid trusted fixture source')
+    if (!path.isAbsolute(fixtureSource) || realpathSync(fixtureSource) !== realpathSync(path.join(runtime,'fixture/index.mjs'))) throw new Error('Invalid trusted fixture source')
     await compile('fixture', [
       `import fixture from ${JSON.stringify(fixtureSource)}`,
       `import { wrapPreviewFixture } from ${JSON.stringify(path.join(runtime,'preview-fixture-fence.mjs'))}`,

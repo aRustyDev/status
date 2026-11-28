@@ -123,8 +123,8 @@ export async function main(env = process.env) {
   const subscriber = fixture.isolatedFallback ? null : schemaSubscriberSettings({ value:approval, environment:policy.environment, branch:policy.name, sha, branchDir, previewUrl:previewUrl.href })
   if (subscriber && fixture.enabled) throw new Error('Legacy subscriber approval and isolated fixtures are mutually exclusive')
   if (fixture.enabled) validateFixtureArtifactApproval({ approval:{...fixtureConfig.branches[ref],enabled:true}, sha, branchDir, manifest })
-  const fixtureSource = fixture.enabled ? ownedPath(control, 'apps/preview-fixture/index.mjs') : null
-  const fixtureSql = fixture.enabled ? ownedPath(control, 'apps/preview-fixture/schema.sql') : null
+  const fixtureSource = fixture.enabled ? path.join(root, 'runtime/fixture/index.mjs') : null
+  const fixtureSql = fixture.enabled ? path.join(root, 'runtime/fixture/schema.sql') : null
   const casSource = fixture.cas ? path.join(branchDir, 'workers', 'cas.mjs') : null
   if (fixture.cas && !existsSync(casSource)) throw new Error('Approved CAS fixture requires the feature CAS Worker')
   const wrangler = path.join(root, 'node_modules', '.bin', 'wrangler')
