@@ -7,9 +7,9 @@ import { createServer } from 'node:https'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
-import gatewayModule from '../../../apps/gateway/index.ts'
-import workerModule from '../../../apps/worker/src/index.ts'
-import dispatcherModule from '../../../.github/actions/branch-previews/runtime/dispatcher.ts'
+import gatewayModule from '../../../../apps/gateway/index.ts'
+import workerModule from '../../../../apps/worker/src/index.ts'
+import dispatcherModule from '../../../actions/branch-previews/runtime/dispatcher.ts'
 
 const gateway = gatewayModule.default ?? gatewayModule
 const worker = workerModule.default ?? workerModule

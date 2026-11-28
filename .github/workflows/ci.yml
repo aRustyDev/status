@@ -122,7 +122,7 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Headless preview browser pilot
-        run: node --test scripts/preview-browser.e2e.mjs
+        run: node --test .github/workflows/branch-previews/test/preview-browser.e2e.mjs
 
       - name: End-to-end tests
         run: npm run test:e2e
