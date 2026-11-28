@@ -22,6 +22,38 @@ test('credentials are pinned independently of the project configuration', () => 
   assert.throws(() => projectSettings({ ...config, identity: { ...config.identity, path: '//example.org/' } }, vars))
   assert.throws(() => projectSettings({ ...config, requiredPaths: ['//example.org/'] }, vars))
   assert.throws(() => projectSettings({ ...config, requiredPaths: 'invalid' }, vars))
+  for (const header of ['Authorization', 'X-Preview', 'x-revision', '', 'X-Bad Header', null]) {
+    assert.throws(() => projectSettings({ ...config, expectedRevisionRequestHeader: header }, vars))
+  }
+  assert.equal(projectSettings({ ...config, expectedRevisionRequestHeader: 'X-Expected-Revision' }, vars).expectedRevisionRequestHeader, 'X-Expected-Revision')
+})
+
+test('expected revision request headers are isolated by context and never added cross-origin', async () => {
+  const contexts = []
+  const browser = { newContext: async () => {
+    const revision = contexts.length === 0 ? 'revision-a' : contexts.length === 1 ? 'revision-b' : 'revision-default'
+    const sent = []
+    let paused
+    const session = { on: (event, handler) => { if (event === 'Fetch.requestPaused') paused = handler }, send: async (method, params) => { sent.push({method,params}) } }
+    const context = { on: () => {}, close: async () => {}, newCDPSession: async () => session, newPage: async () => page }
+    const page = { context: () => context, on: () => {}, goto: async url => ({ ok: () => true, url: () => url, headerValue: async () => revision }) }
+    contexts.push({sent, request: event => paused(event)})
+    return context
+  } }
+  const settings = { ...config, headers: {}, identity: undefined, expectedRevisionRequestHeader: 'X-Expected-Revision' }
+  await openVariant(browser, settings, 'branch-a', 'revision-a', '/')
+  await openVariant(browser, settings, 'branch-b', 'revision-b', '/')
+  await openVariant(browser, { ...settings, expectedRevisionRequestHeader: undefined }, 'branch-default', 'revision-default', '/')
+  for (const [index, expected] of ['revision-a', 'revision-b', undefined].entries()) {
+    const context = contexts[index]
+    assert.deepEqual(context.sent[0], {method:'Fetch.enable',params:{patterns:[{urlPattern:config.origin+'/*',requestStage:'Request'}]}})
+    await context.request({requestId:'same',request:{url:config.origin+'/api',headers:{'X-Expected-Revision':'caller-value'}}})
+    const headers = new Headers(context.sent.at(-1).params.headers.map(({name,value})=>[name,value]))
+    assert.equal(headers.get('X-Preview'), index === 0 ? 'branch-a' : index === 1 ? 'branch-b' : 'branch-default')
+    assert.equal(headers.get('X-Expected-Revision'), expected ?? 'caller-value')
+    await context.request({requestId:'other',request:{url:'https://other.example.net/api',headers:{}}})
+    assert.deepEqual(context.sent.at(-1), {method:'Fetch.continueRequest',params:{requestId:'other'}})
+  }
 })
 
 test('a failing required API check closes its browser context before reporting readiness', async () => {

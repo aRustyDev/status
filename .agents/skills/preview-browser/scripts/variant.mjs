@@ -14,6 +14,14 @@ export function projectSettings(config, env = process.env) {
   if (!/^x-/i.test(config.selectorHeader) || config.selectorHeader.toLowerCase() === config.revisionHeader.toLowerCase()) {
     throw new Error('Configure distinct routing and revision headers with an X-prefixed routing header.')
   }
+  if (config.expectedRevisionRequestHeader !== undefined) {
+    const header = config.expectedRevisionRequestHeader
+    if (typeof header !== 'string') throw new Error('Expected revision request header must be a distinct X-prefixed header.')
+    validateHeaderName(header)
+    if (!/^x-/i.test(header) || [config.selectorHeader, config.revisionHeader].some(name => name.toLowerCase() === header.toLowerCase())) {
+      throw new Error('Expected revision request header must be a distinct X-prefixed header.')
+    }
+  }
   if (config.allowSelfSignedLoopback && (!localOrigin(url) || config.backend !== 'local')) {
     throw new Error('Self-signed TLS is available only for a local browser testing a loopback origin.')
   }
@@ -86,7 +94,8 @@ export async function openVariant(browser, settings, selector, revision, path) {
     const page = await context.newPage()
     // Commands and grants address this specific tab. A popup is a separate target.
     context.on('page', other => { if (other !== page) void other.close().catch(() => {}) })
-    await intercept(page, settings.origin, { ...settings.headers, [settings.selectorHeader]: selector })
+    await intercept(page, settings.origin, { ...settings.headers, [settings.selectorHeader]: selector,
+      ...(settings.expectedRevisionRequestHeader ? { [settings.expectedRevisionRequestHeader]: revision } : {}) })
     let documentRevision = Promise.resolve(null)
     page.on('response', response => {
       const request = response.request()
