@@ -34,6 +34,10 @@ export function projectSettings(config, env = process.env) {
     if (!config.identity?.path || !Object.keys(config.identity.equals ?? {}).length) throw new Error('Configure an identity endpoint and expected principal fields.')
     projectUrl(config.origin, config.identity.path)
   }
+  if (config.requiredPaths !== undefined) {
+    if (!Array.isArray(config.requiredPaths) || config.requiredPaths.length > 10) throw new Error('Configure up to ten required preview paths.')
+    for (const path of config.requiredPaths) projectUrl(config.origin, path)
+  }
   return { ...config, headers }
 }
 
@@ -109,6 +113,10 @@ export async function openVariant(browser, settings, selector, revision, path) {
       if (!principal || !Object.entries(settings.identity.equals).every(([k,v]) => principal[k] === v)) {
         throw new Error('The app did not confirm the expected preview identity and role.')
       }
+    }
+    for (const requiredPath of settings.requiredPaths || []) {
+      try { await goto(projectUrl(settings.origin, requiredPath)) }
+      catch { throw new Error(`Preview readiness check failed for ${requiredPath}: the endpoint must return HTTP success for the requested revision.`) }
     }
     await goto(dest)
     return { context, page, selector, revision, verifyPage, navigate: path => goto(projectUrl(settings.origin, path)) }
