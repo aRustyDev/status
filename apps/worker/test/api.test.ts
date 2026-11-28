@@ -272,6 +272,60 @@ test('only the isolated preview viewer can inspect the Actions editor without ga
   }
 })
 
+test('dedicated isolated preview editor can change only its own unlinked fixture actions', async () => {
+  const editorId='isolated-editor.access', editorAud='isolated-editor-aud', origin='https://editor.example'
+  const token=await signService(editorId,editorAud)
+  const settings={ ...env, API_SCOPE:'operations', PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:'737597c9ba1d3cc17826ea2f2b48a9d259e03dbf1acd241dc62d886da5c20511', PREVIEW_RELEASE:'b'.repeat(40), DEPLOYMENT_ENVIRONMENT:'staging', PREVIEW_BROWSER_ORIGIN:'https://status.example', PREVIEW_BROWSER_CLIENT_ID:'preview-browser.access', PREVIEW_EDITOR_ORIGIN:origin, PREVIEW_EDITOR_ISSUER:issuer, PREVIEW_EDITOR_AUD:editorAud, PREVIEW_EDITOR_CLIENT_ID:editorId, VAULT_ENCRYPTION_KEY:'ab'.repeat(32), ACTIONS_READY:'true', ACTION_ENDPOINTS:JSON.stringify([{id:'issue14-isolated-sink',name:'Sink',url:'https://sink.invalid/',binding:'ABSENT',serviceId:'sink'}]) }
+  const fetchApi=(path:string,method='GET',body?:unknown,config:object=settings,jwt=token,requestOrigin=origin) => worker.fetch(new Request(origin+path,{method,headers:{'Cf-Access-Jwt-Assertion':jwt,origin:requestOrigin,'content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})}),config as never)
+  const action={name:'Fixture',endpointId:'issue14-isolated-sink',vaultId:238010605399733,secretId:218386432287168,enabled:true,checkIds:[],checkSnapshots:[],triggerStatus:'down'}
+  let actionId=''
+  try {
+    const identity=await (await fetchApi('/api/v1/auth/me')).json() as {id:string;role:string;previewActionsEditor?:boolean;previewActionsEditorWrite?:boolean}
+    assert.deepEqual([identity.id,identity.role,identity.previewActionsEditor,identity.previewActionsEditorWrite],['preview-editor','viewer',true,true])
+    assert.equal((await fetchApi('/api/v1/bsp/admin/vaults')).status,200)
+    for (const path of ['/api/v1/bsp/admin/users','/api/v1/bsp/admin/notifications','/api/v1/bsp/admin/vaults/1/secrets','/api/v1/bsp/admin/actions/monitor/00000000-0000-4000-8000-000000000001']) assert.equal((await fetchApi(path)).status,403,path)
+    assert.equal((await fetchApi('/api/v1/bsp/admin/vaults','POST',{})).status,403)
+    assert.equal((await fetchApi('/api/v1/bsp/admin/actions','POST',{...action,checkIds:['00000000-0000-4000-8000-000000000001']})).status,400)
+    assert.equal((await fetchApi('/api/v1/bsp/admin/actions','POST',{...action,endpointId:'other'})).status,400)
+    assert.equal((await fetchApi('/api/v1/bsp/admin/actions','POST',action,settings,token,'https://evil.example')).status,403)
+    const created=await fetchApi('/api/v1/bsp/admin/actions','POST',action)
+    assert.equal(created.status,201)
+    const value=await created.json() as {id:string;version:number}
+    actionId=value.id
+    const otherId='00000000-0000-4000-8000-000000000002'
+    await db.prepare("INSERT INTO worker_actions (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,trigger_status,enabled,created_at,updated_at) SELECT ?, 'Other owner', endpoint_id,endpoint_fingerprint,vault_id,secret_id,trigger_status,enabled,created_at,updated_at FROM worker_actions WHERE id=?").bind(otherId,actionId).run()
+    const visible=await (await fetchApi('/api/v1/bsp/admin/actions')).json() as {id:string}[]
+    assert.deepEqual(visible.map(item=>item.id),[actionId])
+    assert.equal((await fetchApi(`/api/v1/bsp/admin/actions/${otherId}`,'DELETE',{version:1})).status,403)
+    assert.deepEqual(await (await fetchApi('/api/v1/bsp/admin/actions/checks')).json(),[])
+    assert.deepEqual(await (await fetchApi('/api/v1/bsp/admin/actions/runs')).json(),[])
+    await db.prepare('DELETE FROM worker_actions WHERE id=?').bind(otherId).run()
+    await db.prepare("UPDATE audit_events SET actor_email='someone-else@example.test' WHERE entity_type='action' AND entity_id=? AND action='create'").bind(actionId).run()
+    assert.equal((await fetchApi(`/api/v1/bsp/admin/actions/${actionId}`,'PATCH',{...action,name:'Not owned',version:value.version})).status,403)
+    assert.equal((await fetchApi(`/api/v1/bsp/admin/actions/${actionId}`,'DELETE',{version:value.version})).status,403)
+    await db.prepare("UPDATE audit_events SET actor_email='preview-editor@automation.invalid' WHERE entity_type='action' AND entity_id=? AND action='create'").bind(actionId).run()
+    const update=await fetchApi(`/api/v1/bsp/admin/actions/${actionId}`,'PATCH',{...action,name:'Updated fixture',version:value.version})
+    assert.equal(update.status,200)
+    const updated=await update.json() as {name:string;version:number}
+    assert.equal(updated.name,'Updated fixture')
+    assert.equal((await fetchApi(`/api/v1/bsp/admin/actions/${actionId}`,'DELETE',{version:updated.version})).status,200)
+    assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM worker_action_outbox').first<{n:number}>())?.n,0)
+    const otherScope={...settings,PREVIEW_SUBSCRIBER_SCOPE:'wrong'}
+    assert.equal((await fetchApi('/api/v1/auth/me','GET',undefined,otherScope)).status,401)
+    for (const bad of [await signService('other.access',editorAud),await signService(editorId,audience),await signService(editorId,editorAud,'-1m'),await signService(editorId,editorAud,'5m','org')]) assert.equal((await fetchApi('/api/v1/auth/me','GET',undefined,settings,bad)).status,401)
+    assert.equal((await fetchApi('/api/v1/auth/me','GET',undefined,{...settings,PREVIEW_EDITOR_AUD:audience})).status,401)
+    assert.equal((await fetchApi('/api/v1/auth/me','GET',undefined,{...settings,PREVIEW_EDITOR_CLIENT_ID:'preview-browser.access'})).status,401)
+    assert.equal((await worker.fetch(new Request('https://status.example/api/v1/auth/me',{headers:{'Cf-Access-Jwt-Assertion':token}}),settings as never)).status,401)
+  } finally {
+    if (actionId) await db.prepare('DELETE FROM worker_actions WHERE id=?').bind(actionId).run()
+    await db.prepare("DELETE FROM audit_events WHERE actor_email='preview-editor@automation.invalid' OR id='issue14-isolated-vault-fixture-v1'").run()
+    await db.prepare('DELETE FROM vault_secrets WHERE id=218386432287168').run()
+    await db.prepare('DELETE FROM vaults WHERE id=238010605399733').run()
+    await db.prepare('DELETE FROM vault_key_verifier').run()
+    await db.prepare("DELETE FROM users WHERE id='issue14-preview-editor-actor'").run()
+  }
+})
+
 test('gateway checks authenticated preview navigation and API requests without touching baseline D1', async () => {
   const isolatedEnv = { ...env, DB: { prepare: () => { throw new Error('Baseline D1 was accessed') } } }
   let dispatches = 0

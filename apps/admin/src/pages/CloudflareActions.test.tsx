@@ -44,6 +44,26 @@ describe('Cloudflare actions',()=>{
   expect(within(form).getByRole('button',{name:'Save Action'})).toBeDisabled()
   expect(api.patch).not.toHaveBeenCalled()
  })
+ it('preselects only the isolated fixture for a scoped editor',async()=>{
+  const client=new QueryClient({defaultOptions:{queries:{retry:false}}})
+  vi.mocked(api.get).mockImplementation(async path=>{
+   if(path==='/admin/actions') return []
+   if(path==='/admin/actions/destinations') return [{id:'issue14-isolated-sink',name:'Issue 14 isolated sink'}]
+   if(path==='/admin/actions/checks') return []
+   if(path==='/admin/vaults') return [{id:238010605399733,name:'Issue 14 isolated preview'}]
+   if(path==='/admin/vaults/238010605399733/secrets') return [{id:218386432287168,name:'Synthetic preview token',type:'value'}]
+   return []
+  })
+  render(<MemoryRouter><QueryClientProvider client={client}><CapabilitiesContext.Provider value={{supportedRoutes:[]}}><CloudflareActions previewWriter /></CapabilitiesContext.Provider></QueryClientProvider></MemoryRouter>)
+  const user=userEvent.setup();await user.click(await screen.findByRole('button',{name:'Add Action'}));const form=screen.getByRole('dialog')
+  await user.type(within(form).getByLabelText('Action name'),'Fixture')
+  await waitFor(()=>expect(within(form).getByLabelText('Approved action destination')).toHaveValue('issue14-isolated-sink'))
+  await waitFor(()=>expect(within(form).getByLabelText('Vault')).toHaveValue('238010605399733'))
+  await waitFor(()=>expect(within(form).getByLabelText('Secure Value secret')).toHaveValue('218386432287168'))
+  vi.mocked(api.post).mockResolvedValueOnce({})
+  await user.click(within(form).getByRole('button',{name:'Create Action'}))
+  await waitFor(()=>expect(api.post).toHaveBeenCalledWith('/admin/actions',expect.objectContaining({name:'Fixture',endpointId:'issue14-isolated-sink',vaultId:238010605399733,secretId:218386432287168,checkIds:[]})))
+ })
  it('warns when the isolated fixture destination is configured',async()=>{
   vi.mocked(api.get).mockImplementation(async path=>path==='/admin/actions/destinations'?[{id:'issue14-isolated-sink',name:'Issue 14 isolated sink'}]:[])
   setup()

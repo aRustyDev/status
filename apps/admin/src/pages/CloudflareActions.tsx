@@ -15,7 +15,7 @@ type Vault = {id:number;name:string}
 type Secret = {id:number;name:string;type:string}
 type Delivery = {actionId:string;checkId:string;status:string;state:string;updatedAt:number}
 
-export default function CloudflareActions({readOnly=false}: {readOnly?:boolean}) {
+export default function CloudflareActions({readOnly=false,previewWriter=false}: {readOnly?:boolean;previewWriter?:boolean}) {
   const capabilities = useCapabilities()
   const qc=useQueryClient(), [editing,setEditing]=useState<Action|'new'|null>(null), [removing,setRemoving]=useState<Action|null>(null)
   const [busy,setBusy]=useState(false), [message,setMessage]=useState('')
@@ -74,12 +74,12 @@ export default function CloudflareActions({readOnly=false}: {readOnly?:boolean})
       {deliveries.data?.length===0 && <p>No action runs yet.</p>}
       {deliveries.data?.map((delivery,index)=><p key={`${delivery.actionId}-${delivery.checkId}-${delivery.updatedAt}-${index}`} className="text-sm">{actions.data?.find(c=>c.id===delivery.actionId)?.name ?? 'Action'}: {delivery.status}, {delivery.state}</p>)}
     </section>
-    {editing && <ActionForm readOnly={readOnly} action={editing==='new'?null:editing} onClose={()=>setEditing(null)} onSaved={async()=>{setEditing(null);await qc.invalidateQueries({queryKey:['worker-actions']})}} />}
+    {editing && <ActionForm readOnly={readOnly} previewWriter={previewWriter} action={editing==='new'?null:editing} onClose={()=>setEditing(null)} onSaved={async()=>{setEditing(null);await qc.invalidateQueries({queryKey:['worker-actions']})}} />}
     {removing && <ConfirmModal title="Delete action" message={`Delete "${removing.name}"? Its pending runs and history will also be removed.${message ? ` ${message}` : ''}`} confirmLabel="Delete" pending={busy} pendingLabel="Deleting…" onConfirm={() => void remove()} onCancel={() => { if (!busy) setRemoving(null) }} />}
   </PageContainer>
 }
 
-function ActionForm({action,onClose,onSaved,readOnly}:{action:Action|null;onClose:()=>void;onSaved:()=>Promise<void>;readOnly:boolean}) {
+function ActionForm({action,onClose,onSaved,readOnly,previewWriter}:{action:Action|null;onClose:()=>void;onSaved:()=>Promise<void>;readOnly:boolean;previewWriter:boolean}) {
   const titleId = useId()
   const [name,setName]=useState(action?.name??''), [endpointId,setEndpointId]=useState(action?.endpointId??''), [vaultId,setVaultId]=useState(action?.vaultId??0), [secretId,setSecretId]=useState(action?.secretId??0)
   const [triggerStatus,setTriggerStatus]=useState(action?.triggerStatus??'down')
@@ -89,6 +89,13 @@ function ActionForm({action,onClose,onSaved,readOnly}:{action:Action|null;onClos
   const checks=useQuery<Check[]>({queryKey:['worker-action-checks'],queryFn:()=>api.get('/admin/actions/checks'),refetchOnMount:'always'})
   const vaults=useQuery<Vault[]>({queryKey:['vaults'],queryFn:()=>api.get('/admin/vaults')})
   const secrets=useQuery<Secret[]>({queryKey:['vault-secrets',vaultId],queryFn:()=>api.get(`/admin/vaults/${vaultId}/secrets`),enabled:vaultId>0})
+  const fixtureDefaultsSet=useRef({destination:false,vault:false,secret:false})
+  useEffect(()=>{
+    if (!previewWriter || action) return
+    if (!fixtureDefaultsSet.current.destination && destinations.data?.length===1 && destinations.data[0]?.id==='issue14-isolated-sink') { fixtureDefaultsSet.current.destination=true; setEndpointId('issue14-isolated-sink') }
+    if (!fixtureDefaultsSet.current.vault && vaults.data?.length===1 && vaults.data[0]?.id===238010605399733) { fixtureDefaultsSet.current.vault=true; setVaultId(238010605399733) }
+    if (!fixtureDefaultsSet.current.secret && vaultId===238010605399733 && secrets.data?.length===1 && secrets.data[0]?.id===218386432287168 && secrets.data[0]?.type==='value') { fixtureDefaultsSet.current.secret=true; setSecretId(218386432287168) }
+  },[previewWriter,action,destinations.data,vaults.data,vaultId,secrets.data])
   useEffect(()=>{
     if (!checks.isFetchedAfterMount || !checks.data || initialChecksLoaded.current) return
     initialChecksLoaded.current=true

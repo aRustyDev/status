@@ -52,6 +52,26 @@ async function queue(x:Awaited<ReturnType<typeof setup>>,status:'up'|'down'|'deg
  ])
 }
 
+test('isolated editor mutation rolls back cleanly when a monitor link races into existence',async()=>{
+ const x=await setup()
+ const testActor={id:'issue14-preview-editor-actor',email:'preview-editor@automation.invalid',version:1}
+ x.local.db.prepare("INSERT INTO users (id,issuer,subject,email,role) VALUES (?,?,?,?,?)").run(testActor.id,'https://preview-editor.invalid','fixture',testActor.email,'admin')
+ x.local.db.prepare('DELETE FROM worker_action_checks WHERE action_id=?').run(x.action.id)
+ x.local.db.prepare('DELETE FROM monitor_action_revisions').run()
+ x.local.db.prepare("UPDATE audit_events SET actor_email=? WHERE entity_type='action' AND entity_id=? AND action='create'").run(testActor.email,x.action.id)
+ let raced=false
+ const racingDb={prepare:x.db.prepare.bind(x.db),async batch(statements:D1PreparedStatement[]){
+  if(!raced){raced=true;x.local.db.prepare('INSERT INTO worker_action_checks (action_id,check_id) VALUES (?,?)').run(x.action.id,checkId)}
+  return x.db.batch(statements)
+ }} as D1Database
+ const input={...x.actionBody,name:'Editor update',checkIds:[],checkSnapshots:[],version:x.action.version}
+ await assert.rejects(actionApi(request('PATCH',input),{...x.env,DB:racingDb},testActor,`/admin/actions/${x.action.id}`),(error:unknown)=>error instanceof ActionError&&error.status===409)
+ assert.equal(raced,true)
+ assert.equal((x.local.db.prepare('SELECT COUNT(*) AS n FROM monitor_action_revisions').get() as {n:number}).n,0)
+ assert.deepEqual({...x.local.db.prepare('SELECT name,version FROM worker_actions WHERE id=?').get(x.action.id)},{name:'Action',version:1})
+ assert.equal((x.local.db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_type='action' AND action='update'").get() as {n:number}).n,0)
+})
+
 test('actions use saved scoped credentials at an approved HTTPS target',async()=>{
  const x=await setup()
  const list=await (await actionApi(request('GET'),x.env,actor,'/admin/actions')).json()

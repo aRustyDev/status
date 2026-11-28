@@ -16,7 +16,7 @@ import { checkFallback, FallbackConflictError, getFallback, publishFallback, sav
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 import { bootstrapPreviewUser } from './issue14-preview-user'
 import { ensureIssue14VaultFixture } from '../../gateway/issue14-vault-fixture'
-import { isIssue14Preview, isIssue14PreviewViewer } from '../../gateway/issue14-preview'
+import { isIssue14Preview, isIssue14PreviewViewer, isKnownIssue14ViewerClient } from '../../gateway/issue14-preview'
 
 interface Env extends EmailChannelEnv {
   API_SCOPE?: string
@@ -38,6 +38,10 @@ interface Env extends EmailChannelEnv {
   ACCESS_AUD: string
   PREVIEW_BROWSER_CLIENT_ID?: string
   PREVIEW_BROWSER_ORIGIN?: string
+  PREVIEW_EDITOR_ORIGIN?: string
+  PREVIEW_EDITOR_ISSUER?: string
+  PREVIEW_EDITOR_AUD?: string
+  PREVIEW_EDITOR_CLIENT_ID?: string
   DEPLOYMENT_ENVIRONMENT?: string
   ENDPOINTS: string
   GATUS?: GatusBinding
@@ -53,7 +57,7 @@ async function notificationsReady(env: Env): Promise<boolean> {
 }
 
 type Role = 'viewer' | 'operator' | 'admin'
-type User = { id: string; issuer: string; subject: string; email: string; role: Role; version: number; previewBrowser?: true }
+type User = { id: string; issuer: string; subject: string; email: string; role: Role; version: number; previewBrowser?: true; previewEditor?: true }
 type Json = Record<string, unknown>
 type Row = Record<string, unknown>
 
@@ -153,19 +157,28 @@ function stableJson(value: unknown): string {
 function effectiveTestConfig(value: Json): Json {
   return { ...value, method: typeof value.method === 'string' ? value.method.toUpperCase() : 'GET', timeoutMs: value.timeoutMs ?? 10_000, attempts: value.attempts ?? 1 }
 }
-type AccessIdentity = Pick<User, 'issuer' | 'subject' | 'email'> & { previewBrowser?: true }
+type AccessIdentity = Pick<User, 'issuer' | 'subject' | 'email'> & { previewBrowser?: true; previewEditor?: true }
 
 async function accessIdentity(request: Request, env: Env): Promise<AccessIdentity> {
   const token = request.headers.get('Cf-Access-Jwt-Assertion')
   if (!token || !env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) throw new HttpError(401, 'Access authentication required')
-  const issuer = `https://${env.ACCESS_TEAM_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '')}`
+  const url = new URL(request.url)
+  const baseIssuer = `https://${env.ACCESS_TEAM_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '')}`
+  // The editor is a separate Access app and origin, never the shared staging app.
+  const editorOrigin = isIssue14Preview(env) && env.DEPLOYMENT_ENVIRONMENT === 'staging' && !!env.PREVIEW_EDITOR_ORIGIN && url.origin === env.PREVIEW_EDITOR_ORIGIN && url.protocol === 'https:' && url.origin !== 'https://status.sow.foo' && url.origin !== env.PREVIEW_BROWSER_ORIGIN
+  const issuer = editorOrigin ? env.PREVIEW_EDITOR_ISSUER : baseIssuer
+  const audience = editorOrigin ? env.PREVIEW_EDITOR_AUD : env.ACCESS_AUD
+  if (!issuer || !audience || (editorOrigin && (!/^https:\/\/[a-z0-9.-]+\.cloudflareaccess\.com$/.test(issuer) || audience === env.ACCESS_AUD || !env.PREVIEW_EDITOR_CLIENT_ID || env.PREVIEW_EDITOR_CLIENT_ID === env.PREVIEW_BROWSER_CLIENT_ID))) throw new HttpError(401, 'Invalid Access identity')
   let payload: JWTPayload
   try {
-    const verified = await jwtVerify(token, accessKeySet(issuer), { issuer, audience: env.ACCESS_AUD, algorithms: ['RS256'], requiredClaims: ['exp'] })
+    const verified = await jwtVerify(token, accessKeySet(issuer), { issuer, audience, algorithms: ['RS256'], requiredClaims: ['exp'] })
     payload = verified.payload
   } catch { throw new HttpError(401, 'Invalid Access identity') }
+  if (editorOrigin) {
+    if (payload.type !== 'app' || payload.common_name !== env.PREVIEW_EDITOR_CLIENT_ID || (typeof payload.common_name === 'string' && await isKnownIssue14ViewerClient(payload.common_name))) throw new HttpError(401, 'Invalid Access identity')
+    return { issuer, subject: env.PREVIEW_EDITOR_CLIENT_ID!, email: 'preview-editor@automation.invalid', previewEditor: true }
+  }
   if (payload.common_name !== undefined) {
-    const url = new URL(request.url)
     if (typeof payload.common_name !== 'string') throw new HttpError(401, 'Invalid Access identity')
     const configuredViewer = env.DEPLOYMENT_ENVIRONMENT === 'staging' && !!env.PREVIEW_BROWSER_CLIENT_ID && payload.common_name === env.PREVIEW_BROWSER_CLIENT_ID &&
       payload.type === 'app' && url.protocol === 'https:' && url.origin === env.PREVIEW_BROWSER_ORIGIN
@@ -184,6 +197,14 @@ async function accessIdentity(request: Request, env: Env): Promise<AccessIdentit
 }
 async function authenticate(request: Request, env: Env): Promise<User> {
   const identity = await accessIdentity(request, env)
+  if (identity.previewEditor) {
+    // A reserved, unloginable actor exists only in this schema database.
+    await env.DB.prepare("INSERT OR IGNORE INTO users (id,issuer,subject,email,role) VALUES ('issue14-preview-editor-actor','https://preview-editor.invalid','fixture','preview-editor@automation.invalid','admin')").run()
+    const actor = await env.DB.prepare("SELECT id,version FROM users WHERE id='issue14-preview-editor-actor' AND issuer='https://preview-editor.invalid' AND subject='fixture' AND role='admin' AND version=1").first<{id:string;version:number}>()
+    if (!actor) throw new HttpError(403, 'Preview editor is unavailable')
+    if (!await ensureIssue14VaultFixture(env, { ...actor, role:'admin' })) throw new HttpError(503, 'Preview fixture is unavailable')
+    return { ...identity, id: 'preview-editor', role: 'viewer', version: 1 }
+  }
   if (identity.previewBrowser) {
     const user: User = { ...identity, id: 'preview-browser', role: 'viewer', version: 1 }
     if (isIssue14Preview(env)) await ensureIssue14VaultFixture(env, user)
@@ -201,7 +222,10 @@ async function authenticate(request: Request, env: Env): Promise<User> {
   return user
 }
 function previewActionsEditor(env: Env, user: User): boolean {
-  return isIssue14Preview(env) && user.id === 'preview-browser' && user.role === 'viewer' && user.previewBrowser === true
+  return isIssue14Preview(env) && user.role === 'viewer' && ((user.id === 'preview-browser' && user.previewBrowser === true) || (user.id === 'preview-editor' && user.previewEditor === true))
+}
+function previewActionsWriter(env: Env, user: User): boolean {
+  return isIssue14Preview(env) && user.id === 'preview-editor' && user.role === 'viewer' && user.previewEditor === true
 }
 function requireRole(user: User, role: Role) {
   if (roles[user.role] < roles[role]) throw new HttpError(403, 'Insufficient role')
@@ -416,7 +440,7 @@ function approvedEndpoints(env: Env): Endpoint[] {
 async function api(request: Request, env: Env, user: User, path: string, receipt: ReceiptContext | null = null): Promise<Response> {
   const method = request.method
   const db = env.DB
-  if (path === '/api/v1/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now(), ...(previewActionsEditor(env, user) ? { previewActionsEditor: true } : {}) })
+  if (path === '/api/v1/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now(), ...(previewActionsEditor(env, user) ? { previewActionsEditor: true } : {}), ...(previewActionsWriter(env, user) ? { previewActionsEditorWrite: true } : {}) })
   if (path.startsWith('/api/v1/public/') && method === 'GET') {
     if (path === '/api/v1/public/incidents') return json(await listIncidents(db, false))
     if (path === '/api/v1/public/maintenances') return json(await listMaintenance(db, false))
@@ -722,9 +746,33 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
   }
   if (route === '/admin/actions' || route.startsWith('/admin/actions/')) {
     const previewRead = previewActionsEditor(env, user) && method === 'GET' && ['/admin/actions', '/admin/actions/destinations', '/admin/actions/checks', '/admin/actions/runs'].includes(route)
-    if (!previewRead) requireRole(user, 'admin')
+    const actionId = /^\/admin\/actions\/([a-f0-9-]{36})$/.exec(route)?.[1]
+    const previewWrite = previewActionsWriter(env, user) && ((method === 'POST' && route === '/admin/actions') || (['PATCH','DELETE'].includes(method) && !!actionId))
+    if (!previewRead && !previewWrite) requireRole(user, 'admin')
+    if (previewWrite) {
+      if (actionId) {
+        const owned = await stmt(db, "SELECT 1 FROM worker_actions a WHERE a.id=? AND EXISTS (SELECT 1 FROM audit_events e WHERE e.entity_type='action' AND e.entity_id=a.id AND e.action='create' AND e.actor_email='preview-editor@automation.invalid') AND NOT EXISTS (SELECT 1 FROM worker_action_checks c WHERE c.action_id=a.id) AND NOT EXISTS (SELECT 1 FROM monitor_action_links l WHERE l.action_id=a.id) AND NOT EXISTS (SELECT 1 FROM worker_action_outbox o WHERE o.action_id=a.id)", actionId).first()
+        if (!owned) throw new HttpError(403, 'Action is not an isolated editor fixture')
+      }
+      if (method !== 'DELETE') {
+        const input = await parseBody(request.clone() as unknown as Request)
+        if (input.endpointId !== 'issue14-isolated-sink' || input.vaultId !== 238010605399733 || input.secretId !== 218386432287168 || !Array.isArray(input.checkIds) || input.checkIds.length || !Array.isArray(input.checkSnapshots) || input.checkSnapshots.length) throw new HttpError(400, 'Use the isolated fixture without monitors')
+      }
+    }
     if (env.ACTIONS_READY !== 'true' || !actionEndpoints(env.ACTION_ENDPOINTS).size || !await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)) throw new HttpError(503, 'Actions are unavailable')
-    try { return await actionApi(request, env as unknown as ActionEnvironment, user, route) }
+    const actor = previewWrite ? { ...user, id:'issue14-preview-editor-actor', role:'admin' as const, version:1 } : user
+    try {
+      // The preview test identity has no monitor or delivery-history access.
+      if (previewRead && ['/admin/actions/checks', '/admin/actions/runs'].includes(route)) return json([])
+      const response = await actionApi(request, env as unknown as ActionEnvironment, actor, route)
+      if (previewRead && route === '/admin/actions') {
+        const result = await response.json() as {id:string}[]
+        const records = await db.prepare("SELECT entity_id FROM audit_events WHERE entity_type='action' AND action='create' AND actor_email='preview-editor@automation.invalid'").all<{entity_id:string}>()
+        const owned = new Set(records.results.map(row => row.entity_id))
+        return json(result.filter(row => owned.has(row.id)))
+      }
+      return response
+    }
     catch (error) {
       if (error instanceof ActionError || error instanceof ReceiptError) throw error
       if (error instanceof Error && error.message.includes('NOT NULL constraint failed: audit_events.details')) throw new HttpError(403, 'Identity changed; refresh and try again')
@@ -1032,7 +1080,7 @@ async function bspApi(request: Request, env: Env, user: User, path: string, rece
     if (!saved) throw new Error('Missing mutation receipt')
     return json({ id: saved.result_alias, version: saved.result_version }, saved.status)
   }
-  if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now(), ...(previewActionsEditor(env, user) ? { previewActionsEditor: true } : {}) })
+  if (route === '/auth/me' && method === 'GET') return json({ id: user.id, email: user.email, role: user.role, version: user.version, serverTime: Date.now(), ...(previewActionsEditor(env, user) ? { previewActionsEditor: true } : {}), ...(previewActionsWriter(env, user) ? { previewActionsEditorWrite: true } : {}) })
   if (route === '/capabilities' && method === 'GET') {
     const vaultAvailable = await vaultKeyReady(db, env.VAULT_ENCRYPTION_KEY)
     const notificationsAvailable = await notificationsReady(env)
@@ -1185,6 +1233,12 @@ export default {
         return json({ ok: true })
       }
       const user = await authenticate(request, env)
+      if (user.previewEditor) {
+        const route = url.pathname
+        const read = request.method === 'GET' && ['/api/v1/auth/me', '/api/v1/bsp/auth/me', '/api/v1/bsp/capabilities', '/api/v1/bsp/admin/actions', '/api/v1/bsp/admin/actions/destinations', '/api/v1/bsp/admin/actions/checks', '/api/v1/bsp/admin/actions/runs', '/api/v1/bsp/admin/vaults', '/api/v1/bsp/admin/vaults/238010605399733/secrets'].includes(route)
+        const write = (request.method === 'POST' && route === '/api/v1/bsp/admin/actions') || (['PATCH','DELETE'].includes(request.method) && /^\/api\/v1\/bsp\/admin\/actions\/[a-f0-9-]{36}$/.test(route))
+        if (!read && !write) throw new HttpError(403, 'Preview editor route unavailable')
+      }
       if (!['GET','HEAD','OPTIONS'].includes(request.method) && request.headers.get('origin') !== url.origin) throw new HttpError(403,'Invalid request origin')
       if (url.pathname === '/api/v1/bsp/admin/backups' || /^\/api\/v1\/bsp\/admin\/backups\/[a-f0-9]{64}\/(verify|download)$/.test(url.pathname)) {
         requireRole(user, 'admin')

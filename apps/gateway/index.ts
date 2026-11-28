@@ -82,7 +82,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       return Response.redirect(url.toString(), 308)
     }
     if (url.pathname.startsWith('/admin/')) {
-      const previewEditorAsset = user.id === 'preview-browser' && user.role === 'viewer' && user.previewActionsEditor === true && request.method === 'GET' && (url.pathname === '/admin/actions' || url.pathname.startsWith('/admin/assets/') || url.pathname === '/admin/icon.png')
+      const previewEditorAsset = (user.id === 'preview-browser' || user.id === 'preview-editor') && user.role === 'viewer' && user.previewActionsEditor === true && request.method === 'GET' && (url.pathname === '/admin/actions' || url.pathname.startsWith('/admin/assets/') || url.pathname === '/admin/icon.png')
       if (user.role !== 'operator' && user.role !== 'admin' && !previewEditorAsset) {
         return Response.json({ error: 'Insufficient role' }, { status: 403 })
       }

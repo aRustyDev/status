@@ -138,6 +138,9 @@ export async function actionApi(request:Request, env:ActionEnvironment, actor:Ac
   const match=/^\/admin\/actions(?:\/([a-f0-9-]{36}))?$/.exec(route)
   if (!match) return fail(404,'Not found')
   const actionId=match[1]
+  // The isolated test editor can change only its own unlinked fixture Actions.
+  // This guard is repeated inside the mutation transaction to fence races.
+  const editorFence = actor.id === 'issue14-preview-editor-actor' ? ` AND EXISTS (SELECT 1 FROM audit_events e WHERE e.entity_type='action' AND e.entity_id=worker_actions.id AND e.action='create' AND e.actor_email='preview-editor@automation.invalid') AND NOT EXISTS (SELECT 1 FROM worker_action_checks c WHERE c.action_id=worker_actions.id) AND NOT EXISTS (SELECT 1 FROM monitor_action_links l WHERE l.action_id=worker_actions.id) AND NOT EXISTS (SELECT 1 FROM worker_action_outbox o WHERE o.action_id=worker_actions.id)` : ''
   if (actionId && method==='DELETE') {
     const input=await body(request)
     if (Object.keys(input).some(k=>k!=='version')) return fail(400,'Invalid request')
@@ -145,8 +148,8 @@ export async function actionApi(request:Request, env:ActionEnvironment, actor:Ac
     const results=await db.batch([
       statement(db,`INSERT INTO audit_events (id,actor_email,action,entity_type,entity_id,created_at,details)
         SELECT ?,?,?,?,?,?,CASE WHEN EXISTS (SELECT 1 FROM users WHERE id=? AND role='admin' AND version=?) THEN '{}' ELSE NULL END
-        WHERE EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND version=?)`,crypto.randomUUID(),actor.email,'delete','action',actionId,Date.now(),actor.id,actor.version,actionId,version),
-      statement(db,'DELETE FROM worker_actions WHERE id=? AND version=?',actionId,version),
+        WHERE EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND version=?${editorFence})`,crypto.randomUUID(),actor.email,'delete','action',actionId,Date.now(),actor.id,actor.version,actionId,version),
+      statement(db,`DELETE FROM worker_actions WHERE id=? AND version=?${editorFence}`,actionId,version),
     ])
     if (!results[1].meta.changes) return fail(409,'Action changed. Reload and try again.')
     return json({ok:true})
@@ -189,9 +192,9 @@ export async function actionApi(request:Request, env:ActionEnvironment, actor:Ac
   const mutation=method==='POST'
     ? statement(db,`INSERT INTO worker_actions (id,name,endpoint_id,endpoint_fingerprint,vault_id,secret_id,enabled,trigger_status,mutation_key,created_at,updated_at)
       SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM worker_actions)<20 AND ${unchangedChecks}`,id,input.name.trim(),input.endpointId,fingerprint,input.vaultId,input.secretId,input.enabled?1:0,input.triggerStatus,token,now,now,snapshots)
-    : statement(db,`UPDATE worker_actions SET name=?,endpoint_id=?,endpoint_fingerprint=?,vault_id=?,secret_id=?,enabled=?,trigger_status=?,version=version+?,mutation_key=?,updated_at=? WHERE id=? AND version=? AND ${unchangedChecks}`,input.name.trim(),input.endpointId,fingerprint,input.vaultId,input.secretId,input.enabled?1:0,input.triggerStatus,unchanged?0:1,token,now,id,version,snapshots)
+    : statement(db,`UPDATE worker_actions SET name=?,endpoint_id=?,endpoint_fingerprint=?,vault_id=?,secret_id=?,enabled=?,trigger_status=?,version=version+?,mutation_key=?,updated_at=? WHERE id=? AND version=? AND ${unchangedChecks}${editorFence}`,input.name.trim(),input.endpointId,fingerprint,input.vaultId,input.secretId,input.enabled?1:0,input.triggerStatus,unchanged?0:1,token,now,id,version,snapshots)
   const operations:D1PreparedStatement[]=[mutation,
-    statement(db, `INSERT OR IGNORE INTO monitor_action_revisions (component_id) SELECT h.component_id FROM http_checks h WHERE h.id IN (SELECT check_id FROM worker_action_checks WHERE action_id=?) OR h.id IN (SELECT value FROM json_each(?)) OR h.component_id IN (SELECT component_id FROM monitor_action_links WHERE action_id=?)`,id,JSON.stringify(checks),id),
+    statement(db, `INSERT OR IGNORE INTO monitor_action_revisions (component_id) SELECT h.component_id FROM http_checks h WHERE (h.id IN (SELECT check_id FROM worker_action_checks WHERE action_id=?) OR h.id IN (SELECT value FROM json_each(?)) OR h.component_id IN (SELECT component_id FROM monitor_action_links WHERE action_id=?)) AND EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)`,id,JSON.stringify(checks),id,id,token),
     statement(db, `UPDATE monitor_action_revisions SET version=version+1 WHERE component_id IN (SELECT h.component_id FROM http_checks h WHERE h.id IN (SELECT check_id FROM worker_action_checks WHERE action_id=?) OR h.id IN (SELECT value FROM json_each(?)) OR h.component_id IN (SELECT component_id FROM monitor_action_links WHERE action_id=?)) AND EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)`,id,JSON.stringify(checks),id,id,token),
     statement(db, `DELETE FROM monitor_action_links WHERE action_id=? AND component_id IN (SELECT component_id FROM http_checks) AND component_id NOT IN (SELECT component_id FROM http_checks WHERE id IN (SELECT value FROM json_each(?))) AND EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)`,id,JSON.stringify(checks),id,token),
     statement(db,'DELETE FROM worker_action_checks WHERE action_id=? AND check_id NOT IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM worker_actions WHERE id=? AND mutation_key=?)',id,JSON.stringify(checks),id,token)]

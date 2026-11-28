@@ -21,7 +21,7 @@ const Backups = lazy(() => import('./pages/Backups'))
 const SystemHealth = lazy(() => import('./pages/SystemHealth'))
 const StaticFallback = lazy(() => import('./pages/CloudflareStaticFallback'))
 
-type Identity = { id: string; email: string; role: 'viewer' | 'operator' | 'admin'; serverTime?: number; previewActionsEditor?: boolean }
+type Identity = { id: string; email: string; role: 'viewer' | 'operator' | 'admin'; serverTime?: number; previewActionsEditor?: boolean; previewActionsEditorWrite?: boolean }
 
 function Shell({ identity, capabilities }: { identity: Identity; capabilities: Capabilities }) {
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -142,7 +142,7 @@ export default function App() {
             <Route path="incidents" element={capabilities.supportedRoutes.includes("/admin/incidents") ? <Incidents /> : <Unavailable />} />
             <Route path="maintenance" element={capabilities.supportedRoutes.includes("/admin/maintenance") ? <Maintenance /> : <Unavailable />} />
             <Route path="delivery-history" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/delivery-history') ? <DeliveryHistory /> : <Unavailable />} />
-            <Route path="actions" element={(identity.role === 'admin' || identity.previewActionsEditor === true) && capabilities.supportedRoutes.includes('/admin/actions') ? <Actions readOnly={identity.previewActionsEditor === true} /> : <Unavailable />} />
+            <Route path="actions" element={(identity.role === 'admin' || identity.previewActionsEditor === true) && capabilities.supportedRoutes.includes('/admin/actions') ? <Actions readOnly={identity.previewActionsEditor === true && identity.previewActionsEditorWrite !== true} previewWriter={identity.previewActionsEditorWrite === true} /> : <Unavailable />} />
             <Route path="delivery-history" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/actions') ? <DeliveryHistory /> : <Unavailable />} />
             <Route path="notifications" element={identity.role === 'admin' && capabilities.supportedRoutes.includes('/admin/notifications') ? <Notifications /> : <Unavailable />} />
             <Route path="vault" element={identity.role === 'admin' && capabilities.supportedRoutes.includes("/admin/vault") ? <Vault /> : <Unavailable />} />
