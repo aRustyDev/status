@@ -9,12 +9,14 @@ import { join } from 'node:path'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import gatewayModule from '../../../apps/gateway/index.ts'
 import workerModule from '../../../apps/worker/src/index.ts'
+import dispatcherModule from '../../../.github/actions/branch-previews/runtime/dispatcher.ts'
 
 const gateway = gatewayModule.default ?? gatewayModule
 const worker = workerModule.default ?? workerModule
+const dispatcher = dispatcherModule.default ?? dispatcherModule
 const variants = [
-  { selector: '1.' + 'a'.repeat(32), release: 'a'.repeat(40), title: 'Compact monitor list' },
-  { selector: '2.' + 'b'.repeat(32), release: 'b'.repeat(40), title: 'Detailed monitor cards' },
+  { selector: 'branch-' + 'a'.repeat(24), release: 'a'.repeat(40), title: 'Compact monitor list' },
+  { selector: 'branch-' + 'b'.repeat(24), release: 'b'.repeat(40), title: 'Detailed monitor cards' },
 ]
 const clientId = 'pilot-fixture.access'
 const clientSecret = 'synthetic-pilot-only'
@@ -62,15 +64,16 @@ const api = { fetch(request) {
     DB: { prepare() { throw new Error('Preview browser auth attempted to access the users database') } },
   })
 } }
-const baseline = {
-  API: api, FLAGS: {
+const dispatcherEnv = {
+  PREVIEW_HEADER: 'X-Status-Preview', FLAG_PREFIX: 'status-preview-', FLAGS: {
     getBooleanDetails: () => ({ value: true }),
     getObjectDetails: key => {
-      const variant = variants.find(item => key === 'status-preview-slot-' + item.selector[0])
-      return { value: variant && { ...variant, target: 'a', expiresAt: Date.now() + 60_000 } }
+      const variant = variants.find(item => key === 'status-preview-' + item.selector)
+      return { value: variant && { selector: variant.selector, release: variant.release } }
     },
   },
 }
+const baseline = { API: api, PREVIEW_DISPATCHER: { fetch: request => dispatcher.fetch(request, dispatcherEnv) } }
 for (const variant of variants) {
   const assets = { fetch(request) {
     verifyInternalHeaders(request)
@@ -87,7 +90,7 @@ for (const variant of variants) {
     return new Response('<!doctype html><html lang="en"><meta charset="utf-8"><title>' + variant.title +
       '</title><main><h1>' + variant.title + '</h1></main></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
   } }
-  baseline['PREVIEW_' + variant.selector[0] + '_A'] = {
+  dispatcherEnv['PREVIEW_BRANCH_' + variant.selector.slice('branch-'.length).toUpperCase() + '_' + variant.release.toUpperCase()] = {
     fetch(request) {
       verifyInternalHeaders(request)
       return gateway.fetch(request, {
