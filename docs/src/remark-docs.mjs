@@ -1,20 +1,23 @@
+import { URL } from 'node:url'
+
 /**
- * Lets the guides in docs/ stay plain GitHub-readable Markdown:
+ * Lets the guides in docs/src/ stay plain GitHub-readable Markdown:
  * - drops the leading `# Title` (the layout renders the title itself),
  * - turns links to sibling guides (`deployment.md#nginx`) into site routes (`/deployment/#nginx`),
- * - points links that leave docs/ (`../README.md`) at the file on GitHub,
+ * - points links that leave docs/src/ at the file on GitHub,
  * - colours the `✓` `•` `✕` marks of a comparison table (see convertMarks).
  */
-const REPO_BLOB = 'https://github.com/BElluu/BetterStatusPage/blob/main/'
+const REPO_BLOB = 'https://github.com/aRustyDev/status/blob/main/'
 
 const SIBLING = /^(?:\.\/)?([\w-]+)\.md(#.*)?$/
 const OUTSIDE = /^\.\.\/(.+)$/
 
 function rewrite(url) {
+  if (url === 'UPSTREAM.md') return REPO_BLOB + 'docs/src/UPSTREAM.md'
   const sibling = SIBLING.exec(url)
   if (sibling) return `/${sibling[1].toLowerCase()}/${sibling[2] ?? ''}`
   const outside = OUTSIDE.exec(url)
-  if (outside) return REPO_BLOB + outside[1]
+  if (outside) return new URL(url, REPO_BLOB + 'docs/src/').href
   return url
 }
 

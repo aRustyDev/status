@@ -79,6 +79,7 @@ const originalFetch = globalThis.fetch
 const keySets = new Map<string, object[]>()
 const keyFetches = new Map<string, number>()
 let sign: (subject: string, email: string, aud?: string, expires?: string) => Promise<string>
+let signService: (clientId: string, aud?: string, expires?: string, type?: string) => Promise<string>
 let adminToken: string, operatorToken: string, viewerToken: string
 
 async function request(path: string, token?: string, method = 'GET', body?: unknown, origin = 'https://status.example', idempotencyKey?: string, idempotencyActor?: string) {
@@ -146,6 +147,7 @@ before(async () => {
     return Response.json({ keys: available })
   }
   sign = (subject, email, aud = audience, expires = '5m') => new SignJWT({ email }).setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).setIssuer(issuer).setAudience(aud).setSubject(subject).setIssuedAt().setExpirationTime(expires).sign(keys.privateKey)
+  signService = (clientId, aud = audience, expires = '5m', type = 'app') => new SignJWT({ common_name: clientId, type }).setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).setIssuer(issuer).setAudience(aud).setSubject('').setIssuedAt().setExpirationTime(expires).sign(keys.privateKey)
   adminToken = await sign('admin-id', 'admin@example.com')
   operatorToken = await sign('operator-id', 'operator@example.com')
   viewerToken = await sign('viewer-id', 'viewer@example.com')
@@ -180,6 +182,63 @@ test('preview identity verification authenticates without reading or writing use
   assert.equal((await verify(await sign('expired', 'expired@example.com', audience, '-1m'))).status, 401)
   assert.equal((await verify(await sign('missing-email', ''))).status, 401)
   assert.equal((await verify(newIdentity, 'POST')).status, 405)
+})
+
+test('the preview browser is a read-only viewer on its configured origin through both gateways', async () => {
+  const origin = 'https://status.example'
+  const clientId = 'preview-browser.access'
+  const token = await signService(clientId)
+  const selector = 'branch-' + 'a'.repeat(24)
+  const release = 'b'.repeat(40)
+  const settings = { ...env, DEPLOYMENT_ENVIRONMENT: 'staging', PREVIEW_BROWSER_ORIGIN: origin, PREVIEW_BROWSER_CLIENT_ID: clientId }
+  const api = { fetch: (req: Request) => {
+    assert.equal(req.headers.has('CF-Access-Client-Secret'), false)
+    assert.equal(req.headers.has('CF-Access-Client-Id'), false)
+    return worker.fetch(req, settings as never)
+  } }
+  const target = { API: api, STATUS_API: api, MONITORING_API: api, STATUS_UI: env.ASSETS, PREVIEW_SELECTOR: selector, PREVIEW_RELEASE: release }
+  let dispatches = 0
+  const baseline = {
+    API: { fetch: (req: Request) => worker.fetch(req, { ...settings, DB: { prepare() { throw new Error('Baseline D1 was accessed') } } } as never) },
+    PREVIEW_DISPATCHER: { fetch: async (req: Request) => {
+      dispatches++
+      const headers = new Headers(req.headers)
+      headers.set('X-Status-Preview-Release', release)
+      const response = await gateway.fetch(new Request(req, { headers }), target as never)
+      const resultHeaders = new Headers(response.headers)
+      resultHeaders.set('X-Status-Preview-Commit', release)
+      return new Response(response.body, { status: response.status, headers: resultHeaders })
+    } },
+  }
+  const makeRequest = (path: string, method = 'GET') => new Request(origin + path, {
+    method, headers: { 'Cf-Access-Jwt-Assertion': token, 'CF-Access-Client-Secret': 'fixture', 'CF-Access-Client-Id': clientId, 'X-Status-Preview': selector, 'X-Status-Identity-Method': 'GET', accept: 'text/html' },
+  })
+  for (const path of ['/', '/asset.js', '/api/v1/auth/me', '/api/v1/bsp/public/status']) {
+    const response = await gateway.fetch(makeRequest(path), baseline as never)
+    assert.equal(response.status, 200, path)
+    assert.equal(response.headers.get('X-Status-Preview-Commit'), release)
+    if (path === '/api/v1/auth/me') {
+      const user = await response.json() as {id: string; role: string}
+      assert.equal(user.id, 'preview-browser')
+      assert.equal(user.role, 'viewer')
+    }
+  }
+  assert.equal((await gateway.fetch(makeRequest('/admin/'), baseline as never)).status, 403)
+  const beforeWrites = dispatches
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+    assert.equal((await gateway.fetch(makeRequest('/api/v1/admin/components', method), baseline as never)).status, 403)
+    assert.equal((await worker.fetch(makeRequest('/api/v1/admin/components', method), settings as never)).status, 403)
+  }
+  assert.equal(dispatches, beforeWrites)
+  assert.equal(await db.prepare('SELECT id FROM users WHERE subject=?').bind(clientId).first(), null)
+  const check = (jwt: string, url = origin, config: object = settings) => worker.fetch(new Request(url + '/api/v1/auth/me', { headers: { 'Cf-Access-Jwt-Assertion': jwt } }), config as never)
+  for (const rejected of [await signService('deployment-probe.access'), await signService(clientId, 'other'), await signService(clientId, audience, '-1m'), await signService(clientId, audience, '5m', 'org'), 'invalid']) {
+    assert.equal((await check(rejected)).status, 401)
+  }
+  assert.equal((await check(token, origin, env)).status, 401)
+  assert.equal((await check(token, origin, { ...settings, DEPLOYMENT_ENVIRONMENT: 'production' })).status, 401)
+  assert.equal((await check(token, 'https://production.example')).status, 401)
+  assert.equal((await check(token, 'http://status.example', { ...settings, PREVIEW_BROWSER_ORIGIN: 'http://status.example' })).status, 401)
 })
 
 test('gateway checks authenticated preview navigation and API requests without touching baseline D1', async () => {

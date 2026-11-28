@@ -34,6 +34,14 @@ test('retirement waits for propagation before removing resources', async () => {
   assert.equal(f.record.active, null)
 })
 
+test('zero delay retires a deleted branch in a single reconciliation', async () => {
+  const f = fixture()
+  f.options.propagationElapsed = async () => true
+  assert.deepEqual(await retireDeletedBranch(f.options), { status: 'deleted' })
+  assert.deepEqual(f.events, ['disable', 'unbind', 'delete'])
+  assert.equal(f.record.active, null)
+})
+
 test('retirement blocks ambiguous candidates and recreated branches', async () => {
   const f = fixture()
   f.record.candidate = { sha: 'pending' }

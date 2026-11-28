@@ -47,6 +47,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: "!inputs.fixture && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (!inputs.fixture || github.repository_id == '1468279539')"
+    outputs:
+      artifact_name: ${{ format('preview-{0}-{1}', github.run_id, github.run_attempt) }}
     steps:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
@@ -58,7 +60,7 @@ jobs:
           ref: ${{ inputs.fixture && 'main' || github.event.repository.default_branch }}
           path: control
           persist-credentials: false
-      - uses: aRustyDev/status/.github/actions/branch-previews@2e0b576c214569465daef8c3e3adb87c5f6301f5
+      - uses: aRustyDev/status/.github/actions/branch-previews@236fa43b128f31cef90cb601f745a3384f78146b
         with:
           operation: check
           config: ${{ inputs.config }}
@@ -70,16 +72,14 @@ jobs:
           ref: ${{ inputs.sha }}
           path: feature
           persist-credentials: false
-      - uses: aRustyDev/status/.github/actions/branch-previews@2e0b576c214569465daef8c3e3adb87c5f6301f5
+      - uses: aRustyDev/status/.github/actions/branch-previews@236fa43b128f31cef90cb601f745a3384f78146b
         with:
           operation: build
           config: ${{ inputs.config }}
         env:
           PREVIEW_FEATURE_DIR: ${{ format('{0}/feature', github.workspace) }}
           PREVIEW_ARTIFACT_DIR: ${{ format('{0}/artifact', runner.temp) }}
-      - name: Package Worker modules, static assets and migrations
-        shell: bash
-        run: tar -C "$RUNNER_TEMP/artifact" -czf "$RUNNER_TEMP/feature.tar.gz" workers migrations $(if test -d "$RUNNER_TEMP/artifact/assets"; then echo assets; fi)
+          PREVIEW_ARCHIVE: ${{ format('{0}/feature.tar.gz', runner.temp) }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ${{ format('preview-{0}-{1}', github.run_id, github.run_attempt) }}
@@ -121,7 +121,7 @@ jobs:
           path: control
           persist-credentials: false
           token: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
-      - uses: aRustyDev/status/.github/actions/branch-previews@2e0b576c214569465daef8c3e3adb87c5f6301f5
+      - uses: aRustyDev/status/.github/actions/branch-previews@236fa43b128f31cef90cb601f745a3384f78146b
         with:
           operation: check
           config: ${{ inputs.config }}
@@ -129,9 +129,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PREVIEW_SOURCE_TOKEN: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
+      - name: Validate the build artifact identity
+        if: "!inputs.fixture"
+        shell: bash
+        env:
+          BUILD_ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
+        run: '[[ "$BUILD_ARTIFACT_NAME" =~ ^preview-${GITHUB_RUN_ID}-[1-9][0-9]*$ ]]'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: ${{ format('preview-{0}-{1}', github.run_id, github.run_attempt) }}
+          name: ${{ needs.build.outputs.artifact_name }}
           path: ${{ format('{0}/download', runner.temp) }}
         if: "!inputs.fixture"
       - name: Download artifact from the verified fixture CI run
@@ -143,7 +149,7 @@ jobs:
           run-id: ${{ steps.verify.outputs.ci_run_id }}
           name: ${{ format('preview-{0}', inputs.sha) }}
           path: ${{ format('{0}/download', runner.temp) }}
-      - uses: aRustyDev/status/.github/actions/branch-previews@2e0b576c214569465daef8c3e3adb87c5f6301f5
+      - uses: aRustyDev/status/.github/actions/branch-previews@236fa43b128f31cef90cb601f745a3384f78146b
         with:
           operation: deploy
           config: ${{ inputs.config }}
@@ -153,6 +159,9 @@ jobs:
           PREVIEW_SOURCE_TOKEN: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
           PREVIEW_BRANCH_CONFIG: ${{ secrets[inputs.fixture && 'FIXTURE_BRANCH_CONFIG' || 'PREVIEW_BRANCH_CONFIG'] }}
           PREVIEW_WORKER_SECRETS: ${{ secrets[inputs.fixture && 'FIXTURE_WORKER_SECRETS' || 'PREVIEW_WORKER_SECRETS'] }}
+          PREVIEW_SCHEMA_SUBSCRIBER_CONFIG: ${{ !inputs.fixture && secrets.PREVIEW_SCHEMA_SUBSCRIBER_CONFIG || '' }}
+          PREVIEW_ISOLATED_FIXTURE_CONFIG: ${{ secrets.PREVIEW_ISOLATED_FIXTURE_CONFIG }}
+          PREVIEW_ISOLATED_FIXTURE_ROOT: ${{ secrets.PREVIEW_ISOLATED_FIXTURE_ROOT }}
           CLOUDFLARE_API_TOKEN: ${{ secrets[inputs.fixture && 'FIXTURE_CLOUDFLARE_API_TOKEN' || 'CLOUDFLARE_BRANCH_PREVIEW_API_TOKEN'] }}
           FLAGSHIP_APP_ID: ${{ vars[inputs.fixture && 'FIXTURE_FLAGSHIP_APP_ID' || 'FLAGSHIP_APP_ID'] }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars[inputs.fixture && 'FIXTURE_CLOUDFLARE_ACCOUNT_ID' || 'CLOUDFLARE_ACCOUNT_ID'] }}

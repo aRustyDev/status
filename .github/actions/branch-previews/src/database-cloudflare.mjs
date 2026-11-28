@@ -25,6 +25,7 @@ export function cloudflareDatabaseAdapter({ accountId, token, wrangler, seedSql,
     return results[0].results
   }
   return {
+    query,
     recordDatabase,
     recordIntent,
     recordProgress,
@@ -52,6 +53,23 @@ export function cloudflareDatabaseAdapter({ accountId, token, wrangler, seedSql,
     async seed(database) {
       if (typeof seedSql !== 'string' || !seedSql.trim()) throw new Error('Missing trusted schema seed')
       await query(database, seedSql)
+    },
+    async initializeFixture(database, sqlFile) {
+      if (!database?.owned || typeof database.id !== 'string' || !database.id || typeof database.name !== 'string' || !database.name || !path.isAbsolute(sqlFile)) throw new Error('Fixture seed requires an owned database and trusted SQL file')
+      const tmp = await mkdtemp(path.join(tmpdir(), 'status-preview-fixture-d1-'))
+      try {
+        const config = path.join(tmp, 'wrangler.json')
+        await writeFile(config, JSON.stringify({ name: 'status-preview-fixture-seed', compatibility_date: '2026-11-23', d1_databases: [{ binding: 'DB', database_id: database.id, database_name: database.name }] }), { mode: 0o600 })
+        run(wrangler, ['d1', 'execute', 'DB', '--remote', '--config', config, '--file', sqlFile], { env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId, CLOUDFLARE_API_TOKEN: token, WRANGLER_SEND_METRICS: 'false' }, stdio: 'inherit' })
+      } finally { await rm(tmp, { recursive: true, force: true }) }
+    },
+    async initializeFixtureRegistry(database, statements) {
+      if (!database?.owned || !Array.isArray(statements) || statements.length < 1 || statements.length > 4) throw new Error('Fixture registry requires an owned database')
+      for (const statement of statements) {
+        if (statement?.sql !== 'INSERT INTO endpoint_registry (endpoint_id, fingerprint) VALUES (?, ?) ON CONFLICT(endpoint_id) DO UPDATE SET fingerprint=excluded.fingerprint' ||
+            !Array.isArray(statement.params) || statement.params.length !== 2 || !/^preview-[a-z-]+$/.test(statement.params[0]) || !/^[a-f0-9]{64}$/.test(statement.params[1])) throw new Error('Invalid fixture registry entry')
+        await query(database, statement.sql, statement.params)
+      }
     },
     async deleteDatabase(database) {
       const response = await fetcher(`${base}/${encodeURIComponent(database.id)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })

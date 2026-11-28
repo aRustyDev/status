@@ -1,5 +1,5 @@
 import { createAdminShell, type AdminShellConfig, type NavSection } from '@better-forge/ui'
-import changelogSource from '../../../../docs/changelog.md?raw'
+import changelogSource from '../../../../docs/src/changelog.md?raw'
 import packageMetadata from '../../package.json'
 import { DOCS_URL, statusPageUrl } from '../navigation'
 

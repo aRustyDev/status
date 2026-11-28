@@ -23,6 +23,9 @@
       "vars": {
         "ACCESS_TEAM_DOMAIN": "REPLACE_ACCESS_TEAM_DOMAIN",
         "ACCESS_AUD": "REPLACE_ACCESS_AUDIENCE",
+        "DEPLOYMENT_ENVIRONMENT": "staging",
+        "PREVIEW_BROWSER_ORIGIN": "",
+        "PREVIEW_BROWSER_CLIENT_ID": "",
         "ENDPOINTS": "[]",
         "API_SCOPE": "status"
       },
