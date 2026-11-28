@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { isIssue14PreviewViewer } from '../issue14-preview.ts'
+import { isIssue14PreviewViewer, issue14EditorSettings, issue14EditorClientMatches } from '../issue14-preview.ts'
 
 const client = 'synthetic-viewer-id'
 const digest = createHash('sha256').update(client).digest('hex')
@@ -19,4 +19,19 @@ test('the fallback recognizes only the isolated viewer on the exact staging orig
   assert.equal(await isIssue14PreviewViewer(env, origin, {type:'org',common_name:client}, digest), false)
   assert.equal(await isIssue14PreviewViewer(env, origin, {type:'app',common_name:'different'}, digest), false)
   assert.equal(await isIssue14PreviewViewer(env, origin, {type:'app'}, digest), false)
+})
+
+test('the editor fallback is restricted to the exact isolated release and a single client digest', async () => {
+  const fallback = {origin:'https://editor.example',issuer:'https://test.cloudflareaccess.com',audience:'test-audience',clientDigest:digest}
+  const resolved = issue14EditorSettings(env, fallback)
+  assert.deepEqual(resolved, fallback)
+  assert.equal(await issue14EditorClientMatches(resolved!, client), true)
+  assert.equal(await issue14EditorClientMatches(resolved!, 'other-client'), false)
+  for (const change of [{API_SCOPE:'status'}, {PREVIEW_SUBSCRIBER_REQUIRED:'false'}, {PREVIEW_SUBSCRIBER_SCOPE:'other'}, {PREVIEW_RELEASE:''}, {DEPLOYMENT_ENVIRONMENT:'production'}, {PREVIEW_EDITOR_ORIGIN:'https://partial.example'}]) {
+    assert.equal(issue14EditorSettings({...env,...change}, fallback), null)
+  }
+  const explicit = issue14EditorSettings({...env, PREVIEW_EDITOR_ORIGIN:'https://explicit.example', PREVIEW_EDITOR_ISSUER:'https://test.cloudflareaccess.com', PREVIEW_EDITOR_AUD:'explicit-audience', PREVIEW_EDITOR_CLIENT_ID:'explicit-client'}, fallback)
+  assert.equal(explicit?.origin, 'https://explicit.example')
+  assert.equal(await issue14EditorClientMatches(explicit!, 'explicit-client'), true)
+  assert.equal(await issue14EditorClientMatches(explicit!, client), false)
 })

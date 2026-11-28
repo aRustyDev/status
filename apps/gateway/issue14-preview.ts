@@ -25,6 +25,29 @@ export async function isIssue14PreviewViewer(
       url.origin !== 'https://status.sow.foo' || identity.type !== 'app' || typeof identity.common_name !== 'string') return false
   return isKnownIssue14ViewerClient(identity.common_name, expectedDigest)
 }
+
+// Public Access app metadata and a one-way client-ID digest, not the token's
+// secret. This fallback is compiled only into the disposable preview branch.
+const editorFallback = {
+  origin: 'https://issue14-editor-778537fd773a0d7e33ce.sow.foo',
+  issuer: 'https://woven-solutions.cloudflareaccess.com',
+  audience: '83b17595e80d731d05695243f699bfe376c639b81bf7be639bbe77b1f285f5dd',
+  clientDigest: '88e1c5b7f97e3d216fc80334420c2fb1a9c5802380d98c6346baf81e1f273669',
+}
+type EditorSettings = { origin:string; issuer:string; audience:string; clientId?:string; clientDigest?:string }
+export function issue14EditorSettings(env: Issue14PreviewScope & { DEPLOYMENT_ENVIRONMENT?:string; PREVIEW_EDITOR_ORIGIN?:string; PREVIEW_EDITOR_ISSUER?:string; PREVIEW_EDITOR_AUD?:string; PREVIEW_EDITOR_CLIENT_ID?:string }, fallback: EditorSettings = editorFallback): EditorSettings | null {
+  if (!isIssue14Preview(env) || env.DEPLOYMENT_ENVIRONMENT !== 'staging') return null
+  const values = [env.PREVIEW_EDITOR_ORIGIN, env.PREVIEW_EDITOR_ISSUER, env.PREVIEW_EDITOR_AUD, env.PREVIEW_EDITOR_CLIENT_ID]
+  if (values.every(value => !value)) return fallback
+  if (values.some(value => !value)) return null
+  return { origin:values[0]!, issuer:values[1]!, audience:values[2]!, clientId:values[3]! }
+}
+export async function issue14EditorClientMatches(settings: EditorSettings, clientId: string): Promise<boolean> {
+  if (settings.clientId) return clientId === settings.clientId
+  if (!settings.clientDigest || !/^[0-9a-f]{64}$/.test(settings.clientDigest)) return false
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(clientId))
+  return [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('') === settings.clientDigest
+}
 export function issue14PreviewEnvironment<T extends Issue14PreviewScope>(env: T): T {
   if (!isIssue14Preview(env)) return env
   // Deliberately remove the binding, even if one was supplied. The Action

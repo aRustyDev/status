@@ -16,7 +16,7 @@ import { checkFallback, FallbackConflictError, getFallback, publishFallback, sav
 import { boundedBody, receiptContext, findReceipt, receiptClaim, receiptFinish, ReceiptError, type Receipt, type ReceiptContext } from './idempotency'
 import { bootstrapPreviewUser } from './issue14-preview-user'
 import { ensureIssue14VaultFixture } from '../../gateway/issue14-vault-fixture'
-import { isIssue14Preview, isIssue14PreviewViewer, isKnownIssue14ViewerClient } from '../../gateway/issue14-preview'
+import { isIssue14Preview, isIssue14PreviewViewer, isKnownIssue14ViewerClient, issue14EditorSettings, issue14EditorClientMatches } from '../../gateway/issue14-preview'
 
 interface Env extends EmailChannelEnv {
   API_SCOPE?: string
@@ -172,18 +172,21 @@ async function accessIdentity(request: Request, env: Env): Promise<AccessIdentit
   const url = new URL(request.url)
   const baseIssuer = `https://${env.ACCESS_TEAM_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '')}`
   // The editor is a separate Access app and origin, never the shared staging app.
-  const editorOrigin = isIssue14Preview(env) && env.DEPLOYMENT_ENVIRONMENT === 'staging' && !!env.PREVIEW_EDITOR_ORIGIN && url.origin === env.PREVIEW_EDITOR_ORIGIN && url.protocol === 'https:' && url.origin !== 'https://status.sow.foo' && url.origin !== env.PREVIEW_BROWSER_ORIGIN
-  const issuer = editorOrigin ? env.PREVIEW_EDITOR_ISSUER : baseIssuer
-  const audience = editorOrigin ? env.PREVIEW_EDITOR_AUD : env.ACCESS_AUD
-  if (!issuer || !audience || (editorOrigin && (!/^https:\/\/[a-z0-9.-]+\.cloudflareaccess\.com$/.test(issuer) || audience === env.ACCESS_AUD || !env.PREVIEW_EDITOR_CLIENT_ID || env.PREVIEW_EDITOR_CLIENT_ID === env.PREVIEW_BROWSER_CLIENT_ID))) throw new HttpError(401, 'Invalid Access identity')
+  const editor = issue14EditorSettings(env)
+  const editorOrigin = !!editor && url.origin === editor.origin && url.protocol === 'https:' && url.origin !== 'https://status.sow.foo' && url.origin !== env.PREVIEW_BROWSER_ORIGIN
+  const issuer = editorOrigin ? editor.issuer : baseIssuer
+  const audience = editorOrigin ? editor.audience : env.ACCESS_AUD
+  if (!issuer || !audience || (editorOrigin && (!/^https:\/\/[a-z0-9.-]+\.cloudflareaccess\.com$/.test(issuer) || audience === env.ACCESS_AUD || (editor.clientId && editor.clientId === env.PREVIEW_BROWSER_CLIENT_ID)))) throw new HttpError(401, 'Invalid Access identity')
   let payload: JWTPayload
   try {
     const verified = await jwtVerify(token, accessKeySet(issuer), { issuer, audience, algorithms: ['RS256'], requiredClaims: ['exp'] })
     payload = verified.payload
   } catch { throw new HttpError(401, 'Invalid Access identity') }
   if (editorOrigin) {
-    if (payload.type !== 'app' || payload.common_name !== env.PREVIEW_EDITOR_CLIENT_ID || (typeof payload.common_name === 'string' && await isKnownIssue14ViewerClient(payload.common_name))) throw new HttpError(401, 'Invalid Access identity')
-    return { issuer, subject: env.PREVIEW_EDITOR_CLIENT_ID!, email: 'preview-editor@automation.invalid', previewEditor: true }
+    if (payload.type !== 'app' || typeof payload.common_name !== 'string' || payload.common_name === env.PREVIEW_BROWSER_CLIENT_ID || !await issue14EditorClientMatches(editor, payload.common_name) || await isKnownIssue14ViewerClient(payload.common_name)) throw new HttpError(401, 'Invalid Access identity')
+    // Reject a release switch before fixture initialization or any Action write.
+    if (request.headers.get('X-Status-Editor-Expected-Release') !== env.PREVIEW_RELEASE) throw new HttpError(403, 'Preview release changed')
+    return { issuer, subject: payload.common_name, email: 'preview-editor@automation.invalid', previewEditor: true }
   }
   if (payload.common_name !== undefined) {
     if (typeof payload.common_name !== 'string') throw new HttpError(401, 'Invalid Access identity')

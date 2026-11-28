@@ -276,10 +276,21 @@ test('dedicated isolated preview editor can change only its own unlinked fixture
   const editorId='isolated-editor.access', editorAud='isolated-editor-aud', origin='https://editor.example'
   const token=await signService(editorId,editorAud)
   const settings={ ...env, API_SCOPE:'operations', PREVIEW_SUBSCRIBER_REQUIRED:'true', PREVIEW_SUBSCRIBER_SCOPE:'737597c9ba1d3cc17826ea2f2b48a9d259e03dbf1acd241dc62d886da5c20511', PREVIEW_RELEASE:'b'.repeat(40), DEPLOYMENT_ENVIRONMENT:'staging', PREVIEW_BROWSER_ORIGIN:'https://status.example', PREVIEW_BROWSER_CLIENT_ID:'preview-browser.access', PREVIEW_EDITOR_ORIGIN:origin, PREVIEW_EDITOR_ISSUER:issuer, PREVIEW_EDITOR_AUD:editorAud, PREVIEW_EDITOR_CLIENT_ID:editorId, VAULT_ENCRYPTION_KEY:'ab'.repeat(32), ACTIONS_READY:'true', ACTION_ENDPOINTS:JSON.stringify([{id:'issue14-isolated-sink',name:'Sink',url:'https://sink.invalid/',binding:'ABSENT',serviceId:'sink'}]) }
-  const fetchApi=(path:string,method='GET',body?:unknown,config:object=settings,jwt=token,requestOrigin=origin) => worker.fetch(new Request(origin+path,{method,headers:{'Cf-Access-Jwt-Assertion':jwt,origin:requestOrigin,'content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})}),config as never)
+  const fetchApi=(path:string,method='GET',body?:unknown,config:object=settings,jwt=token,requestOrigin=origin) => worker.fetch(new Request(origin+path,{method,headers:{'Cf-Access-Jwt-Assertion':jwt,'X-Status-Editor-Expected-Release':settings.PREVIEW_RELEASE,origin:requestOrigin,'content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})}),config as never)
   const action={name:'Fixture',endpointId:'issue14-isolated-sink',vaultId:238010605399733,secretId:218386432287168,enabled:true,checkIds:[],checkSnapshots:[],triggerStatus:'down'}
   let actionId=''
   try {
+    for (const expected of [undefined, 'c'.repeat(40)]) {
+      const headers:Record<string,string>={'Cf-Access-Jwt-Assertion':token}
+      if (expected) headers['X-Status-Editor-Expected-Release']=expected
+      const rejected=await worker.fetch(new Request(origin+'/api/v1/auth/me',{headers}),settings as never)
+      assert.equal(rejected.status,403)
+      const staleWrite=await worker.fetch(new Request(origin+'/api/v1/bsp/admin/actions',{method:'POST',headers:{...headers,origin,'content-type':'application/json'},body:JSON.stringify(action)}),settings as never)
+      assert.equal(staleWrite.status,403)
+      assert.equal(await db.prepare("SELECT id FROM users WHERE id='issue14-preview-editor-actor'").first(),null)
+      assert.equal(await db.prepare('SELECT id FROM vaults WHERE id=238010605399733').first(),null)
+      assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM worker_actions').first<{n:number}>())?.n,0)
+    }
     const identity=await (await fetchApi('/api/v1/auth/me')).json() as {id:string;role:string;previewActionsEditor?:boolean;previewActionsEditorWrite?:boolean}
     assert.deepEqual([identity.id,identity.role,identity.previewActionsEditor,identity.previewActionsEditorWrite],['preview-editor','viewer',true,true])
     assert.equal((await fetchApi('/api/v1/bsp/admin/vaults')).status,200)
