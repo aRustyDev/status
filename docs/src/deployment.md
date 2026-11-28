@@ -80,14 +80,16 @@ docker compose up -d
 
 ### Building the image from source
 
-To build and run your own image instead of the published one, clone the repository and use the local override, so the production Compose file keeps pointing at GHCR:
+To build and run your own image instead of the published one, clone this repository and use the local override, so the production Compose file keeps pointing at GHCR:
 
 ```bash
-git clone https://github.com/BElluu/BetterStatusPage.git
-cd BetterStatusPage
-cp .env.example .env   # set the secrets as above
-docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+git clone https://github.com/aRustyDev/status.git
+cd status
+cp .docker/dev/.env.example .env   # set the secrets as above
+docker compose --project-directory . --env-file .env -f .docker/compose.yml -f .docker/dev/compose.yml up -d --build
 ```
+
+Use the same `--project-directory`, `--env-file`, and `-f` arguments for later Compose commands. The project directory preserves the checkout's usual Compose project name and volume names; if the existing deployment used another project name, set `COMPOSE_PROJECT_NAME` to that name before starting.
 
 ### 4. Open the setup wizard
 
@@ -151,15 +153,15 @@ node --version   # should print v26.x.x
 ### 2. Clone and install dependencies
 
 ```bash
-git clone https://github.com/BElluu/BetterStatusPage.git
-cd BetterStatusPage
+git clone https://github.com/aRustyDev/status.git
+cd status
 npm install
 ```
 
 ### 3. Configure
 
 ```bash
-cp .env.example .env
+cp .docker/dev/.env.example .env
 nano .env
 ```
 

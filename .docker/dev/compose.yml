@@ -3,4 +3,5 @@ services:
     image: better-status-page:local
     build:
       context: .
+      dockerfile: .docker/dev/Dockerfile
     pull_policy: never

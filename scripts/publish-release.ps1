@@ -198,6 +198,7 @@ try {
   Write-Step "Building and publishing immutable multi-platform image tag $Version (linux/amd64, linux/arm64)"
   Invoke-External -File 'docker.exe' -Arguments @(
     'buildx', 'build',
+    '--file', '.docker/dev/Dockerfile',
     '--pull',
     '--platform', 'linux/amd64,linux/arm64',
     '--build-arg', "IMAGE_VERSION=$Version",

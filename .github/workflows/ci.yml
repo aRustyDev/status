@@ -249,6 +249,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: .docker/dev/Dockerfile
           load: true
           tags: better-status-page:test
           cache-from: type=gha,scope=${{ matrix.arch }}
