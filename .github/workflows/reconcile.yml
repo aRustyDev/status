@@ -47,7 +47,7 @@ jobs:
           path: control
           persist-credentials: false
           token: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
-      - uses: aRustyDev/status/.github/actions/branch-previews@96377bb3fb45559af985884435f3b4ec7a50f7bc
+      - uses: aRustyDev/status/.github/actions/branch-previews@059657d7830a32314f646a5d205a4d2d1395b417
         with:
           operation: reconcile
           config: ${{ inputs.config }}

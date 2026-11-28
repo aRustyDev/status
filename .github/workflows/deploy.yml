@@ -60,7 +60,7 @@ jobs:
           ref: ${{ inputs.fixture && 'main' || github.event.repository.default_branch }}
           path: control
           persist-credentials: false
-      - uses: aRustyDev/status/.github/actions/branch-previews@236fa43b128f31cef90cb601f745a3384f78146b
+      - uses: aRustyDev/status/.github/actions/branch-previews@059657d7830a32314f646a5d205a4d2d1395b417
         with:
           operation: check
           config: ${{ inputs.config }}
@@ -72,7 +72,7 @@ jobs:
           ref: ${{ inputs.sha }}
           path: feature
           persist-credentials: false
-      - uses: aRustyDev/status/.github/actions/branch-previews@236fa43b128f31cef90cb601f745a3384f78146b
+      - uses: aRustyDev/status/.github/actions/branch-previews@059657d7830a32314f646a5d205a4d2d1395b417
         with:
           operation: build
           config: ${{ inputs.config }}
@@ -121,7 +121,7 @@ jobs:
           path: control
           persist-credentials: false
           token: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
-      - uses: aRustyDev/status/.github/actions/branch-previews@236fa43b128f31cef90cb601f745a3384f78146b
+      - uses: aRustyDev/status/.github/actions/branch-previews@059657d7830a32314f646a5d205a4d2d1395b417
         with:
           operation: check
           config: ${{ inputs.config }}
@@ -149,7 +149,7 @@ jobs:
           run-id: ${{ steps.verify.outputs.ci_run_id }}
           name: ${{ format('preview-{0}', inputs.sha) }}
           path: ${{ format('{0}/download', runner.temp) }}
-      - uses: aRustyDev/status/.github/actions/branch-previews@236fa43b128f31cef90cb601f745a3384f78146b
+      - uses: aRustyDev/status/.github/actions/branch-previews@059657d7830a32314f646a5d205a4d2d1395b417
         with:
           operation: deploy
           config: ${{ inputs.config }}
@@ -158,6 +158,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PREVIEW_SOURCE_TOKEN: ${{ inputs.fixture && secrets.FIXTURE_SOURCE_READ_TOKEN || github.token }}
           PREVIEW_BRANCH_CONFIG: ${{ secrets[inputs.fixture && 'FIXTURE_BRANCH_CONFIG' || 'PREVIEW_BRANCH_CONFIG'] }}
+          PREVIEW_BROWSER_ORIGIN: ${{ !inputs.fixture && vars.PREVIEW_BROWSER_ORIGIN || '' }}
+          PREVIEW_BROWSER_CLIENT_ID: ${{ !inputs.fixture && vars.PREVIEW_BROWSER_CLIENT_ID || '' }}
           PREVIEW_WORKER_SECRETS: ${{ secrets[inputs.fixture && 'FIXTURE_WORKER_SECRETS' || 'PREVIEW_WORKER_SECRETS'] }}
           PREVIEW_SCHEMA_SUBSCRIBER_CONFIG: ${{ !inputs.fixture && secrets.PREVIEW_SCHEMA_SUBSCRIBER_CONFIG || '' }}
           PREVIEW_ISOLATED_FIXTURE_CONFIG: ${{ secrets.PREVIEW_ISOLATED_FIXTURE_CONFIG }}

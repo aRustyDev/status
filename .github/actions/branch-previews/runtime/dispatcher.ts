@@ -80,6 +80,7 @@ export function createDispatcher(authenticate = verifyServiceToken) { return {
       const enabled = await env.FLAGS.getBooleanDetails(env.FLAG_PREFIX + 'enabled', false)
       if (enabled.errorCode || !enabled.value) return uncached(new Response('Preview routing unavailable', { status: 503 }))
       const details = await env.FLAGS.getObjectDetails<BranchRoute>(env.FLAG_PREFIX + 'branch-' + match[1], {})
+      if (details.errorCode === 'FLAG_NOT_FOUND') return uncached(new Response('Preview not found', { status: 404 }))
       if (details.errorCode) return uncached(new Response('Preview routing unavailable', { status: 503 }))
       const route = details.value
       if (route.selector !== selector) return uncached(new Response('Preview not found', { status: 404 }))
