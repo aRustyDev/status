@@ -229,7 +229,7 @@ export function renderSubscriberEmail(event: SubscriberEvent, brand: EmailBrand,
 const iso = (ms: number | null) => (ms === null ? null : new Date(ms).toISOString())
 const isoUpdate = (update: IncidentUpdateSummary) => ({ body: update.body, status: update.status, postedAt: iso(update.postedAt) })
 
-/** Documented in docs/subscriptions.md — keep the two in step. Timestamps are ISO 8601 strings. */
+/** Documented in docs/src/subscriptions.md — keep the two in step. Timestamps are ISO 8601 strings. */
 export function renderSubscriberWebhook(event: SubscriberEvent, site: string, publicUrl: string, manageToken: string): string {
   const links = subscriptionLinks(publicUrl, manageToken)
   const pageUrl = `${publicUrl}/`

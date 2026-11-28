@@ -13,7 +13,11 @@ data
 *.md
 docs
 
-!docs/changelog.md
+!docs
+docs/*
+!docs/src
+docs/src/*
+!docs/src/changelog.md
 
 # Patterns are anchored at the context root, so nested copies need **/.
 **/node_modules

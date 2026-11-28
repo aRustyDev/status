@@ -37,6 +37,6 @@ The Worker tests use local D1 and the browser suite includes a Workers-runtime i
 
 ## Deployment
 
-Follow [Cloudflare deployment and operations](docs/cloudflare-deployment.md) for Access, D1, endpoint registry, staging verification, deployment, and rollback. Protect the entire board hostname with Access. The included gateway configuration is staging-only. Production requires its own gateway and service bindings, hostname, Access policy, D1 database, and endpoint configuration.
+Follow [Cloudflare deployment and operations](cloudflare-deployment.md) for Access, D1, endpoint registry, staging verification, deployment, and rollback. Protect the entire board hostname with Access. The included gateway configuration is staging-only. Production requires its own gateway and service bindings, hostname, Access policy, D1 database, and endpoint configuration.
 
-See [UPSTREAM.md](UPSTREAM.md) and [the Better Status Page license notice](THIRD_PARTY_LICENSE_BetterStatusPage) for upstream attribution.
+See [UPSTREAM.md](UPSTREAM.md) and [the Better Status Page license notice](../../THIRD_PARTY_LICENSE_BetterStatusPage) for upstream attribution.

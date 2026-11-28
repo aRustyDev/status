@@ -654,12 +654,12 @@ describe('what the agent is told', () => {
     assert.deepEqual(readerOffered.filter((name) => changing.some((tool) => tool.name === name)), [], 'a read-only token sees no changing tool')
   })
 
-  it('is described in docs/mcp.md, tool by tool', async () => {
-    const docs = readFileSync(fileURLToPath(new URL('../../../docs/mcp.md', import.meta.url)), 'utf8')
+  it('is described in docs/src/mcp.md, tool by tool', async () => {
+    const docs = readFileSync(fileURLToPath(new URL('../../../docs/src/mcp.md', import.meta.url)), 'utf8')
     // The rows of the tool tables: | `name` | ...
     const documented = [...docs.matchAll(/^\| `([a-z_]+)` \|/gm)].map((match) => match[1]!).sort()
     const real = (await allTools()).map((tool) => tool.name).sort()
-    assert.deepEqual(real.filter((name) => !documented.includes(name)), [], 'add these tools to the tables in docs/mcp.md')
+    assert.deepEqual(real.filter((name) => !documented.includes(name)), [], 'add these tools to the tables in docs/src/mcp.md')
     assert.deepEqual(documented.filter((name) => !real.includes(name)), [], 'these are documented but no longer exist')
   })
 

@@ -24,11 +24,10 @@ function* walk(dir) {
   }
 }
 
-const guides = fs.readdirSync(path.join(root, 'docs')).filter((name) => name.endsWith('.md'))
+const guidesDir = path.join(root, 'docs', 'src')
+const guides = fs.readdirSync(guidesDir).filter((name) => name.endsWith('.md'))
 const files = [
-  path.join(root, 'README.md'),
-  path.join(root, 'README.pl.md'),
-  ...guides.map((name) => path.join(root, 'docs', name)),
+  ...[...walk(guidesDir)].filter((file) => file.endsWith('.md')),
   ...['apps', 'packages'].flatMap((dir) => [...walk(path.join(root, dir))].filter((file) => /\.(ts|tsx)$/.test(file))),
 ].filter((file) => fs.existsSync(file))
 
@@ -42,8 +41,6 @@ const pageExists = (urlPath) => {
 const problems = []
 const siteLink = /https:\/\/docs\.betterstatuspage\.dev(\/[^\s)"'`<>\]\\]*)?/g
 const guideLink = /\]\(([A-Za-z0-9_-]+\.md)(?:#[^)]*)?\)/g
-const docsDir = path.join(root, 'docs') + path.sep
-
 for (const file of files) {
   const text = fs.readFileSync(file, 'utf8')
   const rel = path.relative(root, file).split(path.sep).join('/')
@@ -53,9 +50,9 @@ for (const file of files) {
     if (/[<${]/.test(urlPath)) continue
     if (!pageExists(urlPath)) problems.push(`${rel}: ${match[0]} has no page in the built site`)
   }
-  if (file.startsWith(docsDir) && file.endsWith('.md')) {
+  if (path.dirname(file) === guidesDir && file.endsWith('.md')) {
     for (const match of text.matchAll(guideLink)) {
-      if (!guides.includes(match[1])) problems.push(`${rel}: link to ${match[1]}, which is not a guide in docs/`)
+      if (!guides.includes(match[1])) problems.push(`${rel}: link to ${match[1]}, which is not a guide in docs/src/`)
     }
   }
 }
