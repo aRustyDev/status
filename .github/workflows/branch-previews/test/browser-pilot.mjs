@@ -61,7 +61,10 @@ const api = { fetch(request) {
   return worker.fetch(request, {
     DEPLOYMENT_ENVIRONMENT: 'staging', PREVIEW_BROWSER_ORIGIN: origin,
     PREVIEW_BROWSER_CLIENT_ID: clientId, ACCESS_AUD: audience, ACCESS_TEAM_DOMAIN: new URL(issuer).hostname,
-    DB: { prepare() { throw new Error('Preview browser auth attempted to access the users database') } },
+    DB: { prepare(query) {
+      if (query === 'SELECT alias, entity_type, entity_id FROM entity_aliases') return { all: async () => ({ results: [] }) }
+      throw new Error('Preview browser attempted an unexpected database query')
+    } },
   })
 } }
 const dispatcherEnv = {
@@ -126,6 +129,7 @@ server.listen(0, '127.0.0.1', () => {
   writeFileSync(configPath, JSON.stringify({
     origin, backend: 'local', auth: 'access', allowSelfSignedLoopback: true, selectorHeader: 'X-Status-Preview', revisionHeader: 'X-Status-Preview-Commit',
     identity: { path: '/api/v1/auth/me', equals: { id: 'preview-browser', role: 'viewer' } },
+    requiredPaths: ['/api/v1/bsp/public/locales'],
   }), { mode: 0o600 })
   console.log(JSON.stringify({ configPath, fixtureEnv: { CF_ACCESS_CLIENT_ID: clientId, CF_ACCESS_CLIENT_SECRET: clientSecret, PREVIEW_ACCESS_ORIGIN: origin }, variants }))
 })
